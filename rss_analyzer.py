@@ -135,22 +135,26 @@ class IncrementalProcessor:
         return cutoff_time
     
     def should_send_email(self) -> Tuple[bool, str]:
-        """Determine if we should send email based on time of day"""
+        """Determine if we should send email based on time of day - FIXED"""
         now = datetime.now()
         hour = now.hour
+        
+        # For GitHub Actions, always send email when processing
+        if os.getenv('GITHUB_ACTIONS'):
+            return True, "github_actions"
         
         # Convert to AEST equivalent (assuming UTC+10)
         aest_hour = (hour + 10) % 24
         
-        # Send email only at morning run (6 AM AEST = 20 UTC previous day)
-        if 20 <= hour <= 23 or hour <= 2:  # Around 6 AM AEST
+        # Send email at morning run (6-9 AM AEST = 20-23 UTC previous day, or 0-2 UTC)
+        if 20 <= hour <= 23 or 0 <= hour <= 2:  # Around 6-9 AM AEST
             return True, "morning"
-        elif 0 <= hour <= 4:  # Around 12 PM AEST  
+        elif 3 <= hour <= 7:  # Around 12-4 PM AEST  
             return False, "midday"
-        elif 6 <= hour <= 10:  # Around 6 PM AEST
+        elif 8 <= hour <= 15:  # Around 6 PM - 1 AM AEST
             return False, "evening"
         else:
-            return False, "other"
+            return True, "other_send"  # Send for manual runs
 
 
 class RSSAnalyzer:
@@ -813,7 +817,7 @@ See README.md for detailed setup instructions.
         return processor.should_send_email()
 
     def get_items_for_email(self, hours_back: int = 24) -> List[Tuple]:
-        """Get items for email from the last N hours"""
+        """Get items for email from the last N hours - ENHANCED with debugging"""
         cutoff_time = datetime.now() - timedelta(hours=hours_back)
         
         cursor = self.conn.execute('''
@@ -824,23 +828,37 @@ See README.md for detailed setup instructions.
             ORDER BY interest_score DESC, processed_at DESC
         ''', (cutoff_time,))
         
-        return cursor.fetchall()
+        items = cursor.fetchall()
+        
+        # Debug logging
+        logging.info(f"Email items query: found {len(items)} items since {cutoff_time}")
+        if items:
+            scores = [item[3] for item in items]
+            logging.info(f"Score distribution: min={min(scores)}, max={max(scores)}, avg={sum(scores)/len(scores):.1f}")
+            high_scores = len([s for s in scores if s >= 7])
+            medium_scores = len([s for s in scores if 5 <= s < 7])
+            logging.info(f"High scores (≥7): {high_scores}, Medium scores (5-6): {medium_scores}")
+        
+        return items
 
     def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
-        """Enhanced email generation that prevents clipping"""
+        """Enhanced email generation with better debugging and fallbacks"""
+        logging.info(f"Generating email from {len(items)} items")
+        
         if not items:
+            logging.warning("No items provided for email generation")
             return None
         
-        # CRITICAL: Limit total content to prevent email clipping
-        # Most email clients clip after ~102KB, so we need to be aggressive about limiting content
+        # CRITICAL: More generous filtering to ensure content
+        # Filter and prioritize items more generously
+        high_priority = [item for item in items if item[3] >= 7][:12]  # Increased from 8
+        medium_priority = [item for item in items if 5 <= item[3] < 7][:10]  # Increased from 6
+        low_priority = [item for item in items if 4 <= item[3] < 5][:8]  # Added low priority
         
-        # Filter and prioritize items more aggressively
-        high_priority = [item for item in items if item[3] >= 8][:8]  # Max 8 high priority
-        medium_priority = [item for item in items if 6 <= item[3] < 8][:6]  # Max 6 medium
-        low_priority = [item for item in items if 4 <= item[3] < 6][:4]  # Max 4 low
-        
-        # Total: Maximum 18 items to prevent clipping
+        # Total: Maximum 30 items to ensure we have content
         filtered_items = high_priority + medium_priority + low_priority
+        
+        logging.info(f"Filtered items: {len(high_priority)} high, {len(medium_priority)} medium, {len(low_priority)} low")
         
         # Skip obvious errors and duplicates
         final_items = []
@@ -863,11 +881,14 @@ See README.md for detailed setup instructions.
             
             final_items.append(item)
             
-            # Hard limit to prevent clipping
-            if len(final_items) >= 15:
+            # Generous limit to ensure content
+            if len(final_items) >= 25:
                 break
         
+        logging.info(f"Final items for email: {len(final_items)}")
+        
         if not final_items:
+            logging.warning("No items remaining after filtering")
             return None
         
         return self.build_executive_email_html(final_items)
@@ -1074,15 +1095,15 @@ See README.md for detailed setup instructions.
                 </div>
                 
                 <div class="footer">
-                <div class="footer-text">
-                    AI-Powered Commercial Property Intelligence • {len(relevant_items)} sources analyzed<br>
-                    Generated at {current_time} AEST • Executive Briefing • Threshold: Score ≥5<br>
-                    <br>
-                    <a href="https://www.linkedin.com/in/mattwhiteoak" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 600;">
-                        Connect with Matt WhiteOak on LinkedIn
-                    </a>
+                    <div class="footer-text">
+                        AI-Powered Commercial Property Intelligence • {len(relevant_items)} sources analyzed<br>
+                        Generated at {current_time} AEST • Executive Briefing • Threshold: Score ≥5<br>
+                        <br>
+                        <a href="https://www.linkedin.com/in/mattwhiteoak" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 600;">
+                            💼 Connect with Matt Whiteoak on LinkedIn
+                        </a>
+                    </div>
                 </div>
-            </div>
             </div>
         </body>
         </html>
@@ -1816,10 +1837,12 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
         return html
 
     def send_email(self, content: str):
-        """Send email with HTML content"""
+        """Send email with HTML content - enhanced with debugging"""
         try:
+            logging.info(f"Preparing to send email ({len(content)} characters)")
+            
             msg = MIMEMultipart('alternative')
-            msg['Subject'] = f"Matt's Memo - {datetime.now().strftime('%B %d, %Y')}"
+            msg['Subject'] = f"Commercial Property Intelligence - {datetime.now().strftime('%B %d, %Y')}"
             msg['From'] = self.config['gmail_user']
             msg['To'] = self.config['recipient_email']
             
@@ -1871,18 +1894,25 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
             raise
 
     def send_daily_brief_incremental(self):
-        """Send email only if it's the right time"""
+        """Send email with enhanced logic for GitHub Actions and debugging"""
         should_send, time_period = self.should_send_email_now()
+        
+        logging.info(f"Email decision: should_send={should_send}, time_period={time_period}")
         
         if should_send:
             logging.info(f"Sending {time_period} email brief...")
             
-            # Get items from last 24 hours for morning email
+            # Get items from last 24 hours for email
             items = self.get_items_for_email(24)
             
             if items:
+                logging.info(f"Generating email from {len(items)} items")
                 content = self.generate_daily_email_from_items_enhanced(items)
                 if content:
+                    # Check content size and warn if too large
+                    content_size = len(content.encode('utf-8'))
+                    logging.info(f"Email content size: {content_size/1024:.1f}KB")
+                    
                     self.send_email(content)
                     
                     # Mark items as sent
@@ -1895,20 +1925,24 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
                     
                     logging.info("Email sent successfully")
                 else:
-                    logging.info("No content generated for email")
+                    logging.warning("No content generated for email - all items filtered out")
             else:
-                logging.info("No items found for email")
+                logging.warning("No items found for email")
         else:
             logging.info(f"Skipping email send - {time_period} run (email only sent in morning)")
 
     def run_scheduled_processing(self):
-        """Main method for scheduled processing"""
+        """Main method for scheduled processing with enhanced email logic"""
         try:
             # Process feeds with optimized method
             result = self.process_feeds_optimized_recent()
             
-            # Send email if appropriate
-            self.send_daily_brief_incremental()
+            # Always try to send email for GitHub Actions, or based on schedule for local runs
+            if os.getenv('GITHUB_ACTIONS') or self.should_send_email_now()[0]:
+                logging.info("Attempting to send email...")
+                self.send_daily_brief_incremental()
+            else:
+                logging.info("Skipping email send based on schedule")
             
             logging.info(f"Scheduled processing completed: {result}")
             
