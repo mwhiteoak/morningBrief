@@ -27,20 +27,24 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Create environment variables
-      run: |
-        echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
-        echo "GMAIL_USER=${{ secrets.GMAIL_USER }}" >> .env
-        echo "GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}" >> .env
-        echo "RECIPIENT_EMAIL=${{ secrets.RECIPIENT_EMAIL }}" >> .env
-        echo "LINKEDIN_PROFILE_URL=${{ secrets.LINKEDIN_PROFILE_URL }}" >> .env
-    
     - name: Process RSS feeds
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
       run: |
         echo "🚀 Starting RSS feed processing..."
         python rss_analyzer.py test
     
     - name: Generate and send daily email
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
       run: |
         echo "📧 Generating and sending daily email..."
         python rss_analyzer.py email
@@ -55,6 +59,12 @@ jobs:
         retention-days: 7
     
     - name: Cleanup old database entries
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
       run: |
         python rss_analyzer.py cleanup 7
         echo "🧹 Cleaned up database entries older than 7 days"
