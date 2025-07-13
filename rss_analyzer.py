@@ -312,35 +312,45 @@ See README.md for detailed setup instructions.
             now = datetime.now()
             
             for entry in feed.entries:
-                # Parse published date
-                published = now  # Default to now if no date found
-                if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    try:
-                        published = datetime(*entry.published_parsed[:6])
-                    except (TypeError, ValueError):
-                        pass
-                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
-                    try:
-                        published = datetime(*entry.updated_parsed[:6])
-                    except (TypeError, ValueError):
-                        pass
-                
-                # Get description with fallback to summary
-                description = ""
-                if hasattr(entry, 'description'):
-                    description = entry.description
-                elif hasattr(entry, 'summary'):
-                    description = entry.summary
-                
-                item = FeedItem(
-                    title=entry.title,
-                    link=entry.link,
-                    description=description,
-                    published=published,
-                    source_feed=feed_url,
-                    source_name=feed_name
-                )
-                items.append(item)
+                try:
+                    # Check if entry has required attributes
+                    if not hasattr(entry, 'title') or not hasattr(entry, 'link'):
+                        logging.warning(f"Skipping malformed entry in {feed_name}: missing title or link")
+                        continue
+                    
+                    # Parse published date
+                    published = now  # Default to now if no date found
+                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                        try:
+                            published = datetime(*entry.published_parsed[:6])
+                        except (TypeError, ValueError):
+                            pass
+                    elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                        try:
+                            published = datetime(*entry.updated_parsed[:6])
+                        except (TypeError, ValueError):
+                            pass
+                    
+                    # Get description with fallback to summary
+                    description = ""
+                    if hasattr(entry, 'description'):
+                        description = entry.description
+                    elif hasattr(entry, 'summary'):
+                        description = entry.summary
+                    
+                    item = FeedItem(
+                        title=entry.title,
+                        link=entry.link,
+                        description=description,
+                        published=published,
+                        source_feed=feed_url,
+                        source_name=feed_name
+                    )
+                    items.append(item)
+                    
+                except Exception as e:
+                    logging.warning(f"Error processing entry in {feed_name}: {e}")
+                    continue
             
             # Sort by published date (newest first)
             items.sort(key=lambda x: x.published, reverse=True)
@@ -378,53 +388,63 @@ See README.md for detailed setup instructions.
             
             # Process entries but STOP when we hit old items
             for entry in feed.entries:
-                processed_count += 1
-                
-                # Parse published date
-                published = datetime.now()  # Default to now
-                if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    try:
-                        published = datetime(*entry.published_parsed[:6])
-                    except (TypeError, ValueError):
-                        pass
-                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
-                    try:
-                        published = datetime(*entry.updated_parsed[:6])
-                    except (TypeError, ValueError):
-                        pass
-                
-                # STOP processing if item is too old (RSS feeds are usually chronological)
-                if published < cutoff_time:
-                    too_old_count += 1
-                    # If we hit 3 old items in a row, stop processing (feeds are chronological)
-                    if too_old_count >= 3:
-                        logging.info(f"   Stopping - hit {too_old_count} old items (feed is chronological)")
+                try:
+                    processed_count += 1
+                    
+                    # Check if entry has required attributes
+                    if not hasattr(entry, 'title') or not hasattr(entry, 'link'):
+                        logging.warning(f"Skipping malformed entry in {feed_name}: missing title or link")
+                        continue
+                    
+                    # Parse published date
+                    published = datetime.now()  # Default to now
+                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                        try:
+                            published = datetime(*entry.published_parsed[:6])
+                        except (TypeError, ValueError):
+                            pass
+                    elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                        try:
+                            published = datetime(*entry.updated_parsed[:6])
+                        except (TypeError, ValueError):
+                            pass
+                    
+                    # STOP processing if item is too old (RSS feeds are usually chronological)
+                    if published < cutoff_time:
+                        too_old_count += 1
+                        # If we hit 3 old items in a row, stop processing (feeds are chronological)
+                        if too_old_count >= 3:
+                            logging.info(f"   Stopping - hit {too_old_count} old items (feed is chronological)")
+                            break
+                        continue
+                    else:
+                        too_old_count = 0  # Reset counter
+                    
+                    # Item is recent enough - process it
+                    description = ""
+                    if hasattr(entry, 'description'):
+                        description = entry.description
+                    elif hasattr(entry, 'summary'):
+                        description = entry.summary
+                    
+                    item = FeedItem(
+                        title=entry.title,
+                        link=entry.link,
+                        description=description,
+                        published=published,
+                        source_feed=feed_url,
+                        source_name=feed_name
+                    )
+                    items.append(item)
+                    
+                    # Limit items per feed to prevent memory issues
+                    if len(items) >= max_items:
+                        logging.info(f"   Reached max items limit ({max_items}) for {feed_name}")
                         break
+                        
+                except Exception as e:
+                    logging.warning(f"Error processing entry in {feed_name}: {e}")
                     continue
-                else:
-                    too_old_count = 0  # Reset counter
-                
-                # Item is recent enough - process it
-                description = ""
-                if hasattr(entry, 'description'):
-                    description = entry.description
-                elif hasattr(entry, 'summary'):
-                    description = entry.summary
-                
-                item = FeedItem(
-                    title=entry.title,
-                    link=entry.link,
-                    description=description,
-                    published=published,
-                    source_feed=feed_url,
-                    source_name=feed_name
-                )
-                items.append(item)
-                
-                # Limit items per feed to prevent memory issues
-                if len(items) >= max_items:
-                    logging.info(f"   Reached max items limit ({max_items}) for {feed_name}")
-                    break
             
             # Sort by published date (newest first)
             items.sort(key=lambda x: x.published, reverse=True)
@@ -853,39 +873,26 @@ See README.md for detailed setup instructions.
         return self.build_executive_email_html(final_items)
 
     def build_executive_email_html(self, items: List[Tuple]) -> str:
-        """Build sophisticated AI-powered executive intelligence briefing"""
+        """Build clean, focused executive intelligence briefing"""
         
         current_date = datetime.now().strftime('%B %d, %Y')
         current_time = datetime.now().strftime('%I:%M %p AEST')
         
-        # Advanced AI-powered analytics
+        # Calculate key metrics
         total_items = len(items)
-        high_priority_count = len([item for item in items if item[3] >= 8])
-        critical_count = len([item for item in items if item[3] >= 9])
-        avg_score = sum(item[3] for item in items) / len(items) if items else 0
+        high_priority_count = len([item for item in items if item[3] >= 7])
+        critical_count = len([item for item in items if item[3] >= 8])
         
-        # Market intelligence metrics
+        # Market sentiment
         sentiment = self.calculate_simple_sentiment(items)
-        risk_level = self.calculate_risk_level(items)
-        opportunity_count = len([item for item in items if 'opportunity' in item[0].lower() or 'growth' in item[0].lower()])
+        sentiment_emoji = {"Positive": "📈", "Negative": "📉", "Neutral": "📊"}[sentiment]
+        sentiment_color = {"Positive": "#10b981", "Negative": "#ef4444", "Neutral": "#6366f1"}[sentiment]
         
-        # AI confidence score
-        ai_confidence = min(95, 60 + (avg_score * 4))  # Scale confidence based on relevance
+        # Sort by relevance
+        sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
         
-        # Market pulse calculation
-        market_pulse = self.calculate_market_pulse(items, sentiment, high_priority_count)
-        
-        # Sort items by AI priority
-        sorted_items = sorted(items, key=lambda x: (x[3], x[6] if len(x) > 6 else datetime.now()), reverse=True)
-        
-        # Color schemes for different sentiment states
-        colors = {
-            "Positive": {"primary": "#10B981", "secondary": "#D1FAE5", "text": "#065F46"},
-            "Negative": {"primary": "#EF4444", "secondary": "#FEE2E2", "text": "#991B1B"},
-            "Neutral": {"primary": "#6366F1", "secondary": "#E0E7FF", "text": "#3730A3"}
-        }
-        
-        theme = colors[sentiment]
+        # Filter for only relevant items (score >= 6)
+        relevant_items = [item for item in sorted_items if item[3] >= 6][:10]
         
         html = f"""
         <!DOCTYPE html>
@@ -893,342 +900,183 @@ See README.md for detailed setup instructions.
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Matt's Executive Intelligence • {current_date}</title>
+            <title>Commercial Property Intelligence • {current_date}</title>
             <style>
                 * {{ box-sizing: border-box; }}
                 body {{ 
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                    margin: 0; padding: 0; 
-                    background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
-                    color: #1e293b; line-height: 1.6;
+                    margin: 0; padding: 20px; 
+                    background: #f8fafc; color: #1e293b; line-height: 1.6;
                 }}
                 .container {{ 
-                    max-width: 800px; margin: 20px auto; 
-                    background: white; border-radius: 16px;
-                    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.15);
+                    max-width: 700px; margin: 0 auto; 
+                    background: white; border-radius: 12px;
+                    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
                     overflow: hidden;
                 }}
+                
                 .header {{
-                    background: linear-gradient(135deg, #1e293b 0%, #334155 50%, #475569 100%);
-                    color: white; padding: 40px 30px; position: relative;
-                    overflow: hidden;
-                }}
-                .header::before {{
-                    content: ''; position: absolute; top: 0; right: 0;
-                    width: 200px; height: 200px; border-radius: 50%;
-                    background: linear-gradient(45deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05));
-                    transform: translate(50px, -50px);
+                    background: linear-gradient(135deg, #1e293b 0%, #475569 100%);
+                    color: white; padding: 30px; text-align: center;
                 }}
                 .header h1 {{ 
-                    margin: 0; font-size: 32px; font-weight: 800; 
-                    background: linear-gradient(45deg, #ffffff, #e2e8f0);
-                    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-                    text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    margin: 0; font-size: 24px; font-weight: 700; 
                 }}
-                .header .tagline {{ 
-                    font-size: 16px; opacity: 0.9; margin: 8px 0 0 0;
-                    font-weight: 500; letter-spacing: 0.5px;
-                }}
-                .header .timestamp {{ 
-                    font-size: 14px; opacity: 0.8; margin: 12px 0 0 0;
-                    display: flex; align-items: center; gap: 8px;
+                .header .date {{ 
+                    margin: 8px 0 0 0; opacity: 0.9; font-size: 14px;
                 }}
                 
-                .ai-dashboard {{
-                    background: linear-gradient(135deg, {theme['secondary']} 0%, rgba(255,255,255,0.9) 100%);
-                    padding: 30px; border-bottom: 1px solid #e2e8f0;
+                .summary-bar {{
+                    background: {sentiment_color}15;
+                    padding: 20px; border-bottom: 1px solid #e2e8f0;
+                    display: flex; justify-content: space-between; align-items: center;
+                    flex-wrap: wrap; gap: 15px;
                 }}
-                .ai-status {{
-                    text-align: center; margin-bottom: 25px;
+                .metric {{
+                    text-align: center; flex: 1; min-width: 80px;
                 }}
-                .ai-pulse {{
-                    display: inline-flex; align-items: center; gap: 12px;
-                    background: {theme['primary']}; color: white; 
-                    padding: 12px 24px; border-radius: 25px;
-                    font-weight: 600; font-size: 16px;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                }}
-                .pulse-dot {{
-                    width: 8px; height: 8px; border-radius: 50%;
-                    background: rgba(255,255,255,0.9);
-                    animation: pulse 2s infinite;
-                }}
-                @keyframes pulse {{
-                    0%, 100% {{ opacity: 1; transform: scale(1); }}
-                    50% {{ opacity: 0.7; transform: scale(1.1); }}
-                }}
-                
-                .metrics-grid {{
-                    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-                    gap: 20px; margin-top: 25px;
-                }}
-                .metric-card {{
-                    background: white; border-radius: 12px; padding: 20px;
-                    text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-                    border: 1px solid #e2e8f0; transition: transform 0.2s;
-                }}
-                .metric-card:hover {{ transform: translateY(-2px); }}
                 .metric-value {{
-                    font-size: 28px; font-weight: 800; margin: 0;
-                    background: linear-gradient(45deg, {theme['primary']}, #6366f1);
-                    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                    font-size: 20px; font-weight: 700; 
+                    color: {sentiment_color}; margin: 0;
                 }}
                 .metric-label {{
-                    font-size: 12px; color: #64748b; text-transform: uppercase;
-                    letter-spacing: 0.5px; margin: 8px 0 0 0; font-weight: 600;
+                    font-size: 11px; color: #64748b; 
+                    text-transform: uppercase; margin: 4px 0 0 0;
                 }}
-                .metric-trend {{
-                    font-size: 11px; margin-top: 4px; font-weight: 500;
-                }}
-                .trend-up {{ color: #10b981; }}
-                .trend-down {{ color: #ef4444; }}
-                .trend-neutral {{ color: #6b7280; }}
                 
-                .content {{ padding: 40px 30px; }}
+                .content {{ padding: 30px; }}
                 
                 .executive-summary {{
-                    background: linear-gradient(135deg, #f8fafc 0%, {theme['secondary']} 100%);
-                    border: 1px solid {theme['primary']}33;
-                    border-radius: 16px; padding: 30px; margin-bottom: 35px;
-                    position: relative;
-                }}
-                .executive-summary::before {{
-                    content: '🧠'; position: absolute; top: -10px; left: 25px;
-                    background: {theme['primary']}; color: white;
-                    width: 40px; height: 40px; border-radius: 50%;
-                    display: flex; align-items: center; justify-content: center;
-                    font-size: 18px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                    background: #f1f5f9; border-radius: 8px; 
+                    padding: 20px; margin-bottom: 30px;
+                    border-left: 4px solid {sentiment_color};
                 }}
                 .summary-title {{
-                    font-size: 18px; font-weight: 700; color: {theme['text']};
-                    margin: 0 0 15px 0; padding-left: 20px;
+                    font-size: 16px; font-weight: 700; 
+                    color: #1e293b; margin: 0 0 12px 0;
                 }}
-                .summary-content {{
-                    font-size: 15px; line-height: 1.7; color: #334155;
-                    background: white; padding: 20px; border-radius: 12px;
-                    border-left: 4px solid {theme['primary']};
+                .summary-text {{
+                    font-size: 14px; line-height: 1.6; color: #475569;
                 }}
                 
-                .ai-insights {{
-                    background: linear-gradient(135deg, #fefce8 0%, #fef3c7 100%);
-                    border: 1px solid #f59e0b33; border-radius: 16px;
-                    padding: 25px; margin-bottom: 30px;
-                }}
-                .insights-title {{
-                    font-size: 16px; font-weight: 700; color: #92400e;
-                    margin: 0 0 15px 0; display: flex; align-items: center; gap: 8px;
-                }}
-                .insight-item {{
-                    background: white; padding: 15px; border-radius: 8px;
-                    margin-bottom: 10px; border-left: 3px solid #f59e0b;
-                    font-size: 14px; line-height: 1.6;
-                }}
-                
-                .priority-section {{
-                    margin-bottom: 40px;
-                }}
-                .section-header {{
-                    display: flex; align-items: center; gap: 12px;
-                    margin-bottom: 25px; padding-bottom: 15px;
-                    border-bottom: 2px solid #e2e8f0;
+                .news-section {{
+                    margin-bottom: 30px;
                 }}
                 .section-title {{
-                    font-size: 20px; font-weight: 700; color: #1e293b; margin: 0;
-                }}
-                .section-count {{
-                    background: {theme['primary']}; color: white;
-                    padding: 4px 12px; border-radius: 20px;
-                    font-size: 12px; font-weight: 600;
+                    font-size: 18px; font-weight: 700; color: #1e293b; 
+                    margin: 0 0 20px 0; padding-bottom: 10px;
+                    border-bottom: 2px solid #e2e8f0;
                 }}
                 
                 .news-item {{
                     background: white; border: 1px solid #e2e8f0;
-                    border-radius: 12px; padding: 24px; margin-bottom: 20px;
-                    transition: all 0.3s; position: relative;
+                    border-radius: 8px; padding: 20px; margin-bottom: 16px;
+                    transition: box-shadow 0.2s;
                 }}
                 .news-item:hover {{
-                    box-shadow: 0 8px 25px rgba(0,0,0,0.1);
-                    transform: translateY(-2px);
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
                 }}
-                .news-critical {{ border-left: 4px solid #dc2626; }}
-                .news-high {{ border-left: 4px solid #ea580c; }}
-                .news-medium {{ border-left: 4px solid #d97706; }}
-                .news-normal {{ border-left: 4px solid #65a30d; }}
+                .news-critical {{ border-left: 4px solid #ef4444; }}
+                .news-high {{ border-left: 4px solid #f59e0b; }}
+                .news-medium {{ border-left: 4px solid #10b981; }}
                 
                 .news-header {{
-                    display: flex; justify-content: space-between; align-items: flex-start;
-                    margin-bottom: 15px; gap: 15px;
+                    display: flex; justify-content: space-between; 
+                    align-items: flex-start; margin-bottom: 12px; gap: 15px;
                 }}
                 .news-title {{
-                    font-size: 16px; font-weight: 600; line-height: 1.4;
-                    margin: 0; flex: 1;
+                    font-size: 15px; font-weight: 600; 
+                    line-height: 1.4; margin: 0; flex: 1;
                 }}
                 .news-title a {{
                     color: #1e293b; text-decoration: none;
-                    transition: color 0.2s;
                 }}
-                .news-title a:hover {{ color: {theme['primary']}; }}
+                .news-title a:hover {{ color: {sentiment_color}; }}
                 
                 .news-score {{
-                    background: linear-gradient(45deg, {theme['primary']}, #6366f1);
-                    color: white; padding: 6px 12px; border-radius: 20px;
-                    font-size: 12px; font-weight: 700; white-space: nowrap;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    background: {sentiment_color}; color: white; 
+                    padding: 4px 10px; border-radius: 12px;
+                    font-size: 11px; font-weight: 600; white-space: nowrap;
+                }}
+                
+                .relevance-box {{
+                    background: #fef3c7; border: 1px solid #f59e0b;
+                    border-radius: 6px; padding: 12px; margin-top: 12px;
+                }}
+                .relevance-title {{
+                    font-size: 12px; font-weight: 600; 
+                    color: #92400e; margin: 0 0 6px 0;
+                }}
+                .relevance-text {{
+                    font-size: 13px; line-height: 1.5; 
+                    color: #78350f; margin: 0;
                 }}
                 
                 .news-meta {{
-                    display: flex; align-items: center; gap: 15px;
-                    font-size: 12px; color: #64748b; margin-bottom: 12px;
-                }}
-                .news-meta span {{
-                    display: flex; align-items: center; gap: 4px;
-                }}
-                
-                .news-summary {{
-                    font-size: 14px; line-height: 1.6; color: #475569;
-                    background: #f8fafc; padding: 15px; border-radius: 8px;
-                }}
-                
-                .ai-analysis {{
-                    margin-top: 12px; padding: 12px; background: #f0f9ff;
-                    border-radius: 8px; border-left: 3px solid #0ea5e9;
-                    font-size: 13px; line-height: 1.5; color: #0c4a6e;
-                }}
-                
-                .strategic-actions {{
-                    background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-                    border: 1px solid #10b98133; border-radius: 16px;
-                    padding: 25px; margin-bottom: 30px;
-                }}
-                .actions-title {{
-                    font-size: 16px; font-weight: 700; color: #065f46;
-                    margin: 0 0 20px 0; display: flex; align-items: center; gap: 8px;
-                }}
-                .action-item {{
-                    background: white; padding: 15px; border-radius: 8px;
-                    margin-bottom: 12px; border-left: 3px solid #10b981;
-                    font-size: 14px; line-height: 1.6;
-                    display: flex; align-items: flex-start; gap: 10px;
-                }}
-                .action-priority {{
-                    background: #10b981; color: white; padding: 2px 8px;
-                    border-radius: 12px; font-size: 10px; font-weight: 600;
-                    text-transform: uppercase; white-space: nowrap;
+                    font-size: 12px; color: #64748b; 
+                    margin-bottom: 10px;
                 }}
                 
                 .footer {{
-                    background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-                    color: white; padding: 30px; text-align: center;
+                    background: #1e293b; color: white; 
+                    padding: 20px; text-align: center;
                 }}
-                .footer-brand {{
-                    font-size: 18px; font-weight: 700; margin-bottom: 8px;
-                }}
-                .footer-tagline {{
-                    font-size: 13px; opacity: 0.8; margin-bottom: 15px;
-                }}
-                .footer-stats {{
-                    font-size: 12px; opacity: 0.7; line-height: 1.4;
-                    border-top: 1px solid rgba(255,255,255,0.1);
-                    padding-top: 15px; margin-top: 15px;
+                .footer-text {{
+                    font-size: 12px; opacity: 0.8; margin: 0;
                 }}
                 
                 @media (max-width: 600px) {{
-                    .container {{ margin: 10px; border-radius: 12px; }}
-                    .header {{ padding: 25px 20px; }}
-                    .ai-dashboard {{ padding: 20px; }}
-                    .content {{ padding: 25px 20px; }}
-                    .metrics-grid {{ grid-template-columns: repeat(2, 1fr); gap: 15px; }}
+                    body {{ padding: 10px; }}
+                    .summary-bar {{ flex-direction: column; }}
                     .news-header {{ flex-direction: column; align-items: flex-start; }}
+                    .content {{ padding: 20px; }}
                 }}
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Matt's Executive Intelligence</h1>
-                    <div class="tagline">AI-Powered Strategic Intelligence for Real Estate Leaders</div>
-                    <div class="timestamp">
-                        📅 {current_date} • ⏰ {current_time} • 🤖 AI Confidence: {ai_confidence:.0f}%
-                    </div>
+                    <h1>🏢 Commercial Property Intelligence</h1>
+                    <div class="date">{current_date} • {current_time}</div>
                 </div>
                 
-                <div class="ai-dashboard">
-                    <div class="ai-status">
-                        <div class="ai-pulse">
-                            <div class="pulse-dot"></div>
-                            Market Pulse: {market_pulse}
-                        </div>
+                <div class="summary-bar">
+                    <div class="metric">
+                        <div class="metric-value">{len(relevant_items)}</div>
+                        <div class="metric-label">Relevant Items</div>
                     </div>
-                    
-                    <div class="metrics-grid">
-                        <div class="metric-card">
-                            <div class="metric-value">{total_items}</div>
-                            <div class="metric-label">Sources Analyzed</div>
-                            <div class="metric-trend trend-up">↗ +{total_items}</div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-value">{critical_count}</div>
-                            <div class="metric-label">Critical Alerts</div>
-                            <div class="metric-trend {'trend-up' if critical_count > 0 else 'trend-neutral'}">
-                                {'🚨 Urgent' if critical_count > 0 else '✅ Normal'}
-                            </div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-value">{avg_score:.1f}</div>
-                            <div class="metric-label">Relevance Score</div>
-                            <div class="metric-trend {'trend-up' if avg_score >= 7 else 'trend-neutral' if avg_score >= 5 else 'trend-down'}">
-                                /10 {'🎯 High' if avg_score >= 7 else '📊 Med' if avg_score >= 5 else '📉 Low'}
-                            </div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-value">{sentiment}</div>
-                            <div class="metric-label">Market Sentiment</div>
-                            <div class="metric-trend trend-{'up' if sentiment == 'Positive' else 'down' if sentiment == 'Negative' else 'neutral'}">
-                                {{'📈 Bullish' if sentiment == 'Positive' else '📉 Bearish' if sentiment == 'Negative' else '📊 Stable'}}
-                            </div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-value">{risk_level}</div>
-                            <div class="metric-label">Risk Level</div>
-                            <div class="metric-trend trend-{'down' if risk_level == 'Low' else 'neutral' if risk_level == 'Medium' else 'up'}">
-                                {{'🟢 Stable' if risk_level == 'Low' else '🟡 Watch' if risk_level == 'Medium' else '🔴 Alert'}}
-                            </div>
-                        </div>
-                        <div class="metric-card">
-                            <div class="metric-value">{opportunity_count}</div>
-                            <div class="metric-label">Opportunities</div>
-                            <div class="metric-trend trend-up">💡 Identified</div>
-                        </div>
+                    <div class="metric">
+                        <div class="metric-value">{critical_count}</div>
+                        <div class="metric-label">Critical</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-value">{sentiment_emoji}</div>
+                        <div class="metric-label">Market Sentiment</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-value">🤖</div>
+                        <div class="metric-label">AI Analyzed</div>
                     </div>
                 </div>
                 
                 <div class="content">
                     <div class="executive-summary">
-                        <div class="summary-title">AI Executive Summary</div>
-                        <div class="summary-content">
-                            {self.generate_advanced_executive_summary(sorted_items[:5], sentiment, risk_level)}
+                        <div class="summary-title">📊 Executive Summary</div>
+                        <div class="summary-text">
+                            {self.generate_clean_executive_summary(relevant_items, sentiment)}
                         </div>
                     </div>
                     
-                    {self.generate_ai_insights_section(sorted_items[:3])}
-                    
-                    {self.generate_strategic_actions_section(sorted_items[:3])}
-                    
-                    <div class="priority-section">
-                        <div class="section-header">
-                            <div class="section-title">🎯 Priority Intelligence</div>
-                            <div class="section-count">{min(len(sorted_items), 8)} Items</div>
-                        </div>
-                        {self.generate_enhanced_news_items(sorted_items[:8])}
+                    <div class="news-section">
+                        <div class="section-title">🎯 Commercial Property Impact Analysis</div>
+                        {self.generate_clean_news_items(relevant_items)}
                     </div>
                 </div>
                 
                 <div class="footer">
-                    <div class="footer-brand">Matt's Executive Intelligence Platform</div>
-                    <div class="footer-tagline">Powered by Advanced AI • Real-time Market Analysis • Strategic Decision Support</div>
-                    <div class="footer-stats">
-                        📊 {total_items} sources • 🤖 {ai_confidence:.0f}% confidence • ⚡ Generated in real-time<br>
-                        🔒 Confidential briefing • 📈 Market-focused analysis • 🎯 Executive-grade intelligence
+                    <div class="footer-text">
+                        AI-Powered Commercial Property Intelligence • {len(relevant_items)} sources analyzed<br>
+                        Generated at {current_time} AEST • Confidential Executive Briefing
                     </div>
                 </div>
             </div>
@@ -1237,6 +1085,155 @@ See README.md for detailed setup instructions.
         """
         
         return html
+
+    def generate_clean_executive_summary(self, items: List[Tuple], sentiment: str) -> str:
+        """Generate clean, focused executive summary"""
+        if not items:
+            return "No significant commercial property developments identified in current market analysis."
+        
+        high_impact = [item for item in items if item[3] >= 8]
+        medium_impact = [item for item in items if 6 <= item[3] < 8]
+        
+        summary = f"Market analysis reveals {len(items)} developments with commercial property implications. "
+        
+        if high_impact:
+            summary += f"{len(high_impact)} high-impact items require immediate attention. "
+        
+        if sentiment == "Positive":
+            summary += "Overall market sentiment indicates favorable conditions for commercial property investment and development."
+        elif sentiment == "Negative":
+            summary += "Market conditions suggest caution in commercial property decisions with heightened risk monitoring required."
+        else:
+            summary += "Market sentiment remains stable with balanced risk-reward scenarios across commercial property sectors."
+        
+        return summary
+
+    def generate_clean_news_items(self, items: List[Tuple]) -> str:
+        """Generate clean news items with commercial property relevance"""
+        if not items:
+            return "<p>No relevant commercial property developments identified.</p>"
+        
+        html = ""
+        
+        for item in items:
+            title, link, description, score, summary, source = item[:6]
+            
+            # Determine priority styling
+            if score >= 8:
+                priority_class = "news-critical"
+                priority_label = "CRITICAL"
+            elif score >= 7:
+                priority_class = "news-high"
+                priority_label = "HIGH"
+            else:
+                priority_class = "news-medium"
+                priority_label = "MEDIUM"
+            
+            # Generate AI commercial property relevance
+            relevance = self.generate_commercial_property_relevance(title, description, score)
+            
+            # Clean summary
+            clean_summary = (summary or description)[:150] + "..." if (summary or description) else ""
+            clean_summary = re.sub('<[^<]+?>', '', clean_summary)
+            
+            html += f'''
+            <div class="news-item {priority_class}">
+                <div class="news-header">
+                    <div class="news-title">
+                        <a href="{link}" target="_blank">{title}</a>
+                    </div>
+                    <div class="news-score">{score}/10</div>
+                </div>
+                
+                <div class="news-meta">
+                    {priority_label} • {source} • {datetime.now().strftime('%H:%M')}
+                </div>
+                
+                <div class="relevance-box">
+                    <div class="relevance-title">🏢 Commercial Property Impact</div>
+                    <div class="relevance-text">{relevance}</div>
+                </div>
+            </div>
+            '''
+        
+        return html
+
+    def generate_commercial_property_relevance(self, title: str, description: str, score: int) -> str:
+        """Generate AI-powered commercial property relevance analysis"""
+        title_lower = title.lower()
+        desc_lower = (description or "").lower()
+        combined = title_lower + " " + desc_lower
+        
+        # Use AI to generate specific commercial property relevance
+        try:
+            prompt = f"""Analyze this news item for commercial property relevance in 1-2 sentences:
+            
+Title: {title}
+Description: {description[:200]}
+
+Explain specifically HOW this impacts commercial property (office, retail, industrial, logistics) investment, development, or operations. Be concrete and actionable for A-REIT executives."""
+
+            response = openai.ChatCompletion.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.1
+            )
+            
+            relevance = response.choices[0].message.content.strip()
+            return relevance
+            
+        except Exception as e:
+            logging.warning(f"AI relevance analysis failed: {e}")
+            
+            # Fallback analysis based on keywords
+            if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary']):
+                return "Interest rate changes directly impact commercial property valuations, cap rates, and debt servicing costs across all asset classes."
+            elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid']):
+                return "Workplace trends affect office demand, occupancy rates, and rental growth prospects in CBD and suburban markets."
+            elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce']):
+                return "Consumer behavior shifts influence retail property demand, tenant mix strategies, and asset repositioning requirements."
+            elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain']):
+                return "Supply chain developments impact industrial property demand, logistics hub valuations, and last-mile delivery real estate."
+            elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning']):
+                return "Development regulations and construction factors affect project feasibility, delivery timelines, and development margins."
+            elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital']):
+                return "Technology adoption influences property operations efficiency, tenant requirements, and smart building investment priorities."
+            elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance']):
+                return "Capital market conditions affect property acquisition financing, portfolio strategies, and investment return expectations."
+            else:
+                return "Broader economic trends provide important context for commercial property market dynamics and strategic decision-making."
+
+    def calculate_simple_sentiment(self, items: List[Tuple]) -> str:
+        """Calculate market sentiment from news items"""
+        if not items:
+            return "Neutral"
+        
+        positive_keywords = ['growth', 'increase', 'strong', 'boost', 'positive', 'up', 'gain', 'improvement', 'rising', 'surge']
+        negative_keywords = ['decline', 'fall', 'drop', 'weak', 'negative', 'down', 'loss', 'concern', 'risk', 'falling', 'crash']
+        
+        positive_score = 0
+        negative_score = 0
+        
+        for item in items:
+            title_desc = (item[0] + ' ' + item[2]).lower()
+            interest_score = item[3]
+            
+            # Weight by interest score
+            weight = interest_score / 10.0
+            
+            for keyword in positive_keywords:
+                positive_score += title_desc.count(keyword) * weight
+            
+            for keyword in negative_keywords:
+                negative_score += title_desc.count(keyword) * weight
+        
+        if positive_score > negative_score * 1.3:
+            return "Positive"
+        elif negative_score > positive_score * 1.3:
+            return "Negative"
+        else:
+            return "Neutral"
 
     def calculate_risk_level(self, items: List[Tuple]) -> str:
         """Calculate overall risk level from news items"""
@@ -1271,6 +1268,150 @@ See README.md for detailed setup instructions.
             return "📊 Stable"
         else:
             return "😴 Quiet"
+
+    def generate_executive_summary_text(self, top_items: List[Tuple]) -> str:
+        """Generate executive summary from top items"""
+        if not top_items:
+            return "No significant developments in commercial property sector today."
+        
+        # Extract key themes
+        themes = []
+        for item in top_items[:3]:
+            title = item[0].lower()
+            if any(keyword in title for keyword in ['interest rate', 'rba', 'cash rate']):
+                themes.append("monetary policy developments")
+            elif any(keyword in title for keyword in ['property', 'real estate', 'reit']):
+                themes.append("property sector activity")
+            elif any(keyword in title for keyword in ['office', 'retail', 'industrial']):
+                themes.append("commercial property fundamentals")
+            elif any(keyword in title for keyword in ['technology', 'ai', 'digital']):
+                themes.append("technology disruption")
+        
+        unique_themes = list(set(themes))
+        
+        if unique_themes:
+            theme_text = ", ".join(unique_themes[:2])
+            return f"Key developments today focused on {theme_text}. {len(top_items)} high-priority items require executive attention."
+        else:
+            return f"{len(top_items)} priority items identified across commercial property and related sectors."
+
+    def generate_action_items_html(self, top_items: List[Tuple]) -> str:
+        """Generate action items section"""
+        if not top_items:
+            return ""
+        
+        actions = []
+        
+        for item in top_items[:3]:
+            title, link, description, score = item[0], item[1], item[2], item[3]
+            
+            if score >= 9:
+                actions.append(f"<strong>URGENT:</strong> Review implications of '{title[:60]}...'")
+            elif score >= 8:
+                actions.append(f"<strong>Monitor:</strong> Track developments in '{title[:60]}...'")
+            elif score >= 7:
+                actions.append(f"<strong>Consider:</strong> Assess impact of '{title[:60]}...'")
+        
+        if actions:
+            action_html = "<br>• ".join(actions)
+            return f'''
+            <div class="action-items">
+                <strong>🎯 Executive Action Items</strong><br>
+                • {action_html}
+            </div>
+            '''
+        
+        return ""
+
+    def generate_news_items_html(self, items: List[Tuple]) -> str:
+        """Generate news items HTML"""
+        html = ""
+        
+        for item in items:
+            title, link, description, score, summary, source = item[:6]
+            
+            # Determine priority class
+            if score >= 8:
+                priority_class = "priority-high"
+                priority_icon = "🔴"
+            elif score >= 6:
+                priority_class = "priority-medium"  
+                priority_icon = "🟡"
+            else:
+                priority_class = ""
+                priority_icon = "🟢"
+            
+            # Clean and truncate summary
+            clean_summary = (summary or description)[:200] + "..." if (summary or description) else "No summary available"
+            clean_summary = re.sub('<[^<]+?>', '', clean_summary)  # Remove HTML tags
+            
+            html += f'''
+            <div class="news-item {priority_class}">
+                <div class="news-title">
+                    <a href="{link}" target="_blank">{title}</a>
+                </div>
+                <div class="news-meta">
+                    {priority_icon} Score: {score}/10 • {source} • {datetime.now().strftime('%H:%M')}
+                </div>
+                <div class="news-summary">
+                    {clean_summary}
+                </div>
+            </div>
+            '''
+        
+        return html
+
+    def generate_social_media_html(self, items: List[Tuple]) -> str:
+        """Generate simple social media content"""
+        if len(items) < 2:
+            return ""
+        
+        top_item = items[0]
+        title = top_item[0]
+        
+        # Generate simple social posts
+        twitter_post = f"Key development in commercial property: {title[:180]}... What are your thoughts on the implications? #CommercialProperty #AREIT"
+        
+        linkedin_post = f"Interesting development in our sector:\n\n{title}\n\nThis highlights the importance of staying informed about market dynamics. How do you see this impacting commercial property strategies?\n\n#RealEstate #CommercialProperty #Leadership"
+        
+        return f'''
+        <div class="social-section">
+            <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📱 Ready-to-Share Content</h3>
+            
+            <div class="social-post">
+                <strong>🐦 Twitter:</strong><br>
+                {twitter_post}
+            </div>
+            
+            <div class="social-post">
+                <strong>💼 LinkedIn:</strong><br>
+                {linkedin_post[:300]}...
+            </div>
+        </div>
+        '''
+
+    def generate_additional_items_html(self, items: List[Tuple]) -> str:
+        """Generate additional items section"""
+        if not items:
+            return ""
+        
+        html = '''
+        <div style="margin-top: 20px;">
+            <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📋 Additional Items</h3>
+        '''
+        
+        for item in items:
+            title, link, score, source = item[0], item[1], item[3], item[5]
+            
+            html += f'''
+            <div style="border-bottom: 1px solid #e9ecef; padding: 8px 0; font-size: 12px;">
+                <a href="{link}" target="_blank" style="color: #495057; text-decoration: none; font-weight: 500;">{title}</a>
+                <span style="color: #6c757d; margin-left: 8px;">• {source} • {score}/10</span>
+            </div>
+            '''
+        
+        html += "</div>"
+        return html
 
     def generate_advanced_executive_summary(self, top_items: List[Tuple], sentiment: str, risk_level: str) -> str:
         """Generate sophisticated AI-powered executive summary"""
