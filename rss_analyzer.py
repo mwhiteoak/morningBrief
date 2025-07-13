@@ -1074,11 +1074,15 @@ See README.md for detailed setup instructions.
                 </div>
                 
                 <div class="footer">
-                    <div class="footer-text">
-                        AI-Powered Commercial Property Intelligence • {len(relevant_items)} sources analyzed<br>
-                        Generated at {current_time} AEST • Confidential Executive Briefing
-                    </div>
+                <div class="footer-text">
+                    AI-Powered Commercial Property Intelligence • {len(relevant_items)} sources analyzed<br>
+                    Generated at {current_time} AEST • Executive Briefing • Threshold: Score ≥5<br>
+                    <br>
+                    <a href="https://www.linkedin.com/in/mattwhiteoak" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 600;">
+                        Connect with Matt WhiteOak on LinkedIn
+                    </a>
                 </div>
+            </div>
             </div>
         </body>
         </html>
