@@ -19,6 +19,7 @@ import schedule
 import logging
 import re
 import socket
+import sys
 import concurrent.futures
 from threading import Lock
 from collections import defaultdict, Counter
@@ -1362,25 +1363,83 @@ See README.md for detailed setup instructions.
                 logging.error(f"Emergency fallback also failed: {fallback_error}")
 
 
+    def cleanup_old_items(self, days: int = 7):
+        """Remove items older than specified days"""
+        try:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            
+            # Count items to be deleted
+            cursor = self.conn.execute(
+                'SELECT COUNT(*) FROM items WHERE processed_at < ?', 
+                (cutoff_date,)
+            )
+            count = cursor.fetchone()[0]
+            
+            if count > 0:
+                # Delete old items
+                self.conn.execute(
+                    'DELETE FROM items WHERE processed_at < ?', 
+                    (cutoff_date,)
+                )
+                self.conn.commit()
+                logging.info(f"Cleaned up {count} items older than {days} days")
+            else:
+                logging.info(f"No items older than {days} days found")
+                
+        except Exception as e:
+            logging.error(f"Cleanup error: {e}")
+            raise
+
+
 def main():
     """Main function to run the RSS analyzer"""
     try:
         analyzer = RSSAnalyzer()
         
-        # Schedule processing 3 times daily
-        schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing)  # Morning AEST
-        schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing)  # Midday AEST  
-        schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing)  # Evening AEST
-        
-        logging.info("RSS Analyzer started - running scheduled processing...")
-        
-        # Run immediately on startup
-        analyzer.run_scheduled_processing()
-        
-        # Keep running scheduled tasks
-        while True:
-            schedule.run_pending()
-            time.sleep(60)  # Check every minute
+        # Handle command line arguments for GitHub Actions
+        if len(sys.argv) > 1:
+            command = sys.argv[1].lower()
+            
+            if command in ['process', 'run', 'test']:
+                logging.info("Running single processing cycle for GitHub Actions...")
+                analyzer.run_scheduled_processing()
+                logging.info("Processing completed successfully!")
+                
+            elif command == 'email':
+                logging.info("Sending daily email...")
+                analyzer.send_daily_brief_enhanced()
+                logging.info("Email sent successfully!")
+                
+            elif command == 'cleanup':
+                days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+                logging.info(f"Cleaning up items older than {days} days...")
+                analyzer.cleanup_old_items(days)
+                logging.info("Cleanup completed!")
+                
+            else:
+                print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
+                print("  process - Run RSS processing and send email")
+                print("  email   - Send daily email only")  
+                print("  cleanup - Remove old database entries (default: 7 days)")
+                sys.exit(1)
+        else:
+            # Run continuous scheduled mode
+            logging.info("Starting continuous scheduled mode...")
+            
+            # Schedule processing 3 times daily
+            schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing)  # Morning AEST
+            schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing)  # Midday AEST  
+            schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing)  # Evening AEST
+            
+            logging.info("RSS Analyzer started - running scheduled processing...")
+            
+            # Run immediately on startup
+            analyzer.run_scheduled_processing()
+            
+            # Keep running scheduled tasks
+            while True:
+                schedule.run_pending()
+                time.sleep(60)  # Check every minute
             
     except KeyboardInterrupt:
         logging.info("RSS Analyzer stopped by user")
