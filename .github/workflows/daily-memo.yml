@@ -1,0 +1,60 @@
+name: Matt's Memo - Daily Intelligence Brief
+
+on:
+  schedule:
+    # Run at 6:00 AM AEST (8:00 PM UTC previous day)
+    - cron: '0 20 * * *'
+  
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+jobs:
+  send-daily-memo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Create environment variables
+      run: |
+        echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
+        echo "GMAIL_USER=${{ secrets.GMAIL_USER }}" >> .env
+        echo "GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}" >> .env
+        echo "RECIPIENT_EMAIL=${{ secrets.RECIPIENT_EMAIL }}" >> .env
+        echo "LINKEDIN_PROFILE_URL=${{ secrets.LINKEDIN_PROFILE_URL }}" >> .env
+    
+    - name: Process RSS feeds
+      run: |
+        echo "🚀 Starting RSS feed processing..."
+        python rss_analyzer.py test
+    
+    - name: Generate and send daily email
+      run: |
+        echo "📧 Generating and sending daily email..."
+        python rss_analyzer.py email
+        echo "✅ Daily memo sent successfully!"
+    
+    - name: Upload logs as artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rss-analyzer-logs-${{ github.run_number }}
+        path: rss_analyzer.log
+        retention-days: 7
+    
+    - name: Cleanup old database entries
+      run: |
+        python rss_analyzer.py cleanup 7
+        echo "🧹 Cleaned up database entries older than 7 days"
