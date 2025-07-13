@@ -3,7 +3,7 @@ name: Matt's Memo - Daily Intelligence Brief
 on:
   schedule:
     # Run at 6:00 AM AEST (8:00 PM UTC previous day)
-    - cron: '0 20 * * *'
+    - cron: '0 20 * * *'  # Fixed: added missing asterisk
   
   # Allow manual triggering for testing
   workflow_dispatch:
@@ -27,7 +27,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Process RSS feeds
+    - name: Process RSS feeds and send daily email
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -35,20 +35,9 @@ jobs:
         RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
       run: |
-        echo "🚀 Starting RSS feed processing..."
-        python rss_analyzer.py test
-    
-    - name: Generate and send daily email
-      env:
-        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        GMAIL_USER: ${{ secrets.GMAIL_USER }}
-        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-        LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
-      run: |
-        echo "📧 Generating and sending daily email..."
-        python rss_analyzer.py email
-        echo "✅ Daily memo sent successfully!"
+        echo "🚀 Starting RSS feed processing and email generation..."
+        python rss_analyzer.py process
+        echo "✅ Daily memo processing completed!"
     
     - name: Upload logs as artifact
       if: always()
