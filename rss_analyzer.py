@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Enhanced RSS Feed Analyzer - Executive Intelligence Platform
-With comprehensive summary, social media content, and executive dashboard
+RSS Feed Analyzer for A-REIT CEO/COO - Executive Intelligence Platform
+Monitors RSS feeds, evaluates content with OpenAI, and sends daily emails
+OPTIMIZED VERSION - 3x Daily Incremental Processing
 """
 
 import feedparser
@@ -14,832 +15,1268 @@ from datetime import datetime, timedelta
 import time
 import os
 import json
+import schedule
 import logging
 import re
-from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+import socket
+import concurrent.futures
+from threading import Lock
 from collections import defaultdict, Counter
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+from dotenv import load_dotenv
+
+# Import RSS feeds from separate file
+from feeds import RSS_FEEDS
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging (fixed Unicode issues for Windows)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('rss_analyzer.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 
 @dataclass
-class SocialMediaPost:
-    platform: str  # 'twitter' or 'linkedin'
-    content: str
-    hashtags: List[str]
-    source_article: str
-    rationale: str
+class FeedItem:
+    title: str
+    link: str
+    description: str
+    published: datetime
+    source_feed: str
+    source_name: str = ""
+    interest_score: Optional[int] = None
+    ai_summary: Optional[str] = None
+    category: Optional[str] = None
+    sentiment: Optional[str] = None
+    key_metrics: Optional[List[str]] = None
+    geographic_tags: Optional[List[str]] = None
+    sector_tags: Optional[List[str]] = None
 
 @dataclass
-class ExecutiveInsight:
-    category: str
-    insight: str
-    relevance_score: int
-    action_required: bool
-    timeline: str
-    source_articles: List[str]
+class ExecutiveSummary:
+    market_pulse_score: float
+    key_alerts: List[str]
+    major_deals: List[str]
+    regulatory_items: List[str]
+    sentiment_overview: str
+    trending_topics: List[Tuple[str, int]]
 
-@dataclass
-class PropertyRelevanceAnalysis:
-    relevance_score: int  # 1-10
-    property_sectors: List[str]  # office, retail, industrial, residential
-    market_impact: str  # positive, negative, neutral
-    reasoning: str
-    key_metrics: List[str]
-    geographic_impact: List[str]
-
-class EnhancedEmailGenerator:
-    """Generate comprehensive executive briefings with social media content"""
+class IncrementalProcessor:
+    """Processes only new items since last run - much faster!"""
     
     def __init__(self, rss_analyzer):
         self.analyzer = rss_analyzer
-        self.openai_client = openai
+        self.init_tracking_table()
     
-    def analyze_property_relevance(self, items: List[Tuple]) -> Dict[str, PropertyRelevanceAnalysis]:
-        """Use AI to analyze why each item is relevant to commercial property"""
+    def init_tracking_table(self):
+        """Initialize table to track last processing times"""
+        self.analyzer.conn.execute('''
+            CREATE TABLE IF NOT EXISTS processing_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_type TEXT NOT NULL,
+                last_run_time DATETIME NOT NULL,
+                items_processed INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.analyzer.conn.commit()
+        logging.info("Processing tracking table initialized")
+    
+    def get_last_run_time(self, run_type: str = 'feed_processing') -> Optional[datetime]:
+        """Get the last time we processed feeds"""
+        cursor = self.analyzer.conn.execute('''
+            SELECT last_run_time FROM processing_runs 
+            WHERE run_type = ? 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        ''', (run_type,))
         
+        result = cursor.fetchone()
+        if result:
+            try:
+                return datetime.fromisoformat(result[0].replace('Z', '+00:00').replace('+00:00', ''))
+            except:
+                return datetime.fromisoformat(result[0])
+        return None
+    
+    def update_last_run_time(self, run_type: str = 'feed_processing', items_processed: int = 0):
+        """Update the last run time"""
+        now = datetime.now()
+        self.analyzer.conn.execute('''
+            INSERT INTO processing_runs (run_type, last_run_time, items_processed)
+            VALUES (?, ?, ?)
+        ''', (run_type, now, items_processed))
+        self.analyzer.conn.commit()
+        logging.info(f"Updated last run time: {now}, items processed: {items_processed}")
+    
+    def get_incremental_cutoff_time(self) -> datetime:
+        """Get the cutoff time for incremental processing"""
+        last_run = self.get_last_run_time()
+        
+        if last_run:
+            # Process items since last run, with small overlap for safety
+            cutoff_time = last_run - timedelta(minutes=30)  # 30min overlap
+            logging.info(f"Incremental processing: items since {cutoff_time}")
+        else:
+            # First run - get last 6 hours
+            cutoff_time = datetime.now() - timedelta(hours=6)
+            logging.info(f"First run: items from last 6 hours since {cutoff_time}")
+        
+        return cutoff_time
+    
+    def should_send_email(self) -> Tuple[bool, str]:
+        """Determine if we should send email based on time of day"""
+        now = datetime.now()
+        hour = now.hour
+        
+        # Convert to AEST equivalent (assuming UTC+10)
+        aest_hour = (hour + 10) % 24
+        
+        # Send email only at morning run (6 AM AEST = 20 UTC previous day)
+        if 20 <= hour <= 23 or hour <= 2:  # Around 6 AM AEST
+            return True, "morning"
+        elif 0 <= hour <= 4:  # Around 12 PM AEST  
+            return False, "midday"
+        elif 6 <= hour <= 10:  # Around 6 PM AEST
+            return False, "evening"
+        else:
+            return False, "other"
+
+class RSSAnalyzer:
+    def __init__(self):
+        # Load configuration from environment variables
+        self.config = {
+            'openai_api_key': os.getenv('OPENAI_API_KEY'),
+            'gmail_user': os.getenv('GMAIL_USER'),
+            'gmail_password': os.getenv('GMAIL_APP_PASSWORD'),
+            'recipient_email': os.getenv('RECIPIENT_EMAIL'),
+        }
+        
+        # Validate required environment variables
+        required_vars = ['OPENAI_API_KEY', 'GMAIL_USER', 'GMAIL_APP_PASSWORD', 'RECIPIENT_EMAIL']
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            raise ValueError(f"""
+Missing required environment variables: {', '.join(missing_vars)}
+
+Please ensure you have:
+1. Copied .env.template to .env
+2. Added your actual credentials to .env
+3. Set up Gmail App Password (not regular password)
+4. Created OpenAI API key
+
+See README.md for detailed setup instructions.
+            """)
+        
+        # Validate configuration format
+        self.validate_config()
+        
+        # Initialize OpenAI
+        openai.api_key = self.config['openai_api_key']
+        
+        # Initialize database
+        self.init_database()
+        
+        # Load RSS feeds from separate file
+        self.rss_feeds = RSS_FEEDS
+        
+        logging.info(f"Initialized RSS Analyzer with {len(self.rss_feeds)} feeds")
+    
+    def validate_config(self):
+        """Validate configuration and provide helpful error messages"""
+        errors = []
+        
+        # Check OpenAI API key format
+        api_key = self.config.get('openai_api_key', '')
+        if not api_key.startswith('sk-'):
+            errors.append("OpenAI API key should start with 'sk-'")
+        
+        # Check email format
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        
+        gmail_user = self.config.get('gmail_user', '')
+        if not re.match(email_pattern, gmail_user):
+            errors.append(f"Invalid Gmail user email format: {gmail_user}")
+        
+        recipient = self.config.get('recipient_email', '')
+        if not re.match(email_pattern, recipient):
+            errors.append(f"Invalid recipient email format: {recipient}")
+        
+        # Check Gmail app password (should be 16 characters)
+        app_password = self.config.get('gmail_password', '')
+        if len(app_password) != 16:
+            errors.append("Gmail app password should be 16 characters long")
+        
+        if errors:
+            error_msg = "Configuration errors found:\n" + "\n".join(f"  - {error}" for error in errors)
+            error_msg += "\n\nPlease check your .env file and fix these issues."
+            raise ValueError(error_msg)
+        
+        logging.info("Configuration validation passed")
+        
+    def init_database(self):
+        """Initialize SQLite database with enhanced schema"""
+        self.conn = sqlite3.connect('rss_items.db', check_same_thread=False)
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                link TEXT UNIQUE NOT NULL,
+                description TEXT,
+                published DATETIME,
+                source_feed TEXT,
+                source_name TEXT,
+                interest_score INTEGER,
+                ai_summary TEXT,
+                category TEXT,
+                sentiment TEXT,
+                key_metrics TEXT,
+                geographic_tags TEXT,
+                sector_tags TEXT,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                email_sent BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        
+        # Add new columns if they don't exist (for existing databases)
+        try:
+            self.conn.execute('ALTER TABLE items ADD COLUMN category TEXT')
+            self.conn.execute('ALTER TABLE items ADD COLUMN sentiment TEXT')
+            self.conn.execute('ALTER TABLE items ADD COLUMN key_metrics TEXT')
+            self.conn.execute('ALTER TABLE items ADD COLUMN geographic_tags TEXT')
+            self.conn.execute('ALTER TABLE items ADD COLUMN sector_tags TEXT')
+        except sqlite3.OperationalError:
+            pass  # Columns already exist
+        
+        self.conn.commit()
+        logging.info("Database initialized successfully")
+    
+    def fetch_feed_items(self, feed_config: Dict) -> List[FeedItem]:
+        """Legacy fetch method - gets all items (for compatibility)"""
+        feed_url = feed_config['url']
+        feed_name = feed_config['name']
+        
+        try:
+            logging.info(f"Fetching feed: {feed_name}")
+            feed = feedparser.parse(feed_url)
+            
+            if feed.bozo:
+                logging.warning(f"Feed parsing warning for {feed_name}: {feed.bozo_exception}")
+            
+            items = []
+            now = datetime.now()
+            
+            for entry in feed.entries:
+                # Parse published date
+                published = now  # Default to now if no date found
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    try:
+                        published = datetime(*entry.published_parsed[:6])
+                    except (TypeError, ValueError):
+                        pass
+                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                    try:
+                        published = datetime(*entry.updated_parsed[:6])
+                    except (TypeError, ValueError):
+                        pass
+                
+                # Get description with fallback to summary
+                description = ""
+                if hasattr(entry, 'description'):
+                    description = entry.description
+                elif hasattr(entry, 'summary'):
+                    description = entry.summary
+                
+                item = FeedItem(
+                    title=entry.title,
+                    link=entry.link,
+                    description=description,
+                    published=published,
+                    source_feed=feed_url,
+                    source_name=feed_name
+                )
+                items.append(item)
+            
+            # Sort by published date (newest first)
+            items.sort(key=lambda x: x.published, reverse=True)
+            
+            logging.info(f"Fetched {len(items)} items from {feed_name}")
+            return items
+            
+        except Exception as e:
+            logging.error(f"Error fetching feed {feed_name} ({feed_url}): {e}")
+            return []
+
+    def fetch_feed_items_recent_only(self, feed_config: Dict, cutoff_time: datetime, max_items: int = 20) -> List[FeedItem]:
+        """OPTIMIZED: Fetch ONLY recent RSS feed items - much faster!"""
+        feed_url = feed_config['url']
+        feed_name = feed_config['name']
+        
+        try:
+            logging.info(f"Fetching recent items from: {feed_name} (since {cutoff_time.strftime('%H:%M')})")
+            
+            # Set timeout for slow feeds
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(15)  # 15 second timeout
+            
+            try:
+                feed = feedparser.parse(feed_url)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
+            
+            if feed.bozo:
+                logging.warning(f"Feed parsing warning for {feed_name}: {feed.bozo_exception}")
+            
+            items = []
+            processed_count = 0
+            too_old_count = 0
+            
+            # Process entries but STOP when we hit old items
+            for entry in feed.entries:
+                processed_count += 1
+                
+                # Parse published date
+                published = datetime.now()  # Default to now
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    try:
+                        published = datetime(*entry.published_parsed[:6])
+                    except (TypeError, ValueError):
+                        pass
+                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                    try:
+                        published = datetime(*entry.updated_parsed[:6])
+                    except (TypeError, ValueError):
+                        pass
+                
+                # STOP processing if item is too old (RSS feeds are usually chronological)
+                if published < cutoff_time:
+                    too_old_count += 1
+                    # If we hit 3 old items in a row, stop processing (feeds are chronological)
+                    if too_old_count >= 3:
+                        logging.info(f"   Stopping - hit {too_old_count} old items (feed is chronological)")
+                        break
+                    continue
+                else:
+                    too_old_count = 0  # Reset counter
+                
+                # Item is recent enough - process it
+                description = ""
+                if hasattr(entry, 'description'):
+                    description = entry.description
+                elif hasattr(entry, 'summary'):
+                    description = entry.summary
+                
+                item = FeedItem(
+                    title=entry.title,
+                    link=entry.link,
+                    description=description,
+                    published=published,
+                    source_feed=feed_url,
+                    source_name=feed_name
+                )
+                items.append(item)
+                
+                # Limit items per feed to prevent memory issues
+                if len(items) >= max_items:
+                    logging.info(f"   Reached max items limit ({max_items}) for {feed_name}")
+                    break
+            
+            # Sort by published date (newest first)
+            items.sort(key=lambda x: x.published, reverse=True)
+            
+            if items:
+                newest = items[0].published
+                oldest = items[-1].published
+                time_span = (newest - oldest).total_seconds() / 3600
+                logging.info(f"✓ {feed_name}: {len(items)} recent items (processed {processed_count} entries, spanning {time_span:.1f}h)")
+            else:
+                logging.info(f"✓ {feed_name}: No recent items (processed {processed_count} entries)")
+            
+            return items
+            
+        except Exception as e:
+            logging.error(f"✗ Error fetching {feed_name}: {e}")
+            return []
+
+    def fetch_feeds_parallel_recent(self, cutoff_time: datetime, max_workers: int = 4) -> List[FeedItem]:
+        """OPTIMIZED: Fetch recent items from all feeds in parallel - FAST!"""
+        all_items = []
+        start_time = time.time()
+        
+        logging.info(f"🚀 Fetching recent items from {len(self.rss_feeds)} feeds in parallel...")
+        logging.info(f"   Cutoff time: {cutoff_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        def fetch_with_timeout(feed_config):
+            """Wrapper to fetch feed with individual timeout"""
+            try:
+                return self.fetch_feed_items_recent_only(feed_config, cutoff_time, max_items=15)
+            except Exception as e:
+                logging.error(f"Feed fetch timeout/error: {feed_config['name']} - {e}")
+                return []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all feed fetch tasks
+            future_to_feed = {
+                executor.submit(fetch_with_timeout, feed_config): feed_config 
+                for feed_config in self.rss_feeds
+            }
+            
+            # Collect results with timeout
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_feed, timeout=60):
+                feed_config = future_to_feed[future]
+                completed += 1
+                
+                try:
+                    items = future.result(timeout=5)
+                    all_items.extend(items)
+                    
+                    percentage = (completed / len(self.rss_feeds)) * 100
+                    logging.info(f"   Progress: {completed}/{len(self.rss_feeds)} feeds ({percentage:.0f}%)")
+                    
+                except Exception as e:
+                    logging.warning(f"   Failed: {feed_config['name']} - {e}")
+        
+        elapsed = time.time() - start_time
+        logging.info(f"✅ Parallel fetch completed in {elapsed:.1f}s: {len(all_items)} total recent items")
+        
+        return all_items
+
+    def should_use_ai_analysis_quick(self, item) -> bool:
+        """Quick decision: does this item need AI analysis?"""
+        title_lower = item.title.lower()
+        desc_lower = item.description.lower()
+        combined = title_lower + " " + desc_lower
+        
+        # High-value items that need nuanced analysis
+        high_value_keywords = [
+            'merger', 'acquisition', 'takeover', 'buyout',
+            'policy', 'regulation', 'government', 'legislation',
+            'market outlook', 'forecast', 'prediction', 'outlook',
+            'investment grade', 'credit rating', 'valuation',
+            'reit dividend', 'distribution', 'capital raising',
+            'development approval', 'planning permit', 'zoning'
+        ]
+        
+        # Technology items that might impact real estate
+        tech_keywords = [
+            'proptech', 'artificial intelligence', 'machine learning',
+            'blockchain', 'automation', 'digital transformation',
+            'smart building', 'iot', 'internet of things',
+            'data analytics', 'predictive analytics', 'ai'
+        ]
+        
+        # Check for high-value keywords
+        if any(keyword in combined for keyword in high_value_keywords):
+            return True
+        
+        # Check for tech keywords
+        if any(keyword in combined for keyword in tech_keywords):
+            return True
+        
+        # High interest score potential (long content with business keywords)
+        if len(item.description) > 200 and any(keyword in combined for keyword in [
+            'commercial property', 'office market', 'retail property',
+            'industrial property', 'property investment', 'real estate'
+        ]):
+            return True
+        
+        return False
+
+    def auto_score_item_quick(self, item):
+        """Quick auto-scoring without AI"""
+        title_lower = item.title.lower()
+        desc_lower = item.description.lower()
+        combined = title_lower + " " + desc_lower
+        
+        # Critical market-moving keywords
+        if any(keyword in title_lower for keyword in [
+            'interest rate', 'rba cuts', 'rba raises', 'cash rate',
+            'property crash', 'property boom', 'house prices surge'
+        ]):
+            item.interest_score = 9
+            item.category = 'Market Movers'
+            item.sentiment = 'Positive' if any(pos in combined for pos in ['cut', 'lower', 'boom', 'surge']) else 'Negative'
+            item.ai_summary = f"Critical market development: {item.title}"
+            return
+        
+        # High priority A-REIT specific
+        if any(keyword in combined for keyword in [
+            'a-reit', 'reit dividend', 'commercial property', 'office occupancy',
+            'retail vacancy', 'cap rates', 'property valuation'
+        ]):
+            item.interest_score = 8
+            item.category = 'A-REIT Specific'
+            item.sentiment = 'Neutral'
+            item.ai_summary = f"A-REIT sector news: {item.title}"
+            return
+        
+        # Technology with property relevance
+        if any(keyword in combined for keyword in [
+            'proptech', 'smart building', 'building automation',
+            'property technology', 'real estate tech'
+        ]):
+            item.interest_score = 7
+            item.category = 'Technology Impact'
+            item.sentiment = 'Positive'
+            item.ai_summary = f"Property technology development: {item.title}"
+            return
+        
+        # General property-related
+        if any(keyword in combined for keyword in [
+            'property', 'real estate', 'construction', 'development'
+        ]):
+            item.interest_score = 6
+            item.category = 'A-REIT Specific'
+            item.sentiment = 'Neutral'
+            item.ai_summary = f"Property sector update: {item.title}"
+            return
+        
+        # Technology (general)
+        if any(keyword in combined for keyword in [
+            'artificial intelligence', 'automation', 'digital', 'innovation'
+        ]):
+            item.interest_score = 5
+            item.category = 'Technology Impact'
+            item.sentiment = 'Positive'
+            item.ai_summary = f"Technology news: {item.title}"
+            return
+        
+        # Default scoring
+        item.interest_score = 4
+        item.category = 'General Business'
+        item.sentiment = 'Neutral'
+        item.ai_summary = f"Business news: {item.title}"
+
+    def process_ai_batch_quick(self, items: List[FeedItem]) -> int:
+        """Quick AI batch processing with larger batches"""
         if not items:
-            return {}
+            return 0
         
-        # Process in batches to avoid token limits
-        batch_size = 8
-        analyses = {}
+        batch_size = 15  # Larger batches for efficiency
+        processed_count = 0
         
         for i in range(0, len(items), batch_size):
             batch = items[i:i + batch_size]
             
-            prompt = """Analyze these news items for their relevance to commercial property (office, retail, industrial, data centers). 
-            For each item, provide:
-            1. Relevance score (1-10, where 10 is directly impacts A-REIT operations)
-            2. Property sectors affected (office/retail/industrial/residential/mixed)
-            3. Market impact (positive/negative/neutral)
-            4. Brief reasoning (why it matters to commercial property)
-            5. Key metrics mentioned (cap rates, yields, occupancy, etc.)
-            6. Geographic regions affected
-
-            Format as JSON for each item:
-            {"item_1": {"relevance_score": X, "property_sectors": [...], "market_impact": "...", "reasoning": "...", "key_metrics": [...], "geographic_impact": [...]}}
-
-            Items to analyze:
-            """
+            # Create very concise prompt for speed
+            prompt = f"Score these {len(batch)} news items for A-REIT CEO (1-10). Format: Item X: Score=Y\n\n"
             
             for idx, item in enumerate(batch, 1):
-                title, link, description = item[0], item[1], item[2]
-                prompt += f"\nItem {idx}: {title}\nDescription: {description[:300]}...\n"
+                prompt += f"{idx}. {item.title} - {item.description[:150]}...\n"
             
             try:
-                response = self.openai_client.ChatCompletion.create(
-                    model="gpt-4",
+                response = openai.ChatCompletion.create(
+                    model="gpt-4o",
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=1500,
-                    temperature=0.2
+                    max_tokens=200,  # Very concise for speed
+                    temperature=0.1
                 )
                 
                 content = response.choices[0].message.content.strip()
                 
-                # Try to parse JSON response
-                try:
-                    batch_analyses = json.loads(content)
-                    for j, item in enumerate(batch):
-                        item_key = f"item_{j+1}"
-                        if item_key in batch_analyses:
-                            analysis_data = batch_analyses[item_key]
-                            analyses[item[1]] = PropertyRelevanceAnalysis(
-                                relevance_score=analysis_data.get('relevance_score', 5),
-                                property_sectors=analysis_data.get('property_sectors', []),
-                                market_impact=analysis_data.get('market_impact', 'neutral'),
-                                reasoning=analysis_data.get('reasoning', ''),
-                                key_metrics=analysis_data.get('key_metrics', []),
-                                geographic_impact=analysis_data.get('geographic_impact', [])
-                            )
-                except json.JSONDecodeError:
-                    # Fallback parsing
-                    for item in batch:
-                        analyses[item[1]] = PropertyRelevanceAnalysis(
-                            relevance_score=6,
-                            property_sectors=['office', 'retail'],
-                            market_impact='neutral',
-                            reasoning='General business relevance to commercial property sector',
-                            key_metrics=[],
-                            geographic_impact=['Australia']
-                        )
+                # Parse scores quickly
+                lines = content.split('\n')
+                for j, item in enumerate(batch):
+                    # Default values
+                    item.interest_score = 6
+                    item.category = 'General Business'
+                    item.sentiment = 'Neutral'
+                    item.ai_summary = f"AI analyzed: {item.title}"
+                    
+                    # Look for score
+                    item_pattern = f"Item {j+1}:"
+                    for line in lines:
+                        if item_pattern in line and 'Score=' in line:
+                            try:
+                                score_part = line.split('Score=')[1].split()[0]
+                                item.interest_score = int(score_part)
+                            except:
+                                pass
+                            break
+                    
+                    processed_count += 1
+                
+                logging.info(f"✓ AI batch {i//batch_size + 1}: {len(batch)} items scored")
+                
+            except Exception as e:
+                logging.error(f"AI batch error: {e}")
+                # Fallback scoring
+                for item in batch:
+                    self.auto_score_item_quick(item)
+                    processed_count += 1
+        
+        return processed_count
+
+    def process_feeds_optimized_recent(self):
+        """MAIN OPTIMIZED METHOD: Only fetch and process recent items - MUCH FASTER!"""
+        logging.info("=" * 60)
+        logging.info("🚀 Starting OPTIMIZED recent-only RSS processing...")
+        
+        start_time = time.time()
+        
+        # Get cutoff time for this run
+        processor = IncrementalProcessor(self)
+        cutoff_time = processor.get_incremental_cutoff_time()
+        
+        # Fetch only recent items from all feeds in parallel
+        all_recent_items = self.fetch_feeds_parallel_recent(cutoff_time, max_workers=5)
+        
+        if not all_recent_items:
+            logging.info("No recent items found from any feeds")
+            processor.update_last_run_time('feed_processing', 0)
+            return {'total_scanned': 0, 'new_items': 0, 'processed': 0}
+        
+        logging.info(f"📊 Found {len(all_recent_items)} recent items across all feeds")
+        
+        # Filter for truly new items (not in database)
+        new_items = []
+        duplicate_count = 0
+        
+        for item in all_recent_items:
+            if not self.item_exists(item.link) and not self.title_exists(item.title, item.source_name):
+                new_items.append(item)
+            else:
+                duplicate_count += 1
+        
+        logging.info(f"📊 After deduplication: {len(new_items)} new items, {duplicate_count} duplicates")
+        
+        if not new_items:
+            logging.info("No new items to process after deduplication")
+            processor.update_last_run_time('feed_processing', 0)
+            return {'total_scanned': len(all_recent_items), 'new_items': 0, 'processed': 0}
+        
+        # Smart processing - auto-score obvious items, AI for complex ones
+        ai_items = []
+        auto_items = []
+        
+        for item in new_items:
+            if self.should_use_ai_analysis_quick(item):
+                ai_items.append(item)
+            else:
+                self.auto_score_item_quick(item)
+                auto_items.append(item)
+        
+        logging.info(f"📊 Processing plan: {len(auto_items)} auto-scored, {len(ai_items)} for AI analysis")
+        
+        # Process AI items in batches
+        ai_processed = 0
+        if ai_items:
+            try:
+                ai_processed = self.process_ai_batch_quick(ai_items)
+            except Exception as e:
+                logging.error(f"AI processing error: {e}")
+                # Fallback - auto-score the AI items
+                for item in ai_items:
+                    self.auto_score_item_quick(item)
+                    auto_items.append(item)
+                ai_items = []
+        
+        # Save all processed items to database
+        total_saved = 0
+        for item in auto_items + ai_items:
+            try:
+                self.save_item(item)
+                total_saved += 1
+            except Exception as e:
+                logging.error(f"Save error for {item.title[:50]}: {e}")
+        
+        # Update tracking
+        processor.update_last_run_time('feed_processing', total_saved)
+        
+        elapsed = time.time() - start_time
+        
+        logging.info("✅ OPTIMIZED processing completed!")
+        logging.info(f"   Duration: {elapsed:.1f} seconds")
+        logging.info(f"   Recent items fetched: {len(all_recent_items)}")
+        logging.info(f"   New items processed: {total_saved}")
+        logging.info(f"   Auto-scored: {len(auto_items)}")
+        logging.info(f"   AI-analyzed: {ai_processed}")
+        logging.info("=" * 60)
+        
+        return {
+            'total_scanned': len(all_recent_items),
+            'new_items': len(new_items),
+            'processed': total_saved
+        }
+
+    def emergency_simple_process_fallback(self):
+        """Emergency fallback if optimized processing fails"""
+        logging.info("🚨 EMERGENCY FALLBACK: Simple processing...")
+        
+        cutoff_time = datetime.now() - timedelta(hours=6)
+        total_items = 0
+        
+        # Process only first 5 feeds with simple scoring
+        emergency_feeds = self.rss_feeds[:5]
+        
+        for feed_config in emergency_feeds:
+            try:
+                # Use basic fetch_feed_items method
+                items = self.fetch_feed_items(feed_config)
+                recent_items = [item for item in items if item.published >= cutoff_time]
+                
+                for item in recent_items[:3]:  # Max 3 items per feed for speed
+                    if not self.item_exists(item.link):
+                        # Simple scoring without AI
+                        score = 7 if any(keyword in item.title.lower() for keyword in [
+                            'property', 'reit', 'real estate', 'commercial', 'office', 'retail'
+                        ]) else 4
+                        
+                        item.interest_score = score
+                        item.ai_summary = f"Emergency mode: {item.title}"
+                        item.category = 'General Business'
+                        item.sentiment = 'Neutral'
+                        
+                        self.save_item(item)
+                        total_items += 1
                         
             except Exception as e:
-                logging.error(f"Property relevance analysis error: {e}")
-                # Fallback for batch
-                for item in batch:
-                    analyses[item[1]] = PropertyRelevanceAnalysis(
-                        relevance_score=5,
-                        property_sectors=['general'],
-                        market_impact='neutral',
-                        reasoning='Analysis not available',
-                        key_metrics=[],
-                        geographic_impact=[]
-                    )
+                logging.error(f"Emergency processing error for {feed_config['name']}: {e}")
         
-        return analyses
+        logging.info(f"✅ Emergency fallback completed: {total_items} items")
+        
+        return {
+            'total_scanned': total_items,
+            'new_items': total_items,
+            'processed': total_items
+        }
 
-    def generate_social_media_content(self, top_items: List[Tuple]) -> List[SocialMediaPost]:
-        """Generate Twitter and LinkedIn posts from top articles"""
-        
-        if len(top_items) < 3:
-            return []
-        
-        # Select top 3 most relevant items
-        selected_items = top_items[:3]
-        
-        prompt = f"""Create social media content for a commercial property executive from these news articles.
-        Generate exactly 3 posts: 1 Twitter thread starter, 1 LinkedIn thought leadership post, and 1 Twitter quick insight.
+    def should_send_email_now(self) -> Tuple[bool, str]:
+        """Check if we should send email based on schedule"""
+        processor = IncrementalProcessor(self)
+        return processor.should_send_email()
 
-        Requirements:
-        - Twitter posts: Max 280 characters, professional tone, include relevant hashtags
-        - LinkedIn post: 200-300 words, thought leadership angle, business insights
-        - Focus on commercial property/A-REIT relevance
-        - Include call-to-action or question for engagement
-        - Professional but approachable tone
-
-        Articles:
-        """
+    def send_daily_brief_incremental(self):
+        """Send email only if it's the right time"""
+        should_send, time_period = self.should_send_email_now()
         
-        for i, item in enumerate(selected_items, 1):
-            title, link, description = item[0], item[1], item[2]
-            prompt += f"\n{i}. {title}\n{description[:200]}...\n"
-        
-        prompt += """\nFormat response as JSON:
-        {
-            "posts": [
-                {
-                    "platform": "twitter",
-                    "content": "post content",
-                    "hashtags": ["hashtag1", "hashtag2"],
-                    "source_article": "article title",
-                    "rationale": "why this angle"
-                },
-                ...
-            ]
-        }"""
-        
-        try:
-            response = self.openai_client.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=800,
-                temperature=0.3
-            )
+        if should_send:
+            logging.info(f"Sending {time_period} email brief...")
             
-            content = response.choices[0].message.content.strip()
+            # Get items from last 24 hours for morning email
+            items = self.get_items_for_email(24)
             
-            try:
-                result = json.loads(content)
-                posts = []
-                
-                for post_data in result.get('posts', []):
-                    posts.append(SocialMediaPost(
-                        platform=post_data.get('platform', 'twitter'),
-                        content=post_data.get('content', ''),
-                        hashtags=post_data.get('hashtags', []),
-                        source_article=post_data.get('source_article', ''),
-                        rationale=post_data.get('rationale', '')
-                    ))
-                
-                return posts
-                
-            except json.JSONDecodeError:
-                # Fallback - create simple posts
-                return self._generate_fallback_social_posts(selected_items)
-                
-        except Exception as e:
-            logging.error(f"Social media generation error: {e}")
-            return self._generate_fallback_social_posts(selected_items)
-    
-    def _generate_fallback_social_posts(self, items: List[Tuple]) -> List[SocialMediaPost]:
-        """Fallback social media posts if AI generation fails"""
-        posts = []
-        
-        if len(items) >= 1:
-            posts.append(SocialMediaPost(
-                platform="twitter",
-                content=f"Key development in commercial property: {items[0][0][:180]}... Thoughts on the implications? #CommercialProperty #AREIT",
-                hashtags=["CommercialProperty", "AREIT"],
-                source_article=items[0][0],
-                rationale="Market development insight"
-            ))
-        
-        if len(items) >= 2:
-            posts.append(SocialMediaPost(
-                platform="linkedin",
-                content=f"Reflecting on recent market developments...\n\n{items[1][0]}\n\nThis highlights the importance of staying agile in commercial property markets. What trends are you watching?\n\n#RealEstate #CommercialProperty #Leadership",
-                hashtags=["RealEstate", "CommercialProperty", "Leadership"],
-                source_article=items[1][0],
-                rationale="Thought leadership angle"
-            ))
-        
-        if len(items) >= 3:
-            posts.append(SocialMediaPost(
-                platform="twitter",
-                content=f"Quick insight: {items[2][0][:150]}... Worth monitoring for sector impact. #PropertyInvesting",
-                hashtags=["PropertyInvesting"],
-                source_article=items[2][0],
-                rationale="Quick market insight"
-            ))
-        
-        return posts
-
-    def generate_executive_insights(self, items: List[Tuple], property_analyses: Dict) -> List[ExecutiveInsight]:
-        """Generate high-level executive insights and action items"""
-        
-        # Group items by category and priority
-        high_priority_items = [item for item in items if item[3] >= 8]  # interest_score >= 8
-        
-        if not high_priority_items:
-            return []
-        
-        prompt = f"""As a strategic advisor to an A-REIT CEO, analyze these high-priority news items and provide executive insights.
-
-        Generate 3-4 key insights in JSON format:
-        {{
-            "insights": [
-                {{
-                    "category": "Market Outlook|Regulatory|Technology|Competition|Operational",
-                    "insight": "Key strategic insight in 1-2 sentences",
-                    "relevance_score": 1-10,
-                    "action_required": true/false,
-                    "timeline": "immediate|short-term|medium-term|long-term",
-                    "source_articles": ["article title 1", "article title 2"]
-                }}
-            ]
-        }}
-
-        High-priority items:
-        """
-        
-        for item in high_priority_items[:8]:  # Limit to top 8 for token management
-            title, link, description, score = item[0], item[1], item[2], item[3]
-            prompt += f"\n- {title} (Score: {score})\n  {description[:150]}...\n"
-        
-        try:
-            response = self.openai_client.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
-                temperature=0.2
-            )
-            
-            content = response.choices[0].message.content.strip()
-            
-            try:
-                result = json.loads(content)
-                insights = []
-                
-                for insight_data in result.get('insights', []):
-                    insights.append(ExecutiveInsight(
-                        category=insight_data.get('category', 'General'),
-                        insight=insight_data.get('insight', ''),
-                        relevance_score=insight_data.get('relevance_score', 5),
-                        action_required=insight_data.get('action_required', False),
-                        timeline=insight_data.get('timeline', 'medium-term'),
-                        source_articles=insight_data.get('source_articles', [])
-                    ))
-                
-                return insights
-                
-            except json.JSONDecodeError:
-                return self._generate_fallback_insights(high_priority_items)
-                
-        except Exception as e:
-            logging.error(f"Executive insights generation error: {e}")
-            return self._generate_fallback_insights(high_priority_items)
-    
-    def _generate_fallback_insights(self, items: List[Tuple]) -> List[ExecutiveInsight]:
-        """Fallback insights if AI generation fails"""
-        insights = []
-        
-        if len(items) >= 1:
-            insights.append(ExecutiveInsight(
-                category="Market Outlook",
-                insight="Market conditions require close monitoring based on recent developments.",
-                relevance_score=7,
-                action_required=True,
-                timeline="short-term",
-                source_articles=[items[0][0]]
-            ))
-        
-        return insights
-
-    def generate_comprehensive_email(self, items: List[Tuple]) -> str:
-        """Generate the comprehensive executive briefing email"""
-        
-        if not items:
-            return self._generate_no_content_email()
-        
-        # Filter and sort items
-        high_priority = [item for item in items if item[3] >= 7]
-        medium_priority = [item for item in items if 5 <= item[3] < 7]
-        
-        # Limit items to prevent clipping
-        top_items = high_priority[:12] + medium_priority[:8]
-        
-        # Generate AI analyses
-        logging.info("Generating property relevance analysis...")
-        property_analyses = self.analyze_property_relevance(top_items)
-        
-        logging.info("Generating social media content...")
-        social_posts = self.generate_social_media_content(high_priority[:5])
-        
-        logging.info("Generating executive insights...")
-        executive_insights = self.generate_executive_insights(top_items, property_analyses)
-        
-        # Calculate dashboard metrics
-        total_items = len(items)
-        high_priority_count = len(high_priority)
-        market_sentiment = self._calculate_market_sentiment(top_items)
-        
-        # Generate HTML email
-        html = self._build_executive_dashboard_html(
-            top_items, property_analyses, social_posts, executive_insights,
-            total_items, high_priority_count, market_sentiment
-        )
-        
-        return html
-    
-    def _calculate_market_sentiment(self, items: List[Tuple]) -> str:
-        """Calculate overall market sentiment from news items"""
-        if not items:
-            return "Neutral"
-        
-        # Simple sentiment based on keywords in titles/descriptions
-        positive_keywords = ['growth', 'increase', 'strong', 'boost', 'positive', 'up', 'gain', 'improvement']
-        negative_keywords = ['decline', 'fall', 'drop', 'weak', 'negative', 'down', 'loss', 'concern', 'risk']
-        
-        positive_count = 0
-        negative_count = 0
-        
-        for item in items:
-            title_desc = (item[0] + ' ' + item[2]).lower()
-            
-            for keyword in positive_keywords:
-                positive_count += title_desc.count(keyword)
-            
-            for keyword in negative_keywords:
-                negative_count += title_desc.count(keyword)
-        
-        if positive_count > negative_count * 1.2:
-            return "Positive"
-        elif negative_count > positive_count * 1.2:
-            return "Cautious"
-        else:
-            return "Neutral"
-
-    def _build_executive_dashboard_html(self, items, property_analyses, social_posts, 
-                                      executive_insights, total_items, high_priority_count, 
-                                      market_sentiment) -> str:
-        """Build comprehensive HTML email matching the desired layout"""
-        
-        current_date = datetime.now().strftime('%B %d, %Y')
-        current_time = datetime.now().strftime('%I:%M %p')
-        
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Matt's Memo - {current_date}</title>
-            <style>
-                body {{ 
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-                    line-height: 1.6; 
-                    margin: 0; 
-                    padding: 20px; 
-                    background-color: #f8f9fa;
-                    color: #333;
-                }}
-                .container {{ 
-                    max-width: 800px; 
-                    margin: 0 auto; 
-                    background-color: white;
-                    border-radius: 12px;
-                    overflow: hidden;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                }}
-                .header {{ 
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white; 
-                    text-align: center; 
-                    padding: 30px 20px;
-                }}
-                .header h1 {{ 
-                    margin: 0; 
-                    font-size: 32px; 
-                    font-weight: 700;
-                }}
-                .subtitle {{ 
-                    margin: 8px 0 0 0; 
-                    opacity: 0.9; 
-                    font-size: 16px;
-                }}
-                .dashboard {{ 
-                    display: grid; 
-                    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); 
-                    gap: 1px; 
-                    background-color: #e9ecef;
-                    margin: 0;
-                }}
-                .metric {{ 
-                    background: white; 
-                    padding: 20px; 
-                    text-align: center;
-                }}
-                .metric-value {{ 
-                    font-size: 28px; 
-                    font-weight: 700; 
-                    color: #667eea;
-                    margin: 0;
-                }}
-                .metric-label {{ 
-                    font-size: 12px; 
-                    color: #6c757d; 
-                    text-transform: uppercase; 
-                    letter-spacing: 0.5px;
-                    margin: 5px 0 0 0;
-                }}
-                .content {{ 
-                    padding: 30px;
-                }}
-                .section {{ 
-                    margin-bottom: 35px;
-                }}
-                .section-title {{ 
-                    font-size: 20px; 
-                    font-weight: 600; 
-                    margin-bottom: 20px; 
-                    color: #495057;
-                    border-bottom: 2px solid #e9ecef;
-                    padding-bottom: 8px;
-                }}
-                .insight-item, .action-item {{ 
-                    background: #f8f9fa; 
-                    border-left: 4px solid #667eea; 
-                    padding: 15px; 
-                    margin-bottom: 15px;
-                    border-radius: 0 8px 8px 0;
-                }}
-                .action-item {{ 
-                    border-left-color: #28a745;
-                }}
-                .news-item {{ 
-                    border: 1px solid #e9ecef; 
-                    border-radius: 8px; 
-                    padding: 20px; 
-                    margin-bottom: 20px;
-                    background: white;
-                }}
-                .news-title {{ 
-                    font-weight: 600; 
-                    font-size: 16px; 
-                    margin-bottom: 8px;
-                }}
-                .news-title a {{ 
-                    color: #495057; 
-                    text-decoration: none;
-                }}
-                .news-title a:hover {{ 
-                    color: #667eea;
-                }}
-                .news-meta {{ 
-                    font-size: 12px; 
-                    color: #6c757d; 
-                    margin-bottom: 12px;
-                }}
-                .relevance-analysis {{ 
-                    background: #e3f2fd; 
-                    border: 1px solid #bbdefb; 
-                    border-radius: 6px; 
-                    padding: 12px; 
-                    margin-top: 12px;
-                    font-size: 14px;
-                }}
-                .social-post {{ 
-                    background: #f8f9fa; 
-                    border-radius: 8px; 
-                    padding: 18px; 
-                    margin-bottom: 18px;
-                    border-left: 4px solid #1da1f2;
-                }}
-                .linkedin-post {{ 
-                    border-left-color: #0077b5;
-                }}
-                .social-platform {{ 
-                    font-weight: 600; 
-                    color: #495057; 
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                }}
-                .social-content {{ 
-                    font-size: 15px; 
-                    line-height: 1.4; 
-                    margin-bottom: 10px;
-                }}
-                .hashtags {{ 
-                    color: #1da1f2; 
-                    font-size: 13px;
-                }}
-                .priority-high {{ 
-                    border-left-color: #dc3545;
-                }}
-                .priority-medium {{ 
-                    border-left-color: #ffc107;
-                }}
-                .footer {{ 
-                    background: #495057; 
-                    color: white; 
-                    text-align: center; 
-                    padding: 20px; 
-                    font-size: 14px;
-                }}
-                .two-column {{ 
-                    display: grid; 
-                    grid-template-columns: 1fr 1fr; 
-                    gap: 30px;
-                }}
-                @media (max-width: 600px) {{ 
-                    .two-column {{ 
-                        grid-template-columns: 1fr;
-                    }}
-                    .dashboard {{ 
-                        grid-template-columns: repeat(2, 1fr);
-                    }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <!-- Header -->
-                <div class="header">
-                    <h1>Matt's Memo</h1>
-                    <div class="subtitle">Strategic Intelligence for Real Estate Leaders</div>
-                    <div class="subtitle">{current_date} • {current_time} • Sydney</div>
-                </div>
-                
-                <!-- Executive Dashboard -->
-                <div class="dashboard">
-                    <div class="metric">
-                        <div class="metric-value">{total_items}</div>
-                        <div class="metric-label">Total Items</div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-value">{high_priority_count}</div>
-                        <div class="metric-label">High Priority</div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-value">{len(executive_insights)}</div>
-                        <div class="metric-label">Action Items</div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-value">{market_sentiment}</div>
-                        <div class="metric-label">Market Sentiment</div>
-                    </div>
-                </div>
-                
-                <div class="content">
-                    <!-- Executive Insights -->
-                    {self._build_executive_insights_section(executive_insights)}
-                    
-                    <!-- Key News with Property Analysis -->
-                    {self._build_news_section(items[:8], property_analyses)}
-                    
-                    <!-- Two Column Layout -->
-                    <div class="two-column">
-                        <!-- Social Media Content -->
-                        {self._build_social_media_section(social_posts)}
-                        
-                        <!-- Additional News -->
-                        {self._build_additional_news_section(items[8:15])}
-                    </div>
-                </div>
-                
-                <!-- Footer -->
-                <div class="footer">
-                    <strong>Matt's Memo</strong><br>
-                    Strategic Intelligence for Real Estate Leaders<br>
-                    Powered by AI • Real-time Analysis • Executive Focus<br><br>
-                    <em>This briefing contains AI-generated insights. Always verify information independently.</em>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return html
-
-    def _build_executive_insights_section(self, insights: List[ExecutiveInsight]) -> str:
-        """Build executive insights section"""
-        if not insights:
-            return ""
-        
-        html = '''
-        <div class="section">
-            <h2 class="section-title">📊 Executive Insights</h2>
-        '''
-        
-        for insight in insights:
-            action_class = "action-item" if insight.action_required else "insight-item"
-            action_icon = "🎯" if insight.action_required else "💡"
-            
-            html += f'''
-            <div class="{action_class}">
-                <strong>{action_icon} {insight.category}</strong> • {insight.timeline.title()}<br>
-                {insight.insight}
-            </div>
-            '''
-        
-        html += "</div>"
-        return html
-
-    def _build_news_section(self, items: List[Tuple], property_analyses: Dict) -> str:
-        """Build main news section with property relevance analysis"""
-        if not items:
-            return ""
-        
-        html = '''
-        <div class="section">
-            <h2 class="section-title">📰 Key Developments</h2>
-        '''
-        
-        for item in items:
-            title, link, description, score, summary, source = item[:6]
-            
-            # Determine priority styling
-            priority_class = "priority-high" if score >= 8 else "priority-medium" if score >= 6 else ""
-            
-            # Get property analysis
-            analysis = property_analyses.get(link)
-            analysis_html = ""
-            
-            if analysis and analysis.relevance_score >= 6:
-                sectors = ", ".join(analysis.property_sectors) if analysis.property_sectors else "General"
-                analysis_html = f'''
-                <div class="relevance-analysis">
-                    <strong>🏢 Property Relevance (Score: {analysis.relevance_score}/10)</strong><br>
-                    <strong>Sectors:</strong> {sectors} • <strong>Impact:</strong> {analysis.market_impact.title()}<br>
-                    {analysis.reasoning}
-                </div>
-                '''
-            
-            html += f'''
-            <div class="news-item {priority_class}">
-                <div class="news-title">
-                    <a href="{link}" target="_blank">{title}</a>
-                </div>
-                <div class="news-meta">
-                    Score: {score}/10 • Source: {source} • {datetime.now().strftime('%H:%M')}
-                </div>
-                <div class="news-summary">
-                    {summary or description[:200] + "..."}
-                </div>
-                {analysis_html}
-            </div>
-            '''
-        
-        html += "</div>"
-        return html
-
-    def _build_social_media_section(self, posts: List[SocialMediaPost]) -> str:
-        """Build social media content section"""
-        if not posts:
-            return '''
-            <div>
-                <h3 class="section-title">📱 Ready-to-Share Content</h3>
-                <div class="social-post">
-                    <div class="social-platform">No social content available</div>
-                    <div class="social-content">Generate content by processing more relevant news items.</div>
-                </div>
-            </div>
-            '''
-        
-        html = '''
-        <div>
-            <h3 class="section-title">📱 Ready-to-Share Content</h3>
-        '''
-        
-        for post in posts:
-            platform_class = "linkedin-post" if post.platform == "linkedin" else ""
-            platform_icon = "💼" if post.platform == "linkedin" else "🐦"
-            hashtag_text = " ".join([f"#{tag}" for tag in post.hashtags])
-            
-            html += f'''
-            <div class="social-post {platform_class}">
-                <div class="social-platform">{platform_icon} {post.platform.title()}</div>
-                <div class="social-content">{post.content}</div>
-                <div class="hashtags">{hashtag_text}</div>
-            </div>
-            '''
-        
-        html += "</div>"
-        return html
-
-    def _build_additional_news_section(self, items: List[Tuple]) -> str:
-        """Build additional news section"""
-        if not items:
-            return ""
-        
-        html = '''
-        <div>
-            <h3 class="section-title">📋 Additional Items</h3>
-        '''
-        
-        for item in items:
-            title, link, description, score, summary, source = item[:6]
-            
-            html += f'''
-            <div style="border-bottom: 1px solid #e9ecef; padding-bottom: 10px; margin-bottom: 10px;">
-                <div style="font-weight: 500; margin-bottom: 4px;">
-                    <a href="{link}" target="_blank" style="color: #495057; text-decoration: none; font-size: 14px;">{title}</a>
-                </div>
-                <div style="font-size: 12px; color: #6c757d;">
-                    {source} • Score: {score}/10
-                </div>
-            </div>
-            '''
-        
-        html += "</div>"
-        return html
-
-    def _generate_no_content_email(self) -> str:
-        """Generate email when no content is available"""
-        current_date = datetime.now().strftime('%B %d, %Y')
-        
-        return f'''
-        <!DOCTYPE html>
-        <html>
-        <head><title>Matt's Memo - {current_date}</title></head>
-        <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <div style="max-width: 600px; margin: 0 auto;">
-                <h1 style="color: #667eea;">Matt's Memo - {current_date}</h1>
-                <p>No significant news items found for today's briefing.</p>
-                <p>This could mean:</p>
-                <ul>
-                    <li>Quiet news day in commercial property sector</li>
-                    <li>All recent items were previously processed</li>
-                    <li>RSS feeds may need checking</li>
-                </ul>
-                <p><em>Next briefing will be sent when new relevant content is available.</em></p>
-            </div>
-        </body>
-        </html>
-        '''
-
-
-# Enhanced RSSAnalyzer class methods to integrate with new email generator
-class EnhancedRSSAnalyzer:
-    """Enhanced version with comprehensive email generation"""
-    
-    def __init__(self, base_analyzer):
-        self.base = base_analyzer
-        self.email_generator = EnhancedEmailGenerator(base_analyzer)
-    
-    def generate_comprehensive_email_from_items(self, items: List[Tuple]) -> Optional[str]:
-        """Generate comprehensive email using enhanced generator"""
-        try:
-            return self.email_generator.generate_comprehensive_email(items)
-        except Exception as e:
-            logging.error(f"Enhanced email generation failed: {e}")
-            # Fallback to simple email
-            return self.base.build_simple_email_html(items)
-    
-    def send_enhanced_daily_brief(self):
-        """Send enhanced daily brief with comprehensive analysis"""
-        try:
-            items = self.base.get_items_for_email(24)
             if items:
-                content = self.generate_comprehensive_email_from_items(items)
+                content = self.generate_daily_email_from_items(items)
                 if content:
-                    self.base.send_email(content)
+                    self.send_email(content)
                     
                     # Mark items as sent
                     cutoff_time = datetime.now() - timedelta(hours=24)
-                    self.base.conn.execute('''
+                    self.conn.execute('''
                         UPDATE items SET email_sent = TRUE 
                         WHERE processed_at >= ? AND email_sent = FALSE
                     ''', (cutoff_time,))
-                    self.base.conn.commit()
+                    self.conn.commit()
                     
-                    logging.info("Enhanced email sent successfully")
+                    logging.info("Email sent successfully")
                 else:
-                    logging.info("No content generated for enhanced email")
+                    logging.info("No content generated for email")
             else:
-                logging.info("No items found for enhanced email")
-        except Exception as e:
-            logging.error(f"Enhanced email brief error: {e}")
-            # Fallback to regular email
-            self.base.send_daily_brief()
+                logging.info("No items found for email")
+        else:
+            logging.info(f"Skipping email send - {time_period} run (email only sent in morning)")
 
+    def get_items_for_email(self, hours_back: int = 24) -> List[Tuple]:
+        """Get items for email from the last N hours"""
+        cutoff_time = datetime.now() - timedelta(hours=hours_back)
+        
+        cursor = self.conn.execute('''
+            SELECT title, link, description, interest_score, ai_summary, source_name, 
+                   processed_at, category, sentiment, key_metrics, geographic_tags, sector_tags
+            FROM items 
+            WHERE processed_at >= ? AND email_sent = FALSE
+            ORDER BY interest_score DESC, processed_at DESC
+        ''', (cutoff_time,))
+        
+        return cursor.fetchall()
 
-# Update the main RSSAnalyzer class to use enhanced email generation
-def enhance_rss_analyzer(analyzer):
-    """Enhance existing RSSAnalyzer with new email capabilities"""
-    enhanced = EnhancedRSSAnalyzer(analyzer)
+   def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
+    """Enhanced email generation that prevents clipping"""
+    if not items:
+        return None
     
-    # Replace email generation methods
-    analyzer.generate_daily_email_from_items = enhanced.generate_comprehensive_email_from_items
-    analyzer.send_daily_brief_enhanced = enhanced.send_enhanced_daily_brief
+    # CRITICAL: Limit total content to prevent email clipping
+    # Most email clients clip after ~102KB, so we need to be aggressive about limiting content
     
-    return analyzer
+    # Filter and prioritize items more aggressively
+    high_priority = [item for item in items if item[3] >= 8][:8]  # Max 8 high priority
+    medium_priority = [item for item in items if 6 <= item[3] < 8][:6]  # Max 6 medium
+    low_priority = [item for item in items if 4 <= item[3] < 6][:4]  # Max 4 low
+    
+    # Total: Maximum 18 items to prevent clipping
+    filtered_items = high_priority + medium_priority + low_priority
+    
+    # Skip obvious errors and duplicates
+    final_items = []
+    seen_titles = set()
+    
+    for item in filtered_items:
+        title, link, description, score, summary, source_name = item[:6]
+        
+        # Skip errors
+        if any(phrase in title.lower() for phrase in [
+            'not found', 'sign up to rss.app', 'error', 'access denied', '404'
+        ]):
+            continue
+        
+        # Skip duplicates (fuzzy matching)
+        title_key = title.lower()[:50]  # First 50 chars for fuzzy matching
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        
+        final_items.append(item)
+        
+        # Hard limit to prevent clipping
+        if len(final_items) >= 15:
+            break
+    
+    if not final_items:
+        return None
+    
+    return self.build_executive_email_html(final_items)
+
+def build_executive_email_html(self, items: List[Tuple]) -> str:
+    """Build executive-focused HTML email that won't get clipped"""
+    
+    current_date = datetime.now().strftime('%B %d, %Y')
+    current_time = datetime.now().strftime('%I:%M %p AEST')
+    
+    # Calculate metrics
+    total_items = len(items)
+    high_priority_count = len([item for item in items if item[3] >= 8])
+    avg_score = sum(item[3] for item in items) / len(items) if items else 0
+    
+    # Determine market sentiment
+    sentiment = self.calculate_simple_sentiment(items)
+    sentiment_color = {"Positive": "#28a745", "Negative": "#dc3545", "Neutral": "#6c757d"}[sentiment]
+    
+    # Sort items by priority
+    sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
+    
+    # Build HTML (keeping it concise to prevent clipping)
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Matt's Memo - {current_date}</title>
+        <style>
+            body {{ 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                line-height: 1.5; 
+                margin: 0; 
+                padding: 0; 
+                background-color: #f8f9fa;
+                color: #333;
+                font-size: 14px;
+            }}
+            .container {{ 
+                max-width: 700px; 
+                margin: 0 auto; 
+                background-color: white;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .header {{ 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white; 
+                text-align: center; 
+                padding: 25px 15px;
+            }}
+            .header h1 {{ 
+                margin: 0; 
+                font-size: 28px; 
+                font-weight: 700;
+            }}
+            .subtitle {{ 
+                margin: 5px 0 0 0; 
+                opacity: 0.9; 
+                font-size: 14px;
+            }}
+            .dashboard {{ 
+                display: flex;
+                background-color: #e9ecef;
+                margin: 0;
+            }}
+            .metric {{ 
+                flex: 1;
+                background: white; 
+                padding: 15px; 
+                text-align: center;
+                border-right: 1px solid #e9ecef;
+            }}
+            .metric:last-child {{ border-right: none; }}
+            .metric-value {{ 
+                font-size: 22px; 
+                font-weight: 700; 
+                color: #667eea;
+                margin: 0;
+            }}
+            .metric-label {{ 
+                font-size: 11px; 
+                color: #6c757d; 
+                text-transform: uppercase; 
+                letter-spacing: 0.3px;
+                margin: 3px 0 0 0;
+            }}
+            .content {{ 
+                padding: 20px 15px;
+            }}
+            .summary-box {{
+                background: #f8f9fa;
+                border-left: 4px solid #667eea;
+                padding: 15px;
+                margin-bottom: 20px;
+                border-radius: 0 6px 6px 0;
+            }}
+            .news-item {{ 
+                border: 1px solid #e9ecef; 
+                border-radius: 6px; 
+                padding: 15px; 
+                margin-bottom: 12px;
+                background: white;
+            }}
+            .news-title {{ 
+                font-weight: 600; 
+                font-size: 15px; 
+                margin-bottom: 6px;
+                line-height: 1.3;
+            }}
+            .news-title a {{ 
+                color: #495057; 
+                text-decoration: none;
+            }}
+            .news-title a:hover {{ 
+                color: #667eea;
+            }}
+            .news-meta {{ 
+                font-size: 11px; 
+                color: #6c757d; 
+                margin-bottom: 8px;
+            }}
+            .news-summary {{
+                font-size: 13px;
+                color: #495057;
+                line-height: 1.4;
+            }}
+            .priority-high {{ 
+                border-left: 4px solid #dc3545;
+            }}
+            .priority-medium {{ 
+                border-left: 4px solid #ffc107;
+            }}
+            .social-section {{
+                background: #f8f9fa;
+                padding: 15px;
+                border-radius: 6px;
+                margin-top: 20px;
+            }}
+            .social-post {{
+                background: white;
+                border: 1px solid #e9ecef;
+                border-radius: 4px;
+                padding: 12px;
+                margin-bottom: 10px;
+                font-size: 13px;
+            }}
+            .footer {{ 
+                background: #495057; 
+                color: white; 
+                text-align: center; 
+                padding: 15px; 
+                font-size: 12px;
+            }}
+            .action-items {{
+                background: #e8f5e8;
+                border: 1px solid #c3e6c3;
+                border-radius: 6px;
+                padding: 12px;
+                margin-bottom: 15px;
+            }}
+            @media (max-width: 600px) {{ 
+                .dashboard {{ flex-direction: column; }}
+                .metric {{ border-right: none; border-bottom: 1px solid #e9ecef; }}
+                .metric:last-child {{ border-bottom: none; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <!-- Header -->
+            <div class="header">
+                <h1>Matt's Memo</h1>
+                <div class="subtitle">Strategic Intelligence for Real Estate Leaders</div>
+                <div class="subtitle">{current_date} • {current_time}</div>
+            </div>
+            
+            <!-- Dashboard -->
+            <div class="dashboard">
+                <div class="metric">
+                    <div class="metric-value">{total_items}</div>
+                    <div class="metric-label">Items Analyzed</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">{high_priority_count}</div>
+                    <div class="metric-label">High Priority</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value">{avg_score:.1f}/10</div>
+                    <div class="metric-label">Avg Relevance</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" style="color: {sentiment_color}">{sentiment}</div>
+                    <div class="metric-label">Market Sentiment</div>
+                </div>
+            </div>
+            
+            <div class="content">
+                <!-- Executive Summary -->
+                <div class="summary-box">
+                    <strong>📊 Executive Summary</strong><br>
+                    {self.generate_executive_summary_text(sorted_items[:5])}
+                </div>
+                
+                <!-- Action Items -->
+                {self.generate_action_items_html(sorted_items[:3])}
+                
+                <!-- Key News Items -->
+                <h3 style="margin: 20px 0 15px 0; color: #495057; font-size: 16px;">📰 Priority Items</h3>
+                {self.generate_news_items_html(sorted_items[:10])}
+                
+                <!-- Social Media Content -->
+                {self.generate_social_media_html(sorted_items[:3])}
+                
+                <!-- Additional Items -->
+                {self.generate_additional_items_html(sorted_items[10:15])}
+            </div>
+            
+            <!-- Footer -->
+            <div class="footer">
+                <strong>Matt's Memo</strong> • Strategic Intelligence Platform<br>
+                Powered by AI • {total_items} sources analyzed • Executive focused<br>
+                <em>This briefing contains AI-generated insights. Verify independently.</em>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+def calculate_simple_sentiment(self, items: List[Tuple]) -> str:
+    """Calculate market sentiment from news items"""
+    if not items:
+        return "Neutral"
+    
+    positive_keywords = ['growth', 'increase', 'strong', 'boost', 'positive', 'up', 'gain', 'improvement', 'rising', 'surge']
+    negative_keywords = ['decline', 'fall', 'drop', 'weak', 'negative', 'down', 'loss', 'concern', 'risk', 'falling', 'crash']
+    
+    positive_score = 0
+    negative_score = 0
+    
+    for item in items:
+        title_desc = (item[0] + ' ' + item[2]).lower()
+        interest_score = item[3]
+        
+        # Weight by interest score
+        weight = interest_score / 10.0
+        
+        for keyword in positive_keywords:
+            positive_score += title_desc.count(keyword) * weight
+        
+        for keyword in negative_keywords:
+            negative_score += title_desc.count(keyword) * weight
+    
+    if positive_score > negative_score * 1.3:
+        return "Positive"
+    elif negative_score > positive_score * 1.3:
+        return "Negative"
+    else:
+        return "Neutral"
+
+def generate_executive_summary_text(self, top_items: List[Tuple]) -> str:
+    """Generate executive summary from top items"""
+    if not top_items:
+        return "No significant developments in commercial property sector today."
+    
+    # Extract key themes
+    themes = []
+    for item in top_items[:3]:
+        title = item[0].lower()
+        if any(keyword in title for keyword in ['interest rate', 'rba', 'cash rate']):
+            themes.append("monetary policy developments")
+        elif any(keyword in title for keyword in ['property', 'real estate', 'reit']):
+            themes.append("property sector activity")
+        elif any(keyword in title for keyword in ['office', 'retail', 'industrial']):
+            themes.append("commercial property fundamentals")
+        elif any(keyword in title for keyword in ['technology', 'ai', 'digital']):
+            themes.append("technology disruption")
+    
+    unique_themes = list(set(themes))
+    
+    if unique_themes:
+        theme_text = ", ".join(unique_themes[:2])
+        return f"Key developments today focused on {theme_text}. {len(top_items)} high-priority items require executive attention."
+    else:
+        return f"{len(top_items)} priority items identified across commercial property and related sectors."
+
+def generate_action_items_html(self, top_items: List[Tuple]) -> str:
+    """Generate action items section"""
+    if not top_items:
+        return ""
+    
+    actions = []
+    
+    for item in top_items[:3]:
+        title, link, description, score = item[0], item[1], item[2], item[3]
+        
+        if score >= 9:
+            actions.append(f"<strong>URGENT:</strong> Review implications of '{title[:60]}...'")
+        elif score >= 8:
+            actions.append(f"<strong>Monitor:</strong> Track developments in '{title[:60]}...'")
+        elif score >= 7:
+            actions.append(f"<strong>Consider:</strong> Assess impact of '{title[:60]}...'")
+    
+    if actions:
+        action_html = "<br>• ".join(actions)
+        return f'''
+        <div class="action-items">
+            <strong>🎯 Executive Action Items</strong><br>
+            • {action_html}
+        </div>
+        '''
+    
+    return ""
+
+def generate_news_items_html(self, items: List[Tuple]) -> str:
+    """Generate news items HTML"""
+    html = ""
+    
+    for item in items:
+        title, link, description, score, summary, source = item[:6]
+        
+        # Determine priority class
+        if score >= 8:
+            priority_class = "priority-high"
+            priority_icon = "🔴"
+        elif score >= 6:
+            priority_class = "priority-medium"  
+            priority_icon = "🟡"
+        else:
+            priority_class = ""
+            priority_icon = "🟢"
+        
+        # Clean and truncate summary
+        clean_summary = (summary or description)[:200] + "..." if (summary or description) else "No summary available"
+        clean_summary = re.sub('<[^<]+?>', '', clean_summary)  # Remove HTML tags
+        
+        html += f'''
+        <div class="news-item {priority_class}">
+            <div class="news-title">
+                <a href="{link}" target="_blank">{title}</a>
+            </div>
+            <div class="news-meta">
+                {priority_icon} Score: {score}/10 • {source} • {datetime.now().strftime('%H:%M')}
+            </div>
+            <div class="news-summary">
+                {clean_summary}
+            </div>
+        </div>
+        '''
+    
+    return html
+
+def generate_social_media_html(self, items: List[Tuple]) -> str:
+    """Generate simple social media content"""
+    if len(items) < 2:
+        return ""
+    
+    top_item = items[0]
+    title = top_item[0]
+    
+    # Generate simple social posts
+    twitter_post = f"Key development in commercial property: {title[:180]}... What are your thoughts on the implications? #CommercialProperty #AREIT"
+    
+    linkedin_post = f"Interesting development in our sector:\n\n{title}\n\nThis highlights the importance of staying informed about market dynamics. How do you see this impacting commercial property strategies?\n\n#RealEstate #CommercialProperty #Leadership"
+    
+    return f'''
+    <div class="social-section">
+        <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📱 Ready-to-Share Content</h3>
+        
+        <div class="social-post">
+            <strong>🐦 Twitter:</strong><br>
+            {twitter_post}
+        </div>
+        
+        <div class="social-post">
+            <strong>💼 LinkedIn:</strong><br>
+            {linkedin_post[:300]}...
+        </div>
+    </div>
+    '''
+
+def generate_additional_items_html(self, items: List[Tuple]) -> str:
+    """Generate additional items section"""
+    if not items:
+        return ""
+    
+    html = '''
+    <div style="margin-top: 20px;">
+        <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📋 Additional Items</h3>
+    '''
+    
+    for item in items:
+        title, link, score, source = item[0], item[1], item[3], item[5]
+        
+        html += f'''
+        <div style="border-bottom: 1px solid #e9ecef; padding: 8px 0; font-size: 12px;">
+            <a href="{link}" target="_blank" style="color: #495057; text-decoration: none; font-weight: 500;">{title}</a>
+            <span style="color: #6c757d; margin-left: 8px;">• {source} • {score}/10</span>
+        </div>
+        '''
+    
+    html += "</div>"
+    return html
+
+# Update your main email sending method
+def send_daily_brief_enhanced(self, include_all: bool = False):
+    """Enhanced daily brief that won't get clipped"""
+    try:
+        items = self.get_items_for_email(24)
+        if items:
+            content = self.generate_daily_email_from_items_enhanced(items)
+            if content:
+                # Check content size and warn if too large
+                content_size = len(content.encode('utf-8'))
+                if content_size > 100000:  # 100KB limit
+                    logging.warning(f"Email content size: {content_size/1024:.1f}KB - may be clipped")
+                
+                self.send_email(content)
+                
+                # Mark items as sent
+                cutoff_time = datetime.now() - timedelta(hours=24)
+                self.conn.execute('''
+                    UPDATE items SET email_sent = TRUE 
+                    WHERE processed_at >= ? AND email_sent = FALSE
+                ''', (cutoff_time,))
+                self.conn.commit()
+                
+                logging.info(f"Enhanced email sent successfully ({content_size/1024:.1f}KB)")
+            else:
+                logging.info("No content generated for enhanced email")
+        else:
+            logging.info("No items found for enhanced email")
+    except Exception as e:
+        logging.error(f"Enhanced email error: {e}")
+        raise
