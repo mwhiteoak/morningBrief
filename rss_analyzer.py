@@ -1502,27 +1502,194 @@ if __name__ == "__main__":
         if len(sys.argv) > 1:
             command = sys.argv[1].lower()
             
-            if command == "test":
-                # Test mode - process feeds once and exit
-                logging.info("Running in TEST mode - processing feeds once...")
-                analyzer.process_feeds()
-                logging.info("Test completed. Check rss_analyzer.log for details.")
+            if command == "incremental":
+                # NEW: Incremental processing mode - FAST! (3x daily)
+                logging.info("🚀 Running INCREMENTAL processing mode...")
+                start_time = time.time()
+                
+                try:
+                    results = analyzer.process_feeds_incremental()
+                    elapsed = time.time() - start_time
+                    
+                    logging.info("✅ Incremental processing completed successfully!")
+                    logging.info(f"   Duration: {elapsed:.1f} seconds")
+                    logging.info(f"   Items scanned: {results['total_scanned']}")
+                    logging.info(f"   New items: {results['new_items']}")
+                    logging.info(f"   Items processed: {results['processed']}")
+                    
+                    print(f"✅ Success: Processed {results['processed']} items in {elapsed:.1f}s")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Incremental processing failed: {e}")
+                    print(f"❌ Error: {e}")
+                    sys.exit(1)
+                
+            elif command == "email-check":
+                # NEW: Smart email sending based on schedule
+                logging.info("📧 Checking email send schedule...")
+                
+                try:
+                    should_send, time_period = analyzer.should_send_email_now()
+                    
+                    if should_send:
+                        logging.info(f"📧 Sending {time_period} email brief...")
+                        analyzer.send_daily_brief_incremental()
+                        print(f"✅ Email sent for {time_period} period")
+                    else:
+                        logging.info(f"⏭️ Skipping email - {time_period} period (email only sent in morning)")
+                        print(f"⏭️ No email sent - {time_period} period")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Email check failed: {e}")
+                    print(f"❌ Email error: {e}")
+                    # Don't exit - email failure shouldn't break the workflow
+                
+            elif command == "test":
+                # LEGACY: Original test mode - process feeds once
+                logging.info("🧪 Running in LEGACY TEST mode...")
+                
+                try:
+                    start_time = time.time()
+                    analyzer.process_feeds()
+                    elapsed = time.time() - start_time
+                    
+                    logging.info(f"✅ Legacy test completed in {elapsed:.1f} seconds")
+                    print(f"✅ Legacy test completed - check rss_analyzer.log for details")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Legacy test failed: {e}")
+                    print(f"❌ Test failed: {e}")
+                    sys.exit(1)
                 
             elif command == "email":
                 # Send test email with normal filtering
-                logging.info("Generating and sending test email (normal filtering)...")
-                analyzer.send_daily_brief(include_all=False)
-                logging.info("Email test completed.")
+                logging.info("📧 Generating and sending test email (normal filtering)...")
+                
+                try:
+                    analyzer.send_daily_brief(include_all=False)
+                    logging.info("✅ Test email completed")
+                    print("✅ Test email sent successfully")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Email test failed: {e}")
+                    print(f"❌ Email failed: {e}")
+                    sys.exit(1)
                 
             elif command == "email-full":
                 # Send test email with minimal filtering (include everything)
-                logging.info("Generating and sending FULL test email (minimal filtering)...")
-                analyzer.send_daily_brief(include_all=True)
-                logging.info("Full email test completed.")
+                logging.info("📧 Generating and sending FULL test email (minimal filtering)...")
+                
+                try:
+                    analyzer.send_daily_brief(include_all=True)
+                    logging.info("✅ Full email test completed")
+                    print("✅ Full test email sent successfully")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Full email test failed: {e}")
+                    print(f"❌ Full email failed: {e}")
+                    sys.exit(1)
                 
             elif command == "preview":
                 # Preview what would be included in email without sending
-                analyzer.preview_items()
+                logging.info("👀 Previewing email content...")
+                
+                try:
+                    analyzer.preview_items()
+                    print("✅ Preview completed - see output above")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Preview failed: {e}")
+                    print(f"❌ Preview error: {e}")
+                
+            elif command == "stats":
+                # Show comprehensive database statistics
+                logging.info("📊 Generating database statistics...")
+                
+                try:
+                    # Basic item counts
+                    cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items")
+                    total_items = cursor.fetchone()[0]
+                    
+                    cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items WHERE processed_at >= ?", 
+                                                 (datetime.now() - timedelta(hours=6),))
+                    last_6h = cursor.fetchone()[0]
+                    
+                    cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items WHERE processed_at >= ?", 
+                                                 (datetime.now() - timedelta(hours=24),))
+                    last_24h = cursor.fetchone()[0]
+                    
+                    cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items WHERE email_sent = FALSE")
+                    pending_email = cursor.fetchone()[0]
+                    
+                    cursor = analyzer.conn.execute("SELECT AVG(interest_score) FROM items WHERE interest_score IS NOT NULL")
+                    avg_score = cursor.fetchone()[0] or 0
+                    
+                    # Get incremental processing info
+                    processor = IncrementalProcessor(analyzer)
+                    last_run = processor.get_last_run_time()
+                    
+                    print("📊 DATABASE STATISTICS")
+                    print("=" * 50)
+                    print(f"📈 Total items in database: {total_items:,}")
+                    print(f"🕕 Last 6 hours: {last_6h}")
+                    print(f"📅 Last 24 hours: {last_24h}")
+                    print(f"📧 Pending email: {pending_email}")
+                    print(f"⭐ Average interest score: {avg_score:.1f}/10")
+                    print(f"🕐 Last incremental run: {last_run or 'Never'}")
+                    
+                    # Show recent processing runs
+                    cursor = analyzer.conn.execute('''
+                        SELECT run_type, last_run_time, items_processed, created_at 
+                        FROM processing_runs 
+                        ORDER BY created_at DESC 
+                        LIMIT 10
+                    ''')
+                    recent_runs = cursor.fetchall()
+                    
+                    if recent_runs:
+                        print(f"\n🔄 RECENT PROCESSING RUNS")
+                        print("-" * 50)
+                        for run_type, run_time, items, created in recent_runs:
+                            print(f"   {created}: {items} items ({run_type})")
+                    
+                    # Show score distribution
+                    cursor = analyzer.conn.execute('''
+                        SELECT interest_score, COUNT(*) 
+                        FROM items 
+                        WHERE interest_score IS NOT NULL 
+                        GROUP BY interest_score 
+                        ORDER BY interest_score DESC
+                    ''')
+                    score_dist = cursor.fetchall()
+                    
+                    if score_dist:
+                        print(f"\n⭐ SCORE DISTRIBUTION")
+                        print("-" * 50)
+                        for score, count in score_dist:
+                            print(f"   Score {score}: {count} items")
+                    
+                    # Show top sources
+                    cursor = analyzer.conn.execute('''
+                        SELECT source_name, COUNT(*) as item_count
+                        FROM items 
+                        WHERE processed_at >= ?
+                        GROUP BY source_name 
+                        ORDER BY item_count DESC 
+                        LIMIT 10
+                    ''', (datetime.now() - timedelta(days=7),))
+                    top_sources = cursor.fetchall()
+                    
+                    if top_sources:
+                        print(f"\n📰 TOP SOURCES (Last 7 days)")
+                        print("-" * 50)
+                        for source, count in top_sources:
+                            print(f"   {source}: {count} items")
+                    
+                    print("=" * 50)
+                    
+                except Exception as e:
+                    logging.error(f"❌ Stats generation failed: {e}")
+                    print(f"❌ Stats error: {e}")
                 
             elif command == "cleanup":
                 # Clean up old items
@@ -1531,47 +1698,175 @@ if __name__ == "__main__":
                     try:
                         days = int(sys.argv[2])
                     except ValueError:
-                        pass
-                logging.info(f"Cleaning up items older than {days} days...")
-                analyzer.cleanup_old_items(days_to_keep=days)
-                logging.info("Cleanup completed.")
+                        print("❌ Invalid days parameter, using default 30 days")
+                        days = 30
                 
-            elif command == "stats":
-                # Show database statistics
-                cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items")
-                total_items = cursor.fetchone()[0]
+                logging.info(f"🧹 Cleaning up items older than {days} days...")
                 
-                cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items WHERE processed_at >= ?", 
-                                             (datetime.now() - timedelta(days=1),))
-                last_24h = cursor.fetchone()[0]
+                try:
+                    # Count items before cleanup
+                    cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items")
+                    before_count = cursor.fetchone()[0]
+                    
+                    analyzer.cleanup_old_items(days_to_keep=days)
+                    
+                    # Count items after cleanup
+                    cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items")
+                    after_count = cursor.fetchone()[0]
+                    
+                    deleted_count = before_count - after_count
+                    
+                    logging.info(f"✅ Cleanup completed: {deleted_count} items removed")
+                    print(f"✅ Cleanup completed: {deleted_count} items removed, {after_count} remaining")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Cleanup failed: {e}")
+                    print(f"❌ Cleanup error: {e}")
                 
-                cursor = analyzer.conn.execute("SELECT COUNT(*) FROM items WHERE email_sent = FALSE")
-                pending_email = cursor.fetchone()[0]
+            elif command == "reset-tracking":
+                # Reset incremental processing tracking (for testing)
+                logging.info("🔄 Resetting incremental processing tracking...")
                 
-                cursor = analyzer.conn.execute("SELECT AVG(interest_score) FROM items WHERE interest_score IS NOT NULL")
-                avg_score = cursor.fetchone()[0] or 0
+                try:
+                    cursor = analyzer.conn.execute('SELECT COUNT(*) FROM processing_runs')
+                    count_before = cursor.fetchone()[0]
+                    
+                    analyzer.conn.execute('DELETE FROM processing_runs')
+                    analyzer.conn.commit()
+                    
+                    logging.info(f"✅ Tracking reset: {count_before} run records cleared")
+                    print(f"✅ Tracking reset - next incremental run will process last 6 hours")
+                    print(f"   Cleared {count_before} previous run records")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Reset tracking failed: {e}")
+                    print(f"❌ Reset error: {e}")
                 
-                print(f"Database Statistics:")
-                print(f"   Total items: {total_items}")
-                print(f"   Last 24 hours: {last_24h}")
-                print(f"   Pending email: {pending_email}")
-                print(f"   Average interest score: {avg_score:.1f}/10")
+            elif command == "feeds-test":
+                # NEW: Test individual feeds for debugging
+                logging.info("🔍 Testing individual RSS feeds...")
+                
+                try:
+                    total_feeds = len(analyzer.rss_feeds)
+                    print(f"🔍 Testing {total_feeds} RSS feeds...")
+                    print("=" * 60)
+                    
+                    working_feeds = 0
+                    failing_feeds = 0
+                    
+                    for i, feed_config in enumerate(analyzer.rss_feeds, 1):
+                        print(f"[{i}/{total_feeds}] Testing: {feed_config['name']}")
+                        
+                        try:
+                            items = analyzer.fetch_feed_items(feed_config)
+                            recent_items = [item for item in items if item.published >= datetime.now() - timedelta(hours=24)]
+                            
+                            print(f"   ✅ Success: {len(items)} total, {len(recent_items)} recent")
+                            working_feeds += 1
+                            
+                        except Exception as feed_error:
+                            print(f"   ❌ Failed: {feed_error}")
+                            failing_feeds += 1
+                    
+                    print("=" * 60)
+                    print(f"📊 Feed Test Summary:")
+                    print(f"   ✅ Working feeds: {working_feeds}")
+                    print(f"   ❌ Failing feeds: {failing_feeds}")
+                    print(f"   📈 Success rate: {(working_feeds/total_feeds)*100:.1f}%")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Feed test failed: {e}")
+                    print(f"❌ Feed test error: {e}")
+                
+            elif command == "emergency":
+                # Emergency simple processing without AI
+                logging.info("🚨 Running EMERGENCY processing mode (no AI)...")
+                
+                try:
+                    start_time = time.time()
+                    cutoff_time = datetime.now() - timedelta(hours=6)
+                    total_items = 0
+                    
+                    # Process only first 5 feeds with simple scoring
+                    emergency_feeds = analyzer.rss_feeds[:5]
+                    
+                    for feed_config in emergency_feeds:
+                        try:
+                            items = analyzer.fetch_feed_items(feed_config)
+                            recent_items = [item for item in items if item.published >= cutoff_time]
+                            
+                            for item in recent_items[:5]:  # Max 5 items per feed
+                                if not analyzer.item_exists(item.link):
+                                    # Simple scoring without AI
+                                    score = 7 if any(keyword in item.title.lower() for keyword in [
+                                        'property', 'reit', 'real estate', 'commercial', 'office', 'retail'
+                                    ]) else 4
+                                    
+                                    item.interest_score = score
+                                    item.ai_summary = f"Emergency mode: {item.title}"
+                                    item.category = 'General Business'
+                                    item.sentiment = 'Neutral'
+                                    
+                                    analyzer.save_item(item)
+                                    total_items += 1
+                                    
+                        except Exception as e:
+                            logging.error(f"Emergency processing error for {feed_config['name']}: {e}")
+                    
+                    elapsed = time.time() - start_time
+                    logging.info(f"✅ Emergency processing completed: {total_items} items in {elapsed:.1f}s")
+                    print(f"✅ Emergency mode completed: {total_items} items processed in {elapsed:.1f}s")
+                    
+                except Exception as e:
+                    logging.error(f"❌ Emergency processing failed: {e}")
+                    print(f"❌ Emergency error: {e}")
+                    sys.exit(1)
                 
             else:
-                print("Available commands:")
-                print("  python3 rss_analyzer.py              - Run normally (scheduled)")
-                print("  python3 rss_analyzer.py test         - Test feed processing once")
-                print("  python3 rss_analyzer.py preview      - Preview email content without sending")
-                print("  python3 rss_analyzer.py email        - Send test email (normal filtering)")
-                print("  python3 rss_analyzer.py email-full   - Send test email (include everything)")
-                print("  python3 rss_analyzer.py cleanup [days] - Clean old items (default: 30 days)")
-                print("  python3 rss_analyzer.py stats        - Show database statistics")
+                # Show help for unknown commands
+                print("❓ Unknown command. Available commands:")
+                print("")
+                print("🚀 MAIN COMMANDS (3x daily system):")
+                print("  python rss_analyzer.py incremental       - Incremental processing (recommended)")
+                print("  python rss_analyzer.py email-check       - Check if email should be sent")
+                print("")
+                print("📧 EMAIL COMMANDS:")
+                print("  python rss_analyzer.py email             - Send test email (normal filtering)")
+                print("  python rss_analyzer.py email-full        - Send test email (include everything)")
+                print("  python rss_analyzer.py preview           - Preview email content without sending")
+                print("")
+                print("🧪 TESTING & DEBUG:")
+                print("  python rss_analyzer.py test              - Legacy full processing test")
+                print("  python rss_analyzer.py feeds-test        - Test individual RSS feeds")
+                print("  python rss_analyzer.py emergency         - Emergency processing (no AI)")
+                print("  python rss_analyzer.py stats             - Show database statistics")
+                print("")
+                print("🛠️ MAINTENANCE:")
+                print("  python rss_analyzer.py cleanup [days]    - Clean old items (default: 30 days)")
+                print("  python rss_analyzer.py reset-tracking    - Reset incremental processing tracking")
+                print("")
+                print("⏰ SCHEDULER:")
+                print("  python rss_analyzer.py                   - Run scheduler (legacy mode)")
+                print("")
+                print("💡 Recommended workflow:")
+                print("   1. Test feeds: python rss_analyzer.py feeds-test")
+                print("   2. Run incremental: python rss_analyzer.py incremental")
+                print("   3. Check email: python rss_analyzer.py email-check")
+                print("   4. View stats: python rss_analyzer.py stats")
+                
         else:
-            # Normal mode - run scheduler
+            # Normal mode - run scheduler (legacy)
+            logging.info("🕐 Starting legacy scheduler mode...")
+            print("🕐 Running in scheduler mode (legacy)")
+            print("💡 For 3x daily mode, use: python rss_analyzer.py incremental")
             analyzer.run_scheduler()
             
     except KeyboardInterrupt:
-        logging.info("RSS Analyzer stopped by user")
+        logging.info("⏹️ RSS Analyzer stopped by user")
+        print("\n⏹️ Stopped by user")
+        
     except Exception as e:
-        logging.error(f"Fatal error: {e}")
+        logging.error(f"💥 Fatal error: {e}")
+        print(f"💥 Fatal error: {e}")
+        print("🔍 Check rss_analyzer.log for detailed error information")
         raise
