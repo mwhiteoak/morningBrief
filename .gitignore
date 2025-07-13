@@ -1,0 +1,14 @@
+echo "# Environment and secrets
+.env
+*.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.db
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db" > .gitignore
