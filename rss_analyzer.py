@@ -818,11 +818,20 @@ See README.md for detailed setup instructions.
         }
 
     def emergency_simple_process_fallback(self):
-        """Emergency fallback if optimized processing fails"""
+        """Emergency fallback if optimized processing fails - with sensitive content filtering"""
         logging.info("🚨 EMERGENCY FALLBACK: Simple processing...")
         
         cutoff_time = datetime.now() - timedelta(hours=6)
         total_items = 0
+        
+        # Sensitive content keywords for filtering
+        sensitive_keywords = [
+            'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
+            'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
+            'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
+            'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
+            'plane crash', 'drowning', 'fire death', 'explosion death'
+        ]
         
         # Process only first 5 feeds with simple scoring
         emergency_feeds = self.rss_feeds[:5]
@@ -835,6 +844,12 @@ See README.md for detailed setup instructions.
                 
                 for item in recent_items[:3]:  # Max 3 items per feed for speed
                     if not self.item_exists(item.link):
+                        # Check for sensitive content
+                        combined_text = (item.title + ' ' + item.description).lower()
+                        if any(keyword in combined_text for keyword in sensitive_keywords):
+                            logging.debug(f"Emergency fallback: Filtered sensitive content: {item.title[:50]}...")
+                            continue
+                        
                         # Simple scoring without AI
                         score = 7 if any(keyword in item.title.lower() for keyword in [
                             'property', 'reit', 'real estate', 'commercial', 'office', 'retail'
@@ -851,7 +866,7 @@ See README.md for detailed setup instructions.
             except Exception as e:
                 logging.error(f"Emergency processing error for {feed_config['name']}: {e}")
         
-        logging.info(f"✅ Emergency fallback completed: {total_items} items")
+        logging.info(f"✅ Emergency fallback completed: {total_items} items (sensitive content filtered)")
         
         return {
             'total_scanned': total_items,
@@ -890,63 +905,144 @@ See README.md for detailed setup instructions.
         return items
 
     def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
-        """Generate plain text formatted email that works across all email clients"""
-        logging.info(f"Generating email from {len(items)} items")
+        """Generate plain text formatted email that works across all email clients - with timeout protection"""
+        logging.info(f"Starting email generation from {len(items)} items...")
         
         if not items:
             logging.warning("No items provided for email generation")
             return None
         
-        # MUCH MORE INCLUSIVE FILTERING - include everything potentially relevant
-        filtered_items = []
-        seen_titles = set()
+        start_time = time.time()
         
-        for item in items:
-            title, link, description, score, summary, source_name = item[:6]
+        try:
+            # MUCH MORE INCLUSIVE FILTERING - include everything potentially relevant
+            filtered_items = []
+            seen_titles = set()
             
-            # Combine title and description for comprehensive filtering
-            combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
+            for item in items:
+                title, link, description, score, summary, source_name = item[:6]
+                
+                # Combine title and description for comprehensive filtering
+                combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
+                
+                # Skip obvious errors - be very permissive
+                if any(phrase in title.lower() for phrase in [
+                    'not found', 'sign up to rss.app', 'error 404', 'access denied', 
+                    'page not found', 'forbidden', 'unauthorized'
+                ]):
+                    continue
+                
+                # Skip sensitive content not relevant for commercial property intelligence
+                sensitive_keywords = [
+                    'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
+                    'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
+                    'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
+                    'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
+                    'plane crash', 'drowning', 'fire death', 'explosion death'
+                ]
+                
+                if any(keyword in combined_text for keyword in sensitive_keywords):
+                    logging.debug(f"Skipping sensitive content: {title[:50]}...")
+                    continue
+                
+                # Skip exact duplicates only
+                title_key = title.lower().strip()
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
+                
+                # Include ALL items with score >= 4 (much more inclusive)
+                if score >= 4:
+                    filtered_items.append(item)
             
-            # Skip obvious errors - be very permissive
-            if any(phrase in title.lower() for phrase in [
-                'not found', 'sign up to rss.app', 'error 404', 'access denied', 
-                'page not found', 'forbidden', 'unauthorized'
-            ]):
-                continue
+            logging.info(f"Filtered items for email: {len(filtered_items)} (much more inclusive, sensitive content excluded)")
             
-            # Skip sensitive content not relevant for commercial property intelligence
-            sensitive_keywords = [
-                'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
-                'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
-                'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
-                'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
-                'plane crash', 'drowning', 'fire death', 'explosion death'
-            ]
+            if not filtered_items:
+                logging.warning("No items remaining after filtering")
+                return None
             
-            if any(keyword in combined_text for keyword in sensitive_keywords):
-                logging.debug(f"Skipping sensitive content: {title[:50]}...")
-                continue
+            # Generate email with timeout protection
+            email_content = self.build_plain_text_email(filtered_items)
             
-            # Skip exact duplicates only
-            title_key = title.lower().strip()
-            if title_key in seen_titles:
-                continue
-            seen_titles.add(title_key)
+            elapsed_time = time.time() - start_time
+            logging.info(f"Email generation completed in {elapsed_time:.1f} seconds")
             
-            # Include ALL items with score >= 4 (much more inclusive)
-            if score >= 4:
-                filtered_items.append(item)
+            return email_content
+            
+        except Exception as e:
+            elapsed_time = time.time() - start_time
+            logging.error(f"Email generation failed after {elapsed_time:.1f} seconds: {e}")
+            
+            # Return a simple fallback email
+            return self.generate_fallback_email(items)
+    
+    def generate_fallback_email(self, items: List[Tuple]) -> str:
+        """Generate a simple fallback email if main generation fails"""
+        logging.info("Generating fallback email due to main generation failure")
         
-        logging.info(f"Filtered items for email: {len(filtered_items)} (much more inclusive, sensitive content excluded)")
+        current_date = datetime.now().strftime('%B %d, %Y')
+        current_time = datetime.now().strftime('%I:%M %p AEST')
         
-        if not filtered_items:
-            logging.warning("No items remaining after filtering")
-            return None
+        # Filter and sort items simply
+        filtered_items = [item for item in items if item[3] >= 4][:20]  # Limit to 20 items
+        sorted_items = sorted(filtered_items, key=lambda x: x[3], reverse=True)
         
-        return self.build_plain_text_email(filtered_items)
+        email_content = f"""🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING
+{current_date} • {current_time}
+
+===============================================================================
+
+📊 EXECUTIVE SUMMARY
+
+Total Items Analyzed: {len(sorted_items)}
+Status: FALLBACK MODE - Simplified Analysis
+
+Due to processing limitations, this briefing contains simplified analysis.
+For full AI-powered insights, please check the system logs.
+
+===============================================================================
+
+📋 TOP PRIORITY ITEMS
+
+"""
+        
+        # Add top items without AI analysis
+        for i, item in enumerate(sorted_items[:10], 1):
+            title, link, description, score, summary, source = item[:6]
+            
+            clean_title = title.strip()
+            clean_desc = (description or summary or "")[:150].strip()
+            
+            email_content += f"""{i}. {clean_title}
+SCORE: {score}/10 | SOURCE: {source}
+LINK: {link}
+
+SUMMARY: {clean_desc}...
+
+-------------------------------------------------------------------------------
+
+"""
+        
+        email_content += f"""===============================================================================
+
+🤖 AI-POWERED INTELLIGENCE PLATFORM
+
+Generated: {current_time} AEST (Fallback Mode)
+Items Processed: {len(sorted_items)}
+Status: Simplified analysis due to processing constraints
+
+💼 Connect with Matt Whiteoak
+LinkedIn: https://www.linkedin.com/in/mattwhiteoak
+
+===============================================================================
+"""
+        
+        return email_content
 
     def build_plain_text_email(self, items: List[Tuple]) -> str:
-        """Build clean plain text email that works across ALL email clients"""
+        """Build clean plain text email that works across ALL email clients - with global AI limit"""
+        
+        logging.info(f"Building plain text email for {len(items)} items...")
         
         current_date = datetime.now().strftime('%B %d, %Y')
         current_time = datetime.now().strftime('%I:%M %p AEST')
@@ -965,7 +1061,15 @@ See README.md for detailed setup instructions.
         total_items = len(sorted_items)
         critical_count = len(critical_items)
         high_count = len(high_items)
+        total_high_priority = critical_count + high_count
         sentiment = self.calculate_simple_sentiment(sorted_items)
+        
+        logging.info(f"Email stats: {total_items} total, {critical_count} critical, {high_count} high priority")
+        logging.info(f"Total high priority items (score ≥7): {total_high_priority}")
+        
+        # GLOBAL AI LIMIT: Prioritize AI for ALL high-priority items first
+        global_ai_limit = 40  # Increased limit for better coverage
+        self.global_ai_calls_used = 0
         
         # Build plain text email (no markdown)
         email_content = f"""🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING
@@ -978,6 +1082,7 @@ See README.md for detailed setup instructions.
 Total Items Analyzed: {total_items}
 Critical Priority: {critical_count} 
 High Priority: {high_count}
+Total High Priority Items: {total_high_priority}
 Market Sentiment: {sentiment}
 
 {self.generate_plain_text_executive_summary(sorted_items[:5], sentiment)}
@@ -986,58 +1091,79 @@ Market Sentiment: {sentiment}
 
 """
 
-        # Add each priority section
-        if critical_items:
-            email_content += f"""🚨 CRITICAL PRIORITY ITEMS ({len(critical_items)})
+        # Add each priority section with progress logging
+        try:
+            if critical_items:
+                logging.info(f"Processing {len(critical_items)} critical items...")
+                email_content += f"""🚨 CRITICAL PRIORITY ITEMS ({len(critical_items)})
 
-{self.generate_plain_text_news_section(critical_items)}
-
-===============================================================================
-
-"""
-
-        if high_items:
-            email_content += f"""🔴 HIGH PRIORITY ITEMS ({len(high_items)})
-
-{self.generate_plain_text_news_section(high_items)}
+{self.generate_plain_text_news_section_with_global_limit(critical_items, global_ai_limit)}
 
 ===============================================================================
 
 """
 
-        if medium_items:
-            email_content += f"""🟡 MEDIUM PRIORITY ITEMS ({len(medium_items)})
+            if high_items:
+                logging.info(f"Processing {len(high_items)} high priority items...")
+                email_content += f"""🔴 HIGH PRIORITY ITEMS ({len(high_items)})
 
-{self.generate_plain_text_news_section(medium_items)}
-
-===============================================================================
-
-"""
-
-        if normal_items:
-            email_content += f"""🟢 NORMAL PRIORITY ITEMS ({len(normal_items)})
-
-{self.generate_plain_text_news_section(normal_items)}
+{self.generate_plain_text_news_section_with_global_limit(high_items, global_ai_limit)}
 
 ===============================================================================
 
 """
 
-        if other_items:
-            email_content += f"""📋 OTHER RELEVANT ITEMS ({len(other_items)})
+            if medium_items:
+                logging.info(f"Processing {len(medium_items)} medium priority items...")
+                email_content += f"""🟡 MEDIUM PRIORITY ITEMS ({len(medium_items)})
 
-{self.generate_plain_text_news_section(other_items)}
+{self.generate_plain_text_news_section_with_global_limit(medium_items, global_ai_limit)}
 
 ===============================================================================
 
 """
 
-        # Add footer
+            if normal_items:
+                logging.info(f"Processing {len(normal_items)} normal priority items...")
+                email_content += f"""🟢 NORMAL PRIORITY ITEMS ({len(normal_items)})
+
+{self.generate_plain_text_news_section_with_global_limit(normal_items, global_ai_limit)}
+
+===============================================================================
+
+"""
+
+            if other_items:
+                logging.info(f"Processing {len(other_items)} other relevant items...")
+                email_content += f"""📋 OTHER RELEVANT ITEMS ({len(other_items)})
+
+{self.generate_plain_text_news_section_with_global_limit(other_items, global_ai_limit)}
+
+===============================================================================
+
+"""
+        
+        except Exception as e:
+            logging.error(f"Error generating email sections: {e}")
+            # Add fallback content if section generation fails
+            email_content += f"""⚠️ ERROR IN EMAIL GENERATION
+
+An error occurred while generating detailed analysis for some items.
+{len(sorted_items)} items were found but detailed analysis failed.
+
+Please check the logs for more details.
+
+===============================================================================
+
+"""
+        
+        # Add footer with AI usage stats
         email_content += f"""🤖 AI-POWERED INTELLIGENCE PLATFORM
 
 Generated: {current_time} AEST
-Sources Analyzed: {len(set(item[5] for item in sorted_items))}
+Sources Analyzed: {len(set(item[5] for item in sorted_items)) if sorted_items else 0}
 AI Processing: OpenAI GPT-4o with Market Context Analysis
+AI Calls Used: {getattr(self, 'global_ai_calls_used', 0)}/{global_ai_limit}
 Intelligence Threshold: Score ≥ 4/10
 
 💼 Connect with Matt Whiteoak
@@ -1046,7 +1172,66 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
 ===============================================================================
 """
         
+        logging.info(f"Completed email generation: {len(email_content)} characters, AI calls: {getattr(self, 'global_ai_calls_used', 0)}/{global_ai_limit}")
         return email_content
+
+    def generate_plain_text_news_section_with_global_limit(self, items: List[Tuple], global_limit: int) -> str:
+        """Generate news items with global AI limit tracking"""
+        if not items:
+            return "No items in this category."
+        
+        text_content = ""
+        
+        # Initialize global counter if not exists
+        if not hasattr(self, 'global_ai_calls_used'):
+            self.global_ai_calls_used = 0
+            
+        logging.info(f"Generating section for {len(items)} items (Global AI: {self.global_ai_calls_used}/{global_limit})")
+        
+        for i, item in enumerate(items, 1):
+            title, link, description, score, summary, source = item[:6]
+            
+            # Clean up title and description
+            clean_title = title.strip()
+            clean_desc = (description or summary or "")[:200].strip()
+            if clean_desc:
+                clean_desc = clean_desc.replace('\n', ' ').replace('\r', ' ')
+                # Remove HTML tags
+                clean_desc = re.sub('<[^<]+?>', '', clean_desc)
+            
+            # Generate context with global AI limit
+            try:
+                # Use AI for high-priority items OR if we haven't hit global limit
+                if score >= 7 and self.global_ai_calls_used < global_limit:
+                    relevance = self.generate_ai_market_context(title, description, score)
+                    self.global_ai_calls_used += 1
+                    logging.debug(f"Used AI for item {i} (score {score}) - Global AI: {self.global_ai_calls_used}/{global_limit}")
+                else:
+                    # Use fallback
+                    relevance = self.generate_fallback_market_context(title, description, score)
+                    reason = "low score" if score < 7 else "global limit reached"
+                    logging.debug(f"Used fallback for item {i} (score {score}) - {reason}")
+                    
+            except Exception as e:
+                logging.warning(f"Failed to generate context for item {i}: {e}")
+                relevance = "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making."
+            
+            text_content += f"""{i}. {clean_title}
+SCORE: {score}/10 | SOURCE: {source}
+LINK: {link}
+
+COMMERCIAL PROPERTY MARKET CONTEXT:
+{relevance}
+
+"""
+            
+            if clean_desc:
+                text_content += f"SUMMARY: {clean_desc}...\n\n"
+            
+            text_content += "-------------------------------------------------------------------------------\n\n"
+        
+        logging.info(f"Completed section: {len(items)} items processed (Global AI used: {self.global_ai_calls_used}/{global_limit})")
+        return text_content
 
     def generate_plain_text_executive_summary(self, top_items: List[Tuple], sentiment: str) -> str:
         """Generate executive summary in plain text format"""
@@ -1109,11 +1294,17 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
         return "\n".join(summary_parts)
 
     def generate_plain_text_news_section(self, items: List[Tuple]) -> str:
-        """Generate news items in clean plain text format"""
+        """Generate news items in clean plain text format with rate limiting and AI call limits"""
         if not items:
             return "No items in this category."
         
         text_content = ""
+        
+        logging.info(f"Generating news section for {len(items)} items with AI context...")
+        
+        # Limit OpenAI API calls to prevent hanging - only use AI for high-priority items
+        ai_call_count = 0
+        max_ai_calls = 20  # Limit to 20 AI calls per section to prevent hanging
         
         for i, item in enumerate(items, 1):
             title, link, description, score, summary, source = item[:6]
@@ -1126,8 +1317,21 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
                 # Remove HTML tags
                 clean_desc = re.sub('<[^<]+?>', '', clean_desc)
             
-            # Generate AI-powered commercial property relevance
-            relevance = self.generate_ai_market_context(title, description, score)
+            # Generate AI-powered commercial property relevance with limits
+            try:
+                # Only use AI for high-priority items or if we haven't hit the limit
+                if score >= 7 and ai_call_count < max_ai_calls:
+                    relevance = self.generate_ai_market_context(title, description, score)
+                    ai_call_count += 1
+                    logging.debug(f"Used AI for item {i}/{len(items)} (AI calls: {ai_call_count}/{max_ai_calls}): {title[:30]}...")
+                else:
+                    # Use fallback for lower priority items or when we've hit the AI limit
+                    relevance = self.generate_fallback_market_context(title, description, score)
+                    logging.debug(f"Used fallback for item {i}/{len(items)}: {title[:30]}...")
+                    
+            except Exception as e:
+                logging.warning(f"Failed to generate context for item {i}: {e}")
+                relevance = "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making."
             
             text_content += f"""{i}. {clean_title}
 SCORE: {score}/10 | SOURCE: {source}
@@ -1142,11 +1346,16 @@ COMMERCIAL PROPERTY MARKET CONTEXT:
                 text_content += f"SUMMARY: {clean_desc}...\n\n"
             
             text_content += "-------------------------------------------------------------------------------\n\n"
+            
+            # Progress logging every 10 items
+            if i % 10 == 0:
+                logging.info(f"Processed {i}/{len(items)} items (AI calls used: {ai_call_count}/{max_ai_calls})")
         
+        logging.info(f"Completed news section generation for {len(items)} items (Total AI calls: {ai_call_count})")
         return text_content
 
     def generate_ai_market_context(self, title: str, description: str, score: int) -> str:
-        """Generate AI-powered market context using OpenAI"""
+        """Generate AI-powered market context using OpenAI with better error handling"""
         try:
             # Create a concise prompt for OpenAI
             prompt = f"""As a commercial property market analyst, provide a 2-3 sentence analysis of how this news impacts commercial property markets (office, retail, industrial, logistics). Be specific and actionable for A-REIT executives.
@@ -1160,7 +1369,8 @@ Focus on: investment implications, market dynamics, tenant demand, property valu
                 model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=150,
-                temperature=0.1
+                temperature=0.1,
+                timeout=10  # 10 second timeout
             )
             
             ai_context = response.choices[0].message.content.strip()
@@ -1171,33 +1381,44 @@ Focus on: investment implications, market dynamics, tenant demand, property valu
             
             return ai_context
             
+        except openai.error.RateLimitError as e:
+            logging.warning(f"OpenAI rate limit hit: {e}")
+            time.sleep(2)  # Wait 2 seconds and use fallback
+            return self.generate_fallback_market_context(title, description, score)
+            
+        except openai.error.APIError as e:
+            logging.warning(f"OpenAI API error: {e}")
+            return self.generate_fallback_market_context(title, description, score)
+            
         except Exception as e:
             logging.warning(f"AI market context generation failed: {e}")
-            
-            # Fallback to rule-based analysis
-            title_lower = title.lower()
-            desc_lower = (description or "").lower()
-            combined = title_lower + " " + desc_lower
-            
-            # Enhanced fallback analysis
-            if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation', 'cash rate']):
-                return "MONETARY POLICY IMPACT: Interest rate changes directly affect commercial property valuations through cap rate movements and debt servicing costs. Higher rates typically compress property values while lower rates support asset prices and investment activity."
-            elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd', 'co-working']):
-                return "WORKPLACE EVOLUTION: Changing work patterns influence office space demand, lease structures, and CBD vs suburban preferences. Flexible work arrangements may reduce space requirements but increase demand for premium, technology-enabled buildings."
-            elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce', 'mall', 'high street']):
-                return "RETAIL TRANSFORMATION: Consumer behavior shifts impact retail property demand, requiring asset repositioning strategies. E-commerce growth affects traditional retail formats while creating opportunities in logistics and last-mile delivery hubs."
-            elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain', 'distribution']):
-                return "INDUSTRIAL DEMAND: Supply chain developments drive industrial property requirements, particularly in logistics hubs and distribution centers. Automation trends may reduce labor needs but increase demand for specialized, technology-integrated facilities."
-            elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning', 'building approvals']):
-                return "DEVELOPMENT FUNDAMENTALS: Construction activity and planning policies affect supply pipelines, development feasibility, and project timelines. Regulatory changes can significantly impact development margins and market dynamics."
-            elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech', 'smart building']):
-                return "TECHNOLOGY INTEGRATION: Digital transformation affects property operations, tenant expectations, and investment requirements. Smart building technologies can improve operational efficiency and tenant satisfaction while requiring significant capital investment."
-            elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance', 'reit', 'portfolio']):
-                return "CAPITAL MARKET DYNAMICS: Investment flows and financing conditions directly impact property acquisition strategies, portfolio optimization, and return expectations. Capital availability affects market liquidity and pricing dynamics."
-            elif any(keyword in combined for keyword in ['economy', 'gdp', 'employment', 'inflation', 'recession', 'growth']):
-                return "ECONOMIC FUNDAMENTALS: Broader economic conditions influence tenant demand, rental growth, and property market performance. Economic strength supports occupancy rates and rent growth while downturns may pressure fundamentals."
-            else:
-                return "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making, potentially affecting market sentiment, investment flows, or operational considerations for property portfolios."
+            return self.generate_fallback_market_context(title, description, score)
+
+    def generate_fallback_market_context(self, title: str, description: str, score: int) -> str:
+        """Generate fallback market context without OpenAI"""
+        title_lower = title.lower()
+        desc_lower = (description or "").lower()
+        combined = title_lower + " " + desc_lower
+        
+        # Enhanced fallback analysis
+        if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation', 'cash rate']):
+            return "MONETARY POLICY IMPACT: Interest rate changes directly affect commercial property valuations through cap rate movements and debt servicing costs. Higher rates typically compress property values while lower rates support asset prices and investment activity."
+        elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd', 'co-working']):
+            return "WORKPLACE EVOLUTION: Changing work patterns influence office space demand, lease structures, and CBD vs suburban preferences. Flexible work arrangements may reduce space requirements but increase demand for premium, technology-enabled buildings."
+        elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce', 'mall', 'high street']):
+            return "RETAIL TRANSFORMATION: Consumer behavior shifts impact retail property demand, requiring asset repositioning strategies. E-commerce growth affects traditional retail formats while creating opportunities in logistics and last-mile delivery hubs."
+        elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain', 'distribution']):
+            return "INDUSTRIAL DEMAND: Supply chain developments drive industrial property requirements, particularly in logistics hubs and distribution centers. Automation trends may reduce labor needs but increase demand for specialized, technology-integrated facilities."
+        elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning', 'building approvals']):
+            return "DEVELOPMENT FUNDAMENTALS: Construction activity and planning policies affect supply pipelines, development feasibility, and project timelines. Regulatory changes can significantly impact development margins and market dynamics."
+        elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech', 'smart building']):
+            return "TECHNOLOGY INTEGRATION: Digital transformation affects property operations, tenant expectations, and investment requirements. Smart building technologies can improve operational efficiency and tenant satisfaction while requiring significant capital investment."
+        elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance', 'reit', 'portfolio']):
+            return "CAPITAL MARKET DYNAMICS: Investment flows and financing conditions directly impact property acquisition strategies, portfolio optimization, and return expectations. Capital availability affects market liquidity and pricing dynamics."
+        elif any(keyword in combined for keyword in ['economy', 'gdp', 'employment', 'inflation', 'recession', 'growth']):
+            return "ECONOMIC FUNDAMENTALS: Broader economic conditions influence tenant demand, rental growth, and property market performance. Economic strength supports occupancy rates and rent growth while downturns may pressure fundamentals."
+        else:
+            return "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making, potentially affecting market sentiment, investment flows, or operational considerations for property portfolios."
 
     def calculate_simple_sentiment(self, items: List[Tuple]) -> str:
         """Calculate market sentiment from news items"""
