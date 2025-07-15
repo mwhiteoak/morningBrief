@@ -2,7 +2,7 @@
 """
 RSS Feed Analyzer for A-REIT CEO/COO - Executive Intelligence Platform
 Monitors RSS feeds, evaluates content with OpenAI, and sends daily emails
-OPTIMIZED VERSION - 3x Daily Incremental Processing
+OPTIMIZED VERSION - 3x Daily Incremental Processing with Markdown Email
 """
 
 import feedparser
@@ -135,7 +135,7 @@ class IncrementalProcessor:
         return cutoff_time
     
     def should_send_email(self) -> Tuple[bool, str]:
-        """Determine if we should send email based on time of day - FIXED"""
+        """Determine if we should send email based on time of day - MORE FLEXIBLE"""
         now = datetime.now()
         hour = now.hour
         
@@ -143,18 +143,25 @@ class IncrementalProcessor:
         if os.getenv('GITHUB_ACTIONS'):
             return True, "github_actions"
         
+        # Send email during multiple time windows (more flexible)
+        # Morning: 6-9 AM AEST (most important)
+        # Midday: 12-2 PM AEST  
+        # Evening: 6-8 PM AEST
+        
         # Convert to AEST equivalent (assuming UTC+10)
         aest_hour = (hour + 10) % 24
         
-        # Send email at morning run (6-9 AM AEST = 20-23 UTC previous day, or 0-2 UTC)
-        if 20 <= hour <= 23 or 0 <= hour <= 2:  # Around 6-9 AM AEST
+        # Morning run (6-9 AM AEST = 20-23 UTC previous day, or 0-2 UTC)
+        if 20 <= hour <= 23 or 0 <= hour <= 2:
             return True, "morning"
-        elif 3 <= hour <= 7:  # Around 12-4 PM AEST  
-            return False, "midday"
-        elif 8 <= hour <= 15:  # Around 6 PM - 1 AM AEST
-            return False, "evening"
+        # Midday run (12-2 PM AEST = 2-4 UTC)
+        elif 2 <= hour <= 4:
+            return True, "midday"
+        # Evening run (6-8 PM AEST = 8-10 UTC)
+        elif 8 <= hour <= 10:
+            return True, "evening"
         else:
-            return True, "other_send"  # Send for manual runs
+            return False, "off_hours"
 
 
 class RSSAnalyzer:
@@ -812,7 +819,7 @@ See README.md for detailed setup instructions.
         }
 
     def should_send_email_now(self) -> Tuple[bool, str]:
-        """Check if we should send email based on schedule"""
+        """Check if we should send email based on schedule - MORE FLEXIBLE"""
         processor = IncrementalProcessor(self)
         return processor.should_send_email()
 
@@ -842,392 +849,269 @@ See README.md for detailed setup instructions.
         return items
 
     def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
-        """Enhanced email generation with better debugging and fallbacks"""
+        """Generate markdown-formatted email that works across all email clients - MUCH MORE INCLUSIVE"""
         logging.info(f"Generating email from {len(items)} items")
         
         if not items:
             logging.warning("No items provided for email generation")
             return None
         
-        # CRITICAL: More generous filtering to ensure content
-        # Filter and prioritize items more generously
-        high_priority = [item for item in items if item[3] >= 7][:12]  # Increased from 8
-        medium_priority = [item for item in items if 5 <= item[3] < 7][:10]  # Increased from 6
-        low_priority = [item for item in items if 4 <= item[3] < 5][:8]  # Added low priority
-        
-        # Total: Maximum 30 items to ensure we have content
-        filtered_items = high_priority + medium_priority + low_priority
-        
-        logging.info(f"Filtered items: {len(high_priority)} high, {len(medium_priority)} medium, {len(low_priority)} low")
-        
-        # Skip obvious errors and duplicates
-        final_items = []
+        # MUCH MORE INCLUSIVE FILTERING - include everything potentially relevant
+        # Instead of aggressive filtering, just remove obvious errors and duplicates
+        filtered_items = []
         seen_titles = set()
         
-        for item in filtered_items:
+        for item in items:
             title, link, description, score, summary, source_name = item[:6]
             
-            # Skip errors
+            # Only skip obvious errors - be very permissive
             if any(phrase in title.lower() for phrase in [
-                'not found', 'sign up to rss.app', 'error', 'access denied', '404'
+                'not found', 'sign up to rss.app', 'error 404', 'access denied', 
+                'page not found', 'forbidden', 'unauthorized'
             ]):
                 continue
             
-            # Skip duplicates (fuzzy matching)
-            title_key = title.lower()[:50]  # First 50 chars for fuzzy matching
+            # Skip exact duplicates only
+            title_key = title.lower().strip()
             if title_key in seen_titles:
                 continue
             seen_titles.add(title_key)
             
-            final_items.append(item)
-            
-            # Generous limit to ensure content
-            if len(final_items) >= 25:
-                break
+            # Include ALL items with score >= 4 (much more inclusive)
+            if score >= 4:
+                filtered_items.append(item)
         
-        logging.info(f"Final items for email: {len(final_items)}")
+        logging.info(f"Filtered items for email: {len(filtered_items)} (much more inclusive)")
         
-        if not final_items:
+        if not filtered_items:
             logging.warning("No items remaining after filtering")
             return None
         
-        return self.build_executive_email_html(final_items)
+        return self.build_markdown_email(filtered_items)
 
-    def build_executive_email_html(self, items: List[Tuple]) -> str:
-        """Build clean, focused executive intelligence briefing"""
+    def build_markdown_email(self, items: List[Tuple]) -> str:
+        """Build clean markdown email that works across ALL email clients"""
         
         current_date = datetime.now().strftime('%B %d, %Y')
         current_time = datetime.now().strftime('%I:%M %p AEST')
         
-        # Calculate key metrics
-        total_items = len(items)
-        high_priority_count = len([item for item in items if item[3] >= 7])
-        critical_count = len([item for item in items if item[3] >= 8])
-        
-        # Market sentiment
-        sentiment = self.calculate_simple_sentiment(items)
-        sentiment_emoji = {"Positive": "📈", "Negative": "📉", "Neutral": "📊"}[sentiment]
-        sentiment_color = {"Positive": "#10b981", "Negative": "#ef4444", "Neutral": "#6366f1"}[sentiment]
-        
-        # Sort by relevance
+        # Sort items by score (highest first)
         sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
         
-        # Filter for only relevant items (score >= 6)
-        relevant_items = [item for item in sorted_items if item[3] >= 6][:10]
+        # Group items by priority for better organization
+        critical_items = [item for item in sorted_items if item[3] >= 8]
+        high_items = [item for item in sorted_items if item[3] == 7]
+        medium_items = [item for item in sorted_items if item[3] == 6]
+        normal_items = [item for item in sorted_items if item[3] == 5]
+        other_items = [item for item in sorted_items if item[3] == 4]
         
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Commercial Property Intelligence • {current_date}</title>
-            <style>
-                * {{ box-sizing: border-box; }}
-                body {{ 
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                    margin: 0; padding: 20px; 
-                    background: #f8fafc; color: #1e293b; line-height: 1.6;
-                }}
-                .container {{ 
-                    max-width: 700px; margin: 0 auto; 
-                    background: white; border-radius: 12px;
-                    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-                    overflow: hidden;
-                }}
-                
-                .header {{
-                    background: linear-gradient(135deg, #1e293b 0%, #475569 100%);
-                    color: white; padding: 30px; text-align: center;
-                }}
-                .header h1 {{ 
-                    margin: 0; font-size: 24px; font-weight: 700; 
-                }}
-                .header .date {{ 
-                    margin: 8px 0 0 0; opacity: 0.9; font-size: 14px;
-                }}
-                
-                .summary-bar {{
-                    background: {sentiment_color}15;
-                    padding: 20px; border-bottom: 1px solid #e2e8f0;
-                    display: flex; justify-content: space-between; align-items: center;
-                    flex-wrap: wrap; gap: 15px;
-                }}
-                .metric {{
-                    text-align: center; flex: 1; min-width: 80px;
-                }}
-                .metric-value {{
-                    font-size: 20px; font-weight: 700; 
-                    color: {sentiment_color}; margin: 0;
-                }}
-                .metric-label {{
-                    font-size: 11px; color: #64748b; 
-                    text-transform: uppercase; margin: 4px 0 0 0;
-                }}
-                
-                .content {{ padding: 30px; }}
-                
-                .executive-summary {{
-                    background: #f1f5f9; border-radius: 8px; 
-                    padding: 20px; margin-bottom: 30px;
-                    border-left: 4px solid {sentiment_color};
-                }}
-                .summary-title {{
-                    font-size: 16px; font-weight: 700; 
-                    color: #1e293b; margin: 0 0 12px 0;
-                }}
-                .summary-text {{
-                    font-size: 14px; line-height: 1.6; color: #475569;
-                }}
-                
-                .news-section {{
-                    margin-bottom: 30px;
-                }}
-                .section-title {{
-                    font-size: 18px; font-weight: 700; color: #1e293b; 
-                    margin: 0 0 20px 0; padding-bottom: 10px;
-                    border-bottom: 2px solid #e2e8f0;
-                }}
-                
-                .news-item {{
-                    background: white; border: 1px solid #e2e8f0;
-                    border-radius: 8px; padding: 20px; margin-bottom: 16px;
-                    transition: box-shadow 0.2s;
-                }}
-                .news-item:hover {{
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-                }}
-                .news-critical {{ border-left: 4px solid #ef4444; }}
-                .news-high {{ border-left: 4px solid #f59e0b; }}
-                .news-medium {{ border-left: 4px solid #10b981; }}
-                
-                .news-header {{
-                    display: flex; justify-content: space-between; 
-                    align-items: flex-start; margin-bottom: 12px; gap: 15px;
-                }}
-                .news-title {{
-                    font-size: 15px; font-weight: 600; 
-                    line-height: 1.4; margin: 0; flex: 1;
-                }}
-                .news-title a {{
-                    color: #1e293b; text-decoration: none;
-                }}
-                .news-title a:hover {{ color: {sentiment_color}; }}
-                
-                .news-score {{
-                    background: {sentiment_color}; color: white; 
-                    padding: 4px 10px; border-radius: 12px;
-                    font-size: 11px; font-weight: 600; white-space: nowrap;
-                }}
-                
-                .relevance-box {{
-                    background: #fef3c7; border: 1px solid #f59e0b;
-                    border-radius: 6px; padding: 12px; margin-top: 12px;
-                }}
-                .relevance-title {{
-                    font-size: 12px; font-weight: 600; 
-                    color: #92400e; margin: 0 0 6px 0;
-                }}
-                .relevance-text {{
-                    font-size: 13px; line-height: 1.5; 
-                    color: #78350f; margin: 0;
-                }}
-                
-                .news-meta {{
-                    font-size: 12px; color: #64748b; 
-                    margin-bottom: 10px;
-                }}
-                
-                .footer {{
-                    background: #1e293b; color: white; 
-                    padding: 20px; text-align: center;
-                }}
-                .footer-text {{
-                    font-size: 12px; opacity: 0.8; margin: 0;
-                }}
-                
-                @media (max-width: 600px) {{
-                    body {{ padding: 10px; }}
-                    .summary-bar {{ flex-direction: column; }}
-                    .news-header {{ flex-direction: column; align-items: flex-start; }}
-                    .content {{ padding: 20px; }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1>🏢 Commercial Property Intelligence</h1>
-                    <div class="date">{current_date} • {current_time}</div>
-                </div>
-                
-                <div class="summary-bar">
-                    <div class="metric">
-                        <div class="metric-value">{len(relevant_items)}</div>
-                        <div class="metric-label">Relevant Items</div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-value">{critical_count}</div>
-                        <div class="metric-label">Critical</div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-value">{sentiment_emoji}</div>
-                        <div class="metric-label">Market Sentiment</div>
-                    </div>
-                    <div class="metric">
-                        <div class="metric-value">🤖</div>
-                        <div class="metric-label">AI Analyzed</div>
-                    </div>
-                </div>
-                
-                <div class="content">
-                    <div class="executive-summary">
-                        <div class="summary-title">📊 Executive Summary</div>
-                        <div class="summary-text">
-                            {self.generate_clean_executive_summary(relevant_items, sentiment)}
-                        </div>
-                    </div>
-                    
-                    <div class="news-section">
-                        <div class="section-title">🎯 Commercial Property Impact Analysis</div>
-                        {self.generate_clean_news_items(relevant_items)}
-                    </div>
-                </div>
-                
-                <div class="footer">
-                    <div class="footer-text">
-                        AI-Powered Commercial Property Intelligence • {len(relevant_items)} sources analyzed<br>
-                        Generated at {current_time} AEST • Executive Briefing • Threshold: Score ≥5<br>
-                        <br>
-                        <a href="https://www.linkedin.com/in/mattwhiteoak" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 600;">
-                            💼 Connect with Matt Whiteoak on LinkedIn
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
+        # Calculate summary stats
+        total_items = len(sorted_items)
+        critical_count = len(critical_items)
+        high_count = len(high_items)
+        sentiment = self.calculate_simple_sentiment(sorted_items)
         
-        return html
+        # Build markdown email
+        email_content = f"""**🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING**
+**{current_date} • {current_time}**
 
-    def generate_clean_executive_summary(self, items: List[Tuple], sentiment: str) -> str:
-        """Generate clean, focused executive summary"""
-        if not items:
-            return "No significant commercial property developments identified in current market analysis."
-        
-        high_impact = [item for item in items if item[3] >= 8]
-        medium_impact = [item for item in items if 6 <= item[3] < 8]
-        
-        summary = f"Market analysis reveals {len(items)} developments with commercial property implications. "
-        
-        if high_impact:
-            summary += f"{len(high_impact)} high-impact items require immediate attention. "
-        
-        if sentiment == "Positive":
-            summary += "Overall market sentiment indicates favorable conditions for commercial property investment and development."
-        elif sentiment == "Negative":
-            summary += "Market conditions suggest caution in commercial property decisions with heightened risk monitoring required."
-        else:
-            summary += "Market sentiment remains stable with balanced risk-reward scenarios across commercial property sectors."
-        
-        return summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def generate_clean_news_items(self, items: List[Tuple]) -> str:
-        """Generate clean news items with commercial property relevance"""
+**📊 EXECUTIVE SUMMARY**
+
+Total Items Analyzed: **{total_items}**
+Critical Priority: **{critical_count}** 
+High Priority: **{high_count}**
+Market Sentiment: **{sentiment}**
+
+{self.generate_markdown_executive_summary(sorted_items[:5], sentiment)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+
+        # Add each priority section
+        if critical_items:
+            email_content += f"""**🚨 CRITICAL PRIORITY ITEMS ({len(critical_items)})**
+
+{self.generate_markdown_news_section(critical_items)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+
+        if high_items:
+            email_content += f"""**🔴 HIGH PRIORITY ITEMS ({len(high_items)})**
+
+{self.generate_markdown_news_section(high_items)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+
+        if medium_items:
+            email_content += f"""**🟡 MEDIUM PRIORITY ITEMS ({len(medium_items)})**
+
+{self.generate_markdown_news_section(medium_items)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+
+        if normal_items:
+            email_content += f"""**🟢 NORMAL PRIORITY ITEMS ({len(normal_items)})**
+
+{self.generate_markdown_news_section(normal_items)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+
+        if other_items:
+            email_content += f"""**📋 OTHER RELEVANT ITEMS ({len(other_items)})**
+
+{self.generate_markdown_news_section(other_items)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"""
+
+        # Add footer
+        email_content += f"""**🤖 AI-POWERED INTELLIGENCE PLATFORM**
+
+Generated: {current_time} AEST
+Sources Analyzed: {len(set(item[5] for item in sorted_items))}
+AI Processing: OpenAI GPT-4o
+Intelligence Threshold: Score ≥ 4/10
+
+**💼 Connect with Matt Whiteoak**
+LinkedIn: https://www.linkedin.com/in/mattwhiteoak
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        return email_content
+
+    def generate_markdown_executive_summary(self, top_items: List[Tuple], sentiment: str) -> str:
+        """Generate executive summary in markdown format"""
+        if not top_items:
+            return "**No significant developments requiring immediate attention.** Market monitoring continues across all commercial property sectors."
+        
+        summary_parts = []
+        
+        # Key themes analysis
+        themes = {
+            'monetary_policy': 0,
+            'property_market': 0,
+            'technology': 0,
+            'regulatory': 0,
+            'economic': 0
+        }
+        
+        for item in top_items:
+            title_desc = (item[0] + ' ' + (item[2] or '')).lower()
+            score = item[3]
+            
+            if any(keyword in title_desc for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation']):
+                themes['monetary_policy'] += score
+            elif any(keyword in title_desc for keyword in ['property', 'real estate', 'reit', 'commercial', 'residential']):
+                themes['property_market'] += score
+            elif any(keyword in title_desc for keyword in ['technology', 'ai', 'digital', 'automation']):
+                themes['technology'] += score
+            elif any(keyword in title_desc for keyword in ['regulation', 'policy', 'government', 'law']):
+                themes['regulatory'] += score
+            else:
+                themes['economic'] += score
+        
+        # Find dominant themes
+        dominant_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)[:2]
+        
+        # Build summary
+        if dominant_themes[0][1] > 0:
+            theme_names = {
+                'monetary_policy': 'monetary policy developments',
+                'property_market': 'commercial property market activity',
+                'technology': 'technology and innovation impacts',
+                'regulatory': 'regulatory and policy changes',
+                'economic': 'broader economic developments'
+            }
+            
+            primary_theme = theme_names.get(dominant_themes[0][0], 'market developments')
+            summary_parts.append(f"**Primary Focus:** {primary_theme.title()}")
+            
+            if dominant_themes[1][1] > 0:
+                secondary_theme = theme_names.get(dominant_themes[1][0], 'market activity')
+                summary_parts.append(f"**Secondary Focus:** {secondary_theme.title()}")
+        
+        summary_parts.append(f"**Market Sentiment:** {sentiment}")
+        
+        # Add action context
+        critical_count = len([item for item in top_items if item[3] >= 8])
+        if critical_count > 0:
+            summary_parts.append(f"**⚠️ {critical_count} critical items require immediate executive attention**")
+        
+        return "\n".join(summary_parts)
+
+    def generate_markdown_news_section(self, items: List[Tuple]) -> str:
+        """Generate news items in clean markdown format"""
         if not items:
-            return "<p>No relevant commercial property developments identified.</p>"
+            return "_No items in this category._"
         
-        html = ""
+        markdown_content = ""
         
-        for item in items:
+        for i, item in enumerate(items, 1):
             title, link, description, score, summary, source = item[:6]
             
-            # Determine priority styling
-            if score >= 8:
-                priority_class = "news-critical"
-                priority_label = "CRITICAL"
-            elif score >= 7:
-                priority_class = "news-high"
-                priority_label = "HIGH"
-            else:
-                priority_class = "news-medium"
-                priority_label = "MEDIUM"
+            # Clean up title and description
+            clean_title = title.strip()
+            clean_desc = (description or summary or "")[:200].strip()
+            if clean_desc:
+                clean_desc = clean_desc.replace('\n', ' ').replace('\r', ' ')
+                # Remove HTML tags
+                clean_desc = re.sub('<[^<]+?>', '', clean_desc)
             
-            # Generate AI commercial property relevance
-            relevance = self.generate_commercial_property_relevance(title, description, score)
+            # Generate commercial property relevance
+            relevance = self.generate_commercial_property_relevance_markdown(title, description, score)
             
-            # Clean summary
-            clean_summary = (summary or description)[:150] + "..." if (summary or description) else ""
-            clean_summary = re.sub('<[^<]+?>', '', clean_summary)
-            
-            html += f'''
-            <div class="news-item {priority_class}">
-                <div class="news-header">
-                    <div class="news-title">
-                        <a href="{link}" target="_blank">{title}</a>
-                    </div>
-                    <div class="news-score">{score}/10</div>
-                </div>
-                
-                <div class="news-meta">
-                    {priority_label} • {source} • {datetime.now().strftime('%H:%M')}
-                </div>
-                
-                <div class="relevance-box">
-                    <div class="relevance-title">🏢 Commercial Property Impact</div>
-                    <div class="relevance-text">{relevance}</div>
-                </div>
-            </div>
-            '''
-        
-        return html
+            markdown_content += f"""**{i}. {clean_title}**
+**Score:** {score}/10 | **Source:** {source}
+**Link:** {link}
 
-    def generate_commercial_property_relevance(self, title: str, description: str, score: int) -> str:
-        """Generate AI-powered commercial property relevance analysis"""
+**Commercial Property Impact:**
+{relevance}
+
+"""
+            
+            if clean_desc:
+                markdown_content += f"**Summary:** {clean_desc}...\n\n"
+            
+            markdown_content += "─────────────────────────────────────────────────────────────────────────────────────────────\n\n"
+        
+        return markdown_content
+
+    def generate_commercial_property_relevance_markdown(self, title: str, description: str, score: int) -> str:
+        """Generate markdown-formatted commercial property relevance"""
         title_lower = title.lower()
         desc_lower = (description or "").lower()
         combined = title_lower + " " + desc_lower
         
-        # Use AI to generate specific commercial property relevance
-        try:
-            prompt = f"""Analyze this news item for commercial property relevance in 1-2 sentences:
-            
-Title: {title}
-Description: {description[:200]}
-
-Explain specifically HOW this impacts commercial property (office, retail, industrial, logistics) investment, development, or operations. Be concrete and actionable for A-REIT executives."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.1
-            )
-            
-            relevance = response.choices[0].message.content.strip()
-            return relevance
-            
-        except Exception as e:
-            logging.warning(f"AI relevance analysis failed: {e}")
-            
-            # Fallback analysis based on keywords
-            if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary']):
-                return "Interest rate changes directly impact commercial property valuations, cap rates, and debt servicing costs across all asset classes."
-            elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid']):
-                return "Workplace trends affect office demand, occupancy rates, and rental growth prospects in CBD and suburban markets."
-            elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce']):
-                return "Consumer behavior shifts influence retail property demand, tenant mix strategies, and asset repositioning requirements."
-            elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain']):
-                return "Supply chain developments impact industrial property demand, logistics hub valuations, and last-mile delivery real estate."
-            elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning']):
-                return "Development regulations and construction factors affect project feasibility, delivery timelines, and development margins."
-            elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital']):
-                return "Technology adoption influences property operations efficiency, tenant requirements, and smart building investment priorities."
-            elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance']):
-                return "Capital market conditions affect property acquisition financing, portfolio strategies, and investment return expectations."
-            else:
-                return "Broader economic trends provide important context for commercial property market dynamics and strategic decision-making."
+        # Quick relevance analysis
+        if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation']):
+            return "**MONETARY POLICY IMPACT:** Direct influence on commercial property valuations, cap rates, and debt servicing costs across all asset classes."
+        elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd']):
+            return "**WORKPLACE TRENDS:** Affects office demand, occupancy rates, and rental growth prospects in both CBD and suburban markets."
+        elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce']):
+            return "**RETAIL SECTOR:** Influences retail property demand, tenant mix strategies, and asset repositioning requirements."
+        elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain']):
+            return "**INDUSTRIAL/LOGISTICS:** Impacts industrial property demand, logistics hub valuations, and last-mile delivery infrastructure."
+        elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning']):
+            return "**DEVELOPMENT IMPACT:** Affects project feasibility, delivery timelines, development margins, and planning approvals."
+        elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech']):
+            return "**TECHNOLOGY DISRUPTION:** Influences property operations efficiency, tenant requirements, and smart building investment priorities."
+        elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance', 'reit']):
+            return "**CAPITAL MARKETS:** Affects property acquisition financing, portfolio strategies, and investment return expectations."
+        else:
+            return "**MARKET CONTEXT:** Provides important economic context for commercial property strategic decision-making and risk assessment."
 
     def calculate_simple_sentiment(self, items: List[Tuple]) -> str:
         """Calculate market sentiment from news items"""
@@ -1260,595 +1144,19 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
         else:
             return "Neutral"
 
-    def calculate_risk_level(self, items: List[Tuple]) -> str:
-        """Calculate overall risk level from news items"""
-        if not items:
-            return "Low"
-        
-        risk_keywords = ['risk', 'concern', 'uncertainty', 'volatility', 'decline', 'fall', 'crisis', 'threat', 'warning']
-        total_risk_score = 0
-        
-        for item in items:
-            title_desc = (item[0] + ' ' + item[2]).lower()
-            interest_score = item[3]
-            
-            # Count risk keywords weighted by interest score
-            risk_count = sum(1 for keyword in risk_keywords if keyword in title_desc)
-            total_risk_score += risk_count * (interest_score / 10.0)
-        
-        if total_risk_score > 15:
-            return "High"
-        elif total_risk_score > 8:
-            return "Medium"
-        else:
-            return "Low"
-
-    def calculate_market_pulse(self, items: List[Tuple], sentiment: str, high_priority_count: int) -> str:
-        """Calculate overall market pulse"""
-        if high_priority_count >= 5 and sentiment == "Negative":
-            return "⚡ Highly Active"
-        elif high_priority_count >= 3 or sentiment == "Positive":
-            return "📈 Active"
-        elif len(items) >= 10:
-            return "📊 Stable"
-        else:
-            return "😴 Quiet"
-
-    def generate_executive_summary_text(self, top_items: List[Tuple]) -> str:
-        """Generate executive summary from top items"""
-        if not top_items:
-            return "No significant developments in commercial property sector today."
-        
-        # Extract key themes
-        themes = []
-        for item in top_items[:3]:
-            title = item[0].lower()
-            if any(keyword in title for keyword in ['interest rate', 'rba', 'cash rate']):
-                themes.append("monetary policy developments")
-            elif any(keyword in title for keyword in ['property', 'real estate', 'reit']):
-                themes.append("property sector activity")
-            elif any(keyword in title for keyword in ['office', 'retail', 'industrial']):
-                themes.append("commercial property fundamentals")
-            elif any(keyword in title for keyword in ['technology', 'ai', 'digital']):
-                themes.append("technology disruption")
-        
-        unique_themes = list(set(themes))
-        
-        if unique_themes:
-            theme_text = ", ".join(unique_themes[:2])
-            return f"Key developments today focused on {theme_text}. {len(top_items)} high-priority items require executive attention."
-        else:
-            return f"{len(top_items)} priority items identified across commercial property and related sectors."
-
-    def generate_action_items_html(self, top_items: List[Tuple]) -> str:
-        """Generate action items section"""
-        if not top_items:
-            return ""
-        
-        actions = []
-        
-        for item in top_items[:3]:
-            title, link, description, score = item[0], item[1], item[2], item[3]
-            
-            if score >= 9:
-                actions.append(f"<strong>URGENT:</strong> Review implications of '{title[:60]}...'")
-            elif score >= 8:
-                actions.append(f"<strong>Monitor:</strong> Track developments in '{title[:60]}...'")
-            elif score >= 7:
-                actions.append(f"<strong>Consider:</strong> Assess impact of '{title[:60]}...'")
-        
-        if actions:
-            action_html = "<br>• ".join(actions)
-            return f'''
-            <div class="action-items">
-                <strong>🎯 Executive Action Items</strong><br>
-                • {action_html}
-            </div>
-            '''
-        
-        return ""
-
-    def generate_news_items_html(self, items: List[Tuple]) -> str:
-        """Generate news items HTML"""
-        html = ""
-        
-        for item in items:
-            title, link, description, score, summary, source = item[:6]
-            
-            # Determine priority class
-            if score >= 8:
-                priority_class = "priority-high"
-                priority_icon = "🔴"
-            elif score >= 6:
-                priority_class = "priority-medium"  
-                priority_icon = "🟡"
-            else:
-                priority_class = ""
-                priority_icon = "🟢"
-            
-            # Clean and truncate summary
-            clean_summary = (summary or description)[:200] + "..." if (summary or description) else "No summary available"
-            clean_summary = re.sub('<[^<]+?>', '', clean_summary)  # Remove HTML tags
-            
-            html += f'''
-            <div class="news-item {priority_class}">
-                <div class="news-title">
-                    <a href="{link}" target="_blank">{title}</a>
-                </div>
-                <div class="news-meta">
-                    {priority_icon} Score: {score}/10 • {source} • {datetime.now().strftime('%H:%M')}
-                </div>
-                <div class="news-summary">
-                    {clean_summary}
-                </div>
-            </div>
-            '''
-        
-        return html
-
-    def generate_social_media_html(self, items: List[Tuple]) -> str:
-        """Generate simple social media content"""
-        if len(items) < 2:
-            return ""
-        
-        top_item = items[0]
-        title = top_item[0]
-        
-        # Generate simple social posts
-        twitter_post = f"Key development in commercial property: {title[:180]}... What are your thoughts on the implications? #CommercialProperty #AREIT"
-        
-        linkedin_post = f"Interesting development in our sector:\n\n{title}\n\nThis highlights the importance of staying informed about market dynamics. How do you see this impacting commercial property strategies?\n\n#RealEstate #CommercialProperty #Leadership"
-        
-        return f'''
-        <div class="social-section">
-            <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📱 Ready-to-Share Content</h3>
-            
-            <div class="social-post">
-                <strong>🐦 Twitter:</strong><br>
-                {twitter_post}
-            </div>
-            
-            <div class="social-post">
-                <strong>💼 LinkedIn:</strong><br>
-                {linkedin_post[:300]}...
-            </div>
-        </div>
-        '''
-
-    def generate_additional_items_html(self, items: List[Tuple]) -> str:
-        """Generate additional items section"""
-        if not items:
-            return ""
-        
-        html = '''
-        <div style="margin-top: 20px;">
-            <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📋 Additional Items</h3>
-        '''
-        
-        for item in items:
-            title, link, score, source = item[0], item[1], item[3], item[5]
-            
-            html += f'''
-            <div style="border-bottom: 1px solid #e9ecef; padding: 8px 0; font-size: 12px;">
-                <a href="{link}" target="_blank" style="color: #495057; text-decoration: none; font-weight: 500;">{title}</a>
-                <span style="color: #6c757d; margin-left: 8px;">• {source} • {score}/10</span>
-            </div>
-            '''
-        
-        html += "</div>"
-        return html
-
-    def generate_advanced_executive_summary(self, top_items: List[Tuple], sentiment: str, risk_level: str) -> str:
-        """Generate sophisticated AI-powered executive summary"""
-        if not top_items:
-            return "Market conditions are stable with no significant developments requiring immediate attention. Monitoring continues across all sectors."
-        
-        # Analyze themes with AI-level sophistication
-        themes = {
-            'monetary_policy': 0,
-            'property_market': 0,
-            'technology_disruption': 0,
-            'regulatory_changes': 0,
-            'market_sentiment': 0
-        }
-        
-        for item in top_items:
-            title_desc = (item[0] + ' ' + item[2]).lower()
-            score = item[3]
-            
-            if any(keyword in title_desc for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation']):
-                themes['monetary_policy'] += score
-            if any(keyword in title_desc for keyword in ['property', 'real estate', 'reit', 'commercial', 'residential']):
-                themes['property_market'] += score
-            if any(keyword in title_desc for keyword in ['technology', 'ai', 'digital', 'innovation', 'automation']):
-                themes['technology_disruption'] += score
-            if any(keyword in title_desc for keyword in ['regulation', 'policy', 'government', 'law', 'compliance']):
-                themes['regulatory_changes'] += score
-            if any(keyword in title_desc for keyword in ['market', 'sentiment', 'outlook', 'forecast', 'prediction']):
-                themes['market_sentiment'] += score
-        
-        # Find dominant theme
-        dominant_theme = max(themes.items(), key=lambda x: x[1])
-        
-        # Generate intelligent summary based on analysis
-        theme_insights = {
-            'monetary_policy': f"Central bank policy developments are driving market dynamics with {sentiment.lower()} sentiment prevailing.",
-            'property_market': f"Property sector activity shows {sentiment.lower()} momentum with {len(top_items)} key developments requiring strategic attention.",
-            'technology_disruption': f"Technology transformation continues reshaping real estate fundamentals, creating both opportunities and competitive pressures.",
-            'regulatory_changes': f"Regulatory landscape shifts present {risk_level.lower()}-risk scenarios requiring proactive strategic positioning.",
-            'market_sentiment': f"Market sentiment indicators point to {sentiment.lower()} conditions with {risk_level.lower()} volatility expectations."
-        }
-        
-        base_summary = theme_insights.get(dominant_theme[0], "Market conditions reflect mixed signals requiring careful monitoring.")
-        
-        # Add risk and opportunity context
-        if risk_level == "High":
-            base_summary += " Critical risk factors identified require immediate executive attention and potential strategic adjustments."
-        elif risk_level == "Medium":
-            base_summary += " Moderate risk factors suggest enhanced monitoring protocols and contingency planning."
-        
-        return base_summary
-
-    def generate_ai_insights_section(self, items: List[Tuple]) -> str:
-        """Generate AI-powered insights section"""
-        if not items:
-            return ""
-        
-        insights = []
-        
-        for item in items[:3]:
-            title = item[0]
-            score = item[3]
-            
-            if score >= 9:
-                insights.append(f"<strong>Critical Signal:</strong> {title} represents a market-moving development requiring immediate strategic assessment.")
-            elif score >= 8:
-                insights.append(f"<strong>Strategic Opportunity:</strong> {title} indicates emerging market dynamics with potential competitive advantages.")
-            elif score >= 7:
-                insights.append(f"<strong>Market Intelligence:</strong> {title} provides valuable sector insights for informed decision-making.")
-        
-        if not insights:
-            insights = ["Market conditions remain within normal parameters with no exceptional developments requiring immediate intervention."]
-        
-        insight_html = ""
-        for insight in insights[:3]:
-            insight_html += f'<div class="insight-item">{insight}</div>'
-        
-        return f'''
-        <div class="ai-insights">
-            <div class="insights-title">
-                🤖 AI Strategic Insights
-            </div>
-            {insight_html}
-        </div>
-        '''
-
-    def generate_strategic_actions_section(self, items: List[Tuple]) -> str:
-        """Generate strategic action items"""
-        if not items:
-            return ""
-        
-        actions = []
-        
-        for item in items[:3]:
-            title = item[0]
-            score = item[3]
-            
-            if score >= 9:
-                actions.append({
-                    'priority': 'CRITICAL',
-                    'action': f"Immediate executive review of '{title[:60]}...' implications for strategic positioning and risk management."
-                })
-            elif score >= 8:
-                actions.append({
-                    'priority': 'HIGH',
-                    'action': f"Schedule strategic assessment of '{title[:60]}...' within 24-48 hours for potential opportunity capture."
-                })
-            elif score >= 7:
-                actions.append({
-                    'priority': 'MEDIUM',
-                    'action': f"Monitor developments in '{title[:60]}...' and assess relevance to current strategic initiatives."
-                })
-        
-        if not actions:
-            actions = [{
-                'priority': 'MONITOR',
-                'action': 'Continue systematic market monitoring protocols. No immediate strategic actions required.'
-            }]
-        
-        action_html = ""
-        for action in actions[:3]:
-            action_html += f'''
-            <div class="action-item">
-                <div class="action-priority">{action['priority']}</div>
-                <div>{action['action']}</div>
-            </div>
-            '''
-        
-        return f'''
-        <div class="strategic-actions">
-            <div class="actions-title">
-                🎯 Strategic Action Framework
-            </div>
-            {action_html}
-        </div>
-        '''
-
-    def generate_enhanced_news_items(self, items: List[Tuple]) -> str:
-        """Generate enhanced news items with AI analysis"""
-        if not items:
-            return ""
-        
-        html = ""
-        
-        for i, item in enumerate(items):
-            title, link, description, score, summary, source = item[:6]
-            
-            # Determine priority styling
-            if score >= 9:
-                priority_class = "news-critical"
-                priority_label = "🚨 CRITICAL"
-            elif score >= 8:
-                priority_class = "news-high"
-                priority_label = "🔴 HIGH"
-            elif score >= 6:
-                priority_class = "news-medium"
-                priority_label = "🟡 MEDIUM"
-            else:
-                priority_class = "news-normal"
-                priority_label = "🟢 NORMAL"
-            
-            # Generate AI analysis
-            ai_analysis = self.generate_ai_analysis_snippet(title, description, score)
-            
-            # Clean summary
-            clean_summary = (summary or description)[:180] + "..." if (summary or description) else "Analysis pending..."
-            clean_summary = re.sub('<[^<]+?>', '', clean_summary)
-            
-            # Time ago calculation
-            time_processed = datetime.now().strftime('%H:%M')
-            
-            html += f'''
-            <div class="news-item {priority_class}">
-                <div class="news-header">
-                    <div class="news-title">
-                        <a href="{link}" target="_blank">{title}</a>
-                    </div>
-                    <div class="news-score">{score}/10</div>
-                </div>
-                
-                <div class="news-meta">
-                    <span>{priority_label}</span>
-                    <span>📰 {source}</span>
-                    <span>⏰ {time_processed}</span>
-                    <span>🔍 AI Analyzed</span>
-                </div>
-                
-                <div class="news-summary">
-                    {clean_summary}
-                </div>
-                
-                <div class="ai-analysis">
-                    <strong>🤖 AI Analysis:</strong> {ai_analysis}
-                </div>
-            </div>
-            '''
-        
-        return html
-
-    def generate_ai_analysis_snippet(self, title: str, description: str, score: int) -> str:
-        """Generate AI analysis snippet for each news item"""
-        title_lower = title.lower()
-        
-        # AI-style analysis based on content patterns
-        if score >= 9:
-            if 'interest rate' in title_lower or 'rba' in title_lower:
-                return "Critical monetary policy development with direct impact on commercial property valuations and investment strategies."
-            elif 'merger' in title_lower or 'acquisition' in title_lower:
-                return "Significant market consolidation event requiring competitive landscape reassessment and strategic positioning review."
-            else:
-                return "High-impact development requiring immediate executive attention and potential strategic response planning."
-        
-        elif score >= 8:
-            if 'property' in title_lower or 'real estate' in title_lower:
-                return "Relevant property sector development with moderate strategic implications for A-REIT positioning."
-            elif 'technology' in title_lower or 'ai' in title_lower:
-                return "Technology advancement with potential disruption implications for traditional real estate operations."
-            else:
-                return "Important market development warranting strategic monitoring and assessment protocols."
-        
-        elif score >= 6:
-            return "Moderate relevance to real estate sector. Suggests continued monitoring of market trends and dynamics."
-        
-        else:
-            return "General market intelligence. Provides context for broader economic and business environment."
-        """Calculate market sentiment from news items"""
-        if not items:
-            return "Neutral"
-        
-        positive_keywords = ['growth', 'increase', 'strong', 'boost', 'positive', 'up', 'gain', 'improvement', 'rising', 'surge']
-        negative_keywords = ['decline', 'fall', 'drop', 'weak', 'negative', 'down', 'loss', 'concern', 'risk', 'falling', 'crash']
-        
-        positive_score = 0
-        negative_score = 0
-        
-        for item in items:
-            title_desc = (item[0] + ' ' + item[2]).lower()
-            interest_score = item[3]
-            
-            # Weight by interest score
-            weight = interest_score / 10.0
-            
-            for keyword in positive_keywords:
-                positive_score += title_desc.count(keyword) * weight
-            
-            for keyword in negative_keywords:
-                negative_score += title_desc.count(keyword) * weight
-        
-        if positive_score > negative_score * 1.3:
-            return "Positive"
-        elif negative_score > positive_score * 1.3:
-            return "Negative"
-        else:
-            return "Neutral"
-
-    def generate_executive_summary_text(self, top_items: List[Tuple]) -> str:
-        """Generate executive summary from top items"""
-        if not top_items:
-            return "No significant developments in commercial property sector today."
-        
-        # Extract key themes
-        themes = []
-        for item in top_items[:3]:
-            title = item[0].lower()
-            if any(keyword in title for keyword in ['interest rate', 'rba', 'cash rate']):
-                themes.append("monetary policy developments")
-            elif any(keyword in title for keyword in ['property', 'real estate', 'reit']):
-                themes.append("property sector activity")
-            elif any(keyword in title for keyword in ['office', 'retail', 'industrial']):
-                themes.append("commercial property fundamentals")
-            elif any(keyword in title for keyword in ['technology', 'ai', 'digital']):
-                themes.append("technology disruption")
-        
-        unique_themes = list(set(themes))
-        
-        if unique_themes:
-            theme_text = ", ".join(unique_themes[:2])
-            return f"Key developments today focused on {theme_text}. {len(top_items)} high-priority items require executive attention."
-        else:
-            return f"{len(top_items)} priority items identified across commercial property and related sectors."
-
-    def generate_action_items_html(self, top_items: List[Tuple]) -> str:
-        """Generate action items section"""
-        if not top_items:
-            return ""
-        
-        actions = []
-        
-        for item in top_items[:3]:
-            title, link, description, score = item[0], item[1], item[2], item[3]
-            
-            if score >= 9:
-                actions.append(f"<strong>URGENT:</strong> Review implications of '{title[:60]}...'")
-            elif score >= 8:
-                actions.append(f"<strong>Monitor:</strong> Track developments in '{title[:60]}...'")
-            elif score >= 7:
-                actions.append(f"<strong>Consider:</strong> Assess impact of '{title[:60]}...'")
-        
-        if actions:
-            action_html = "<br>• ".join(actions)
-            return f'''
-            <div class="action-items">
-                <strong>🎯 Executive Action Items</strong><br>
-                • {action_html}
-            </div>
-            '''
-        
-        return ""
-
-    def generate_news_items_html(self, items: List[Tuple]) -> str:
-        """Generate news items HTML"""
-        html = ""
-        
-        for item in items:
-            title, link, description, score, summary, source = item[:6]
-            
-            # Determine priority class
-            if score >= 8:
-                priority_class = "priority-high"
-                priority_icon = "🔴"
-            elif score >= 6:
-                priority_class = "priority-medium"  
-                priority_icon = "🟡"
-            else:
-                priority_class = ""
-                priority_icon = "🟢"
-            
-            # Clean and truncate summary
-            clean_summary = (summary or description)[:200] + "..." if (summary or description) else "No summary available"
-            clean_summary = re.sub('<[^<]+?>', '', clean_summary)  # Remove HTML tags
-            
-            html += f'''
-            <div class="news-item {priority_class}">
-                <div class="news-title">
-                    <a href="{link}" target="_blank">{title}</a>
-                </div>
-                <div class="news-meta">
-                    {priority_icon} Score: {score}/10 • {source} • {datetime.now().strftime('%H:%M')}
-                </div>
-                <div class="news-summary">
-                    {clean_summary}
-                </div>
-            </div>
-            '''
-        
-        return html
-
-    def generate_social_media_html(self, items: List[Tuple]) -> str:
-        """Generate simple social media content"""
-        if len(items) < 2:
-            return ""
-        
-        top_item = items[0]
-        title = top_item[0]
-        
-        # Generate simple social posts
-        twitter_post = f"Key development in commercial property: {title[:180]}... What are your thoughts on the implications? #CommercialProperty #AREIT"
-        
-        linkedin_post = f"Interesting development in our sector:\n\n{title}\n\nThis highlights the importance of staying informed about market dynamics. How do you see this impacting commercial property strategies?\n\n#RealEstate #CommercialProperty #Leadership"
-        
-        return f'''
-        <div class="social-section">
-            <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📱 Ready-to-Share Content</h3>
-            
-            <div class="social-post">
-                <strong>🐦 Twitter:</strong><br>
-                {twitter_post}
-            </div>
-            
-            <div class="social-post">
-                <strong>💼 LinkedIn:</strong><br>
-                {linkedin_post[:300]}...
-            </div>
-        </div>
-        '''
-
-    def generate_additional_items_html(self, items: List[Tuple]) -> str:
-        """Generate additional items section"""
-        if not items:
-            return ""
-        
-        html = '''
-        <div style="margin-top: 20px;">
-            <h3 style="margin: 0 0 10px 0; color: #495057; font-size: 14px;">📋 Additional Items</h3>
-        '''
-        
-        for item in items:
-            title, link, score, source = item[0], item[1], item[3], item[5]
-            
-            html += f'''
-            <div style="border-bottom: 1px solid #e9ecef; padding: 8px 0; font-size: 12px;">
-                <a href="{link}" target="_blank" style="color: #495057; text-decoration: none; font-weight: 500;">{title}</a>
-                <span style="color: #6c757d; margin-left: 8px;">• {source} • {score}/10</span>
-            </div>
-            '''
-        
-        html += "</div>"
-        return html
-
-    def send_email(self, content: str):
-        """Send email with HTML content - enhanced with debugging"""
+    def send_email_markdown(self, content: str):
+        """Send email with markdown content as plain text"""
         try:
-            logging.info(f"Preparing to send email ({len(content)} characters)")
+            logging.info(f"Preparing to send markdown email ({len(content)} characters)")
             
             msg = MIMEMultipart('alternative')
             msg['Subject'] = f"Commercial Property Intelligence - {datetime.now().strftime('%B %d, %Y')}"
             msg['From'] = self.config['gmail_user']
             msg['To'] = self.config['recipient_email']
             
-            # Attach HTML content
-            html_part = MIMEText(content, 'html', 'utf-8')
-            msg.attach(html_part)
+            # Send as plain text (markdown formatting will work in most clients)
+            text_part = MIMEText(content, 'plain', 'utf-8')
+            msg.attach(text_part)
             
             # Send email
             with smtplib.SMTP('smtp.gmail.com', 587) as server:
@@ -1856,25 +1164,22 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
                 server.login(self.config['gmail_user'], self.config['gmail_password'])
                 server.send_message(msg)
             
-            logging.info("Email sent successfully")
+            logging.info("Markdown email sent successfully")
             
         except Exception as e:
-            logging.error(f"Failed to send email: {e}")
+            logging.error(f"Failed to send markdown email: {e}")
             raise
 
-    def send_daily_brief_enhanced(self, include_all: bool = False):
-        """Enhanced daily brief that won't get clipped"""
+    def send_daily_brief_enhanced_markdown(self, include_all: bool = False):
+        """Enhanced daily brief using markdown formatting"""
         try:
+            # Get more items (last 24 hours) to be more inclusive
             items = self.get_items_for_email(24)
             if items:
                 content = self.generate_daily_email_from_items_enhanced(items)
                 if content:
-                    # Check content size and warn if too large
-                    content_size = len(content.encode('utf-8'))
-                    if content_size > 100000:  # 100KB limit
-                        logging.warning(f"Email content size: {content_size/1024:.1f}KB - may be clipped")
-                    
-                    self.send_email(content)
+                    # Use markdown email sender
+                    self.send_email_markdown(content)
                     
                     # Mark items as sent
                     cutoff_time = datetime.now() - timedelta(hours=24)
@@ -1884,36 +1189,37 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
                     ''', (cutoff_time,))
                     self.conn.commit()
                     
-                    logging.info(f"Enhanced email sent successfully ({content_size/1024:.1f}KB)")
+                    logging.info(f"Enhanced markdown email sent successfully")
                 else:
                     logging.info("No content generated for enhanced email")
             else:
                 logging.info("No items found for enhanced email")
         except Exception as e:
-            logging.error(f"Enhanced email error: {e}")
+            logging.error(f"Enhanced markdown email error: {e}")
             raise
 
-    def send_daily_brief_incremental(self):
-        """Send email with enhanced logic for GitHub Actions and debugging"""
+    def send_daily_brief_incremental_markdown(self):
+        """Send markdown email with enhanced logic"""
         should_send, time_period = self.should_send_email_now()
         
         logging.info(f"Email decision: should_send={should_send}, time_period={time_period}")
         
         if should_send:
-            logging.info(f"Sending {time_period} email brief...")
+            logging.info(f"Sending {time_period} markdown email brief...")
             
             # Get items from last 24 hours for email
             items = self.get_items_for_email(24)
             
             if items:
-                logging.info(f"Generating email from {len(items)} items")
+                logging.info(f"Generating markdown email from {len(items)} items")
                 content = self.generate_daily_email_from_items_enhanced(items)
                 if content:
                     # Check content size and warn if too large
                     content_size = len(content.encode('utf-8'))
                     logging.info(f"Email content size: {content_size/1024:.1f}KB")
                     
-                    self.send_email(content)
+                    # Use markdown email sender
+                    self.send_email_markdown(content)
                     
                     # Mark items as sent
                     cutoff_time = datetime.now() - timedelta(hours=24)
@@ -1923,24 +1229,24 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
                     ''', (cutoff_time,))
                     self.conn.commit()
                     
-                    logging.info("Email sent successfully")
+                    logging.info("Markdown email sent successfully")
                 else:
                     logging.warning("No content generated for email - all items filtered out")
             else:
                 logging.warning("No items found for email")
         else:
-            logging.info(f"Skipping email send - {time_period} run (email only sent in morning)")
+            logging.info(f"Skipping email send - {time_period} run")
 
-    def run_scheduled_processing(self):
-        """Main method for scheduled processing with enhanced email logic"""
+    def run_scheduled_processing_markdown(self):
+        """Main method for scheduled processing with markdown email"""
         try:
             # Process feeds with optimized method
             result = self.process_feeds_optimized_recent()
             
             # Always try to send email for GitHub Actions, or based on schedule for local runs
             if os.getenv('GITHUB_ACTIONS') or self.should_send_email_now()[0]:
-                logging.info("Attempting to send email...")
-                self.send_daily_brief_incremental()
+                logging.info("Attempting to send markdown email...")
+                self.send_daily_brief_incremental_markdown()
             else:
                 logging.info("Skipping email send based on schedule")
             
@@ -1953,7 +1259,6 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
                 self.emergency_simple_process_fallback()
             except Exception as fallback_error:
                 logging.error(f"Emergency fallback also failed: {fallback_error}")
-
 
     def cleanup_old_items(self, days: int = 7):
         """Remove items older than specified days"""
@@ -1984,7 +1289,7 @@ Explain specifically HOW this impacts commercial property (office, retail, indus
 
 
 def main():
-    """Main function to run the RSS analyzer"""
+    """Main function to run the RSS analyzer with markdown email support"""
     try:
         analyzer = RSSAnalyzer()
         
@@ -1993,13 +1298,13 @@ def main():
             command = sys.argv[1].lower()
             
             if command in ['process', 'run', 'test']:
-                logging.info("Running single processing cycle for GitHub Actions...")
-                analyzer.run_scheduled_processing()
+                logging.info("Running single processing cycle with markdown email for GitHub Actions...")
+                analyzer.run_scheduled_processing_markdown()
                 logging.info("Processing completed successfully!")
                 
             elif command == 'email':
-                logging.info("Sending daily email...")
-                analyzer.send_daily_brief_enhanced()
+                logging.info("Sending daily markdown email...")
+                analyzer.send_daily_brief_enhanced_markdown()
                 logging.info("Email sent successfully!")
                 
             elif command == 'cleanup':
@@ -2010,23 +1315,23 @@ def main():
                 
             else:
                 print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
-                print("  process - Run RSS processing and send email")
-                print("  email   - Send daily email only")  
+                print("  process - Run RSS processing and send markdown email")
+                print("  email   - Send daily markdown email only")  
                 print("  cleanup - Remove old database entries (default: 7 days)")
                 sys.exit(1)
         else:
-            # Run continuous scheduled mode
-            logging.info("Starting continuous scheduled mode...")
+            # Run continuous scheduled mode with markdown emails
+            logging.info("Starting continuous scheduled mode with markdown emails...")
             
             # Schedule processing 3 times daily
-            schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing)  # Morning AEST
-            schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing)  # Midday AEST  
-            schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing)  # Evening AEST
+            schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing_markdown)  # Morning AEST
+            schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing_markdown)  # Midday AEST  
+            schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing_markdown)  # Evening AEST
             
-            logging.info("RSS Analyzer started - running scheduled processing...")
+            logging.info("RSS Analyzer started - running scheduled processing with markdown emails...")
             
             # Run immediately on startup
-            analyzer.run_scheduled_processing()
+            analyzer.run_scheduled_processing_markdown()
             
             # Keep running scheduled tasks
             while True:
