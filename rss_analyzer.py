@@ -904,7 +904,167 @@ See README.md for detailed setup instructions.
         
         return items
 
-    def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
+    def calculate_title_similarity(self, title1: str, title2: str) -> float:
+        """Calculate similarity between two titles using word overlap"""
+        # Normalize titles
+        words1 = set(title1.lower().split())
+        words2 = set(title2.lower().split())
+        
+        # Remove common stop words
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those'}
+        words1 = words1 - stop_words
+        words2 = words2 - stop_words
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        # Calculate Jaccard similarity (intersection / union)
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        similarity = len(intersection) / len(union) if union else 0.0
+        return similarity
+
+    def is_duplicate_content(self, item: Tuple, existing_items: List[Tuple], similarity_threshold: float = 0.7) -> bool:
+        """Check if item is a duplicate using smart fuzzy matching"""
+        title, link, description, score, summary, source = item[:6]
+        
+        for existing_item in existing_items:
+            existing_title, existing_link, existing_desc, existing_score, existing_summary, existing_source = existing_item[:6]
+            
+            # Skip if same source (already handled by exact title matching)
+            if source == existing_source:
+                continue
+            
+            # Check title similarity
+            title_similarity = self.calculate_title_similarity(title, existing_title)
+            
+            # Check if titles are very similar
+            if title_similarity >= similarity_threshold:
+                logging.debug(f"Fuzzy duplicate detected: '{title[:40]}...' similar to '{existing_title[:40]}...' (similarity: {title_similarity:.2f})")
+                return True
+            
+            # Check for exact substring matches (one title contains the other)
+            title_clean = title.lower().strip()
+            existing_title_clean = existing_title.lower().strip()
+            
+            if len(title_clean) > 20 and len(existing_title_clean) > 20:
+                if title_clean in existing_title_clean or existing_title_clean in title_clean:
+                    logging.debug(f"Substring duplicate detected: '{title[:40]}...' and '{existing_title[:40]}...'")
+                    return True
+        
+        return False
+
+    def deduplicate_items_smart(self, items: List[Tuple]) -> List[Tuple]:
+        """Smart deduplication using fuzzy matching and quality scoring"""
+        if not items:
+            return items
+        
+        logging.info(f"Starting smart deduplication for {len(items)} items...")
+        
+        # Sort by score (highest first) to prioritize higher quality items
+        sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
+        
+        deduplicated_items = []
+        
+        for item in sorted_items:
+            title, link, description, score, summary, source = item[:6]
+            
+            # Skip if it's a duplicate
+            if self.is_duplicate_content(item, deduplicated_items):
+                continue
+            
+            # Add to deduplicated list
+            deduplicated_items.append(item)
+        
+        removed_count = len(items) - len(deduplicated_items)
+        logging.info(f"Smart deduplication completed: {removed_count} duplicates removed, {len(deduplicated_items)} items remaining")
+        
+        return deduplicated_items
+
+    def generate_key_takeaways(self, top_items: List[Tuple]) -> List[str]:
+        """Generate key takeaways from top items for executive summary"""
+        if not top_items:
+            return ["No significant developments identified in current market analysis."]
+        
+        takeaways = []
+        
+        # Analyze themes from top items
+        themes = {
+            'monetary_policy': {'items': [], 'keywords': ['interest rate', 'rba', 'fed', 'cash rate', 'monetary', 'inflation']},
+            'property_market': {'items': [], 'keywords': ['property', 'real estate', 'reit', 'commercial', 'residential', 'office', 'retail']},
+            'economic_outlook': {'items': [], 'keywords': ['economy', 'gdp', 'growth', 'recession', 'outlook', 'forecast']},
+            'technology': {'items': [], 'keywords': ['technology', 'ai', 'digital', 'automation', 'proptech', 'innovation']},
+            'regulation': {'items': [], 'keywords': ['regulation', 'policy', 'government', 'law', 'compliance', 'planning']},
+            'market_activity': {'items': [], 'keywords': ['acquisition', 'merger', 'deal', 'transaction', 'investment', 'capital']}
+        }
+        
+        # Categorize top items by theme
+        for item in top_items[:10]:  # Look at top 10 items
+            title_desc = (item[0] + ' ' + (item[2] or '')).lower()
+            
+            for theme, data in themes.items():
+                if any(keyword in title_desc for keyword in data['keywords']):
+                    data['items'].append(item)
+                    break
+        
+        # Generate takeaways for each theme with items
+        for theme, data in themes.items():
+            if data['items']:
+                takeaway = self.generate_theme_takeaway(theme, data['items'])
+                if takeaway:
+                    takeaways.append(takeaway)
+        
+        # If no specific themes, generate generic takeaways
+        if not takeaways:
+            takeaways.append(f"Market analysis reveals {len(top_items)} developments requiring executive attention across commercial property sectors.")
+        
+        # Limit to 5 takeaways maximum
+        return takeaways[:5]
+
+    def generate_theme_takeaway(self, theme: str, items: List[Tuple]) -> str:
+        """Generate a specific takeaway for a theme"""
+        if not items:
+            return ""
+        
+        count = len(items)
+        highest_score = max(item[3] for item in items)
+        
+        # Theme-specific takeaway generation
+        if theme == 'monetary_policy':
+            if highest_score >= 8:
+                return f"🏦 Critical monetary policy developments ({count} items) - Direct impact on commercial property valuations and investment strategies expected."
+            else:
+                return f"🏦 Monetary policy updates ({count} items) - Monitor for commercial property financing and cap rate implications."
+        
+        elif theme == 'property_market':
+            if highest_score >= 8:
+                return f"🏢 Major commercial property market activity ({count} items) - Significant sector developments requiring immediate strategic review."
+            else:
+                return f"🏢 Commercial property market updates ({count} items) - Sector activity indicates stable fundamentals with growth opportunities."
+        
+        elif theme == 'economic_outlook':
+            if highest_score >= 8:
+                return f"📊 Critical economic developments ({count} items) - Broad market conditions may significantly impact property investment strategies."
+            else:
+                return f"📊 Economic context updates ({count} items) - Macroeconomic trends support continued commercial property investment confidence."
+        
+        elif theme == 'technology':
+            return f"💻 Technology sector developments ({count} items) - Digital transformation trends creating new opportunities in proptech and smart building investments."
+        
+        elif theme == 'regulation':
+            if highest_score >= 8:
+                return f"⚖️ Important regulatory changes ({count} items) - Policy developments require compliance review and strategic adjustment considerations."
+            else:
+                return f"⚖️ Regulatory updates ({count} items) - Policy environment remains supportive of commercial property development and investment."
+        
+        elif theme == 'market_activity':
+            if highest_score >= 8:
+                return f"🤝 Major transaction activity ({count} items) - Significant M&A and investment deals indicate strong market confidence and liquidity."
+            else:
+                return f"🤝 Market transaction updates ({count} items) - Steady deal flow demonstrates healthy commercial property investment appetite."
+        
+        return f"📈 Market development ({count} items) - Sector activity indicates continued commercial property market evolution."
         """Generate plain text formatted email that works across all email clients - with enhanced filtering"""
         logging.info(f"Starting email generation from {len(items)} items...")
         
@@ -1071,14 +1231,16 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
         total_items = len(sorted_items)
         critical_count = len(critical_items)
         high_count = len(high_items)
+        medium_count = len(medium_items)
         total_high_priority = critical_count + high_count
+        total_ai_eligible = critical_count + high_count + medium_count  # Now includes medium priority
         sentiment = self.calculate_simple_sentiment(sorted_items)
         
-        logging.info(f"Email stats: {total_items} total, {critical_count} critical, {high_count} high priority")
-        logging.info(f"Total high priority items (score ≥7): {total_high_priority}")
+        logging.info(f"Email stats: {total_items} total, {critical_count} critical, {high_count} high, {medium_count} medium priority")
+        logging.info(f"Total AI-eligible items (score ≥6): {total_ai_eligible}")
         
-        # GLOBAL AI LIMIT: Prioritize AI for ALL high-priority items first
-        global_ai_limit = 40  # Increased limit for better coverage
+        # GLOBAL AI LIMIT: Prioritize AI for high-priority items first, then medium priority
+        global_ai_limit = 50  # Increased limit to accommodate medium priority items
         self.global_ai_calls_used = 0
         
         # Build plain text email (no markdown)
@@ -1092,7 +1254,8 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
 Total Items Analyzed: {total_items}
 Critical Priority: {critical_count} 
 High Priority: {high_count}
-Total High Priority Items: {total_high_priority}
+Medium Priority: {medium_count}
+Total AI-Eligible Items: {total_ai_eligible}
 Market Sentiment: {sentiment}
 
 {self.generate_plain_text_executive_summary(sorted_items[:5], sentiment)}
@@ -1172,9 +1335,11 @@ Please check the logs for more details.
 
 Generated: {current_time} AEST
 Sources Analyzed: {len(set(item[5] for item in sorted_items)) if sorted_items else 0}
-AI Processing: OpenAI GPT-4o with Market Context Analysis
+AI Processing: OpenAI GPT-4o with Enhanced Market Context Analysis
 AI Calls Used: {getattr(self, 'global_ai_calls_used', 0)}/{global_ai_limit}
+AI Priority: Critical (≥8) > High (7) > Medium (6) > Others (≤5)
 Intelligence Threshold: Score ≥ 4/10
+Content Filters: AFR topic pages, image summaries, sensitive content
 
 💼 Connect with Matt Whiteoak
 LinkedIn: https://www.linkedin.com/in/mattwhiteoak
