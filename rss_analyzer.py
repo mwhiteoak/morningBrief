@@ -1338,8 +1338,8 @@ Sources Analyzed: {len(set(item[5] for item in sorted_items)) if sorted_items el
 AI Processing: OpenAI GPT-4o with Enhanced Market Context Analysis
 AI Calls Used: {getattr(self, 'global_ai_calls_used', 0)}/{global_ai_limit}
 AI Priority: Critical (≥8) > High (7) > Medium (6) > Others (≤5)
-Intelligence Threshold: Score ≥ 4/10
-Content Filters: AFR topic pages, image summaries, sensitive content
+Intelligence Features: Smart deduplication, key takeaways, enhanced executive summary
+Content Filters: AFR topic pages, image summaries, sensitive content, fuzzy duplicates
 
 💼 Connect with Matt Whiteoak
 LinkedIn: https://www.linkedin.com/in/mattwhiteoak
@@ -1722,12 +1722,23 @@ Focus on: investment implications, market dynamics, tenant demand, property valu
             raise
 
     def send_daily_brief_enhanced_plain_text(self, include_all: bool = False):
-        """Enhanced daily brief using plain text formatting"""
+        """Enhanced daily brief using plain text formatting - simple fallback version"""
         try:
             # Get more items (last 24 hours) to be more inclusive
             items = self.get_items_for_email(24)
             if items:
-                content = self.generate_daily_email_from_items_enhanced(items)
+                logging.info(f"Generating simple plain text email from {len(items)} items")
+                
+                # Use simple email generation if enhanced method fails
+                try:
+                    if hasattr(self, 'generate_daily_email_from_items_enhanced'):
+                        content = self.generate_daily_email_from_items_enhanced(items)
+                    else:
+                        content = self.generate_simple_email_from_items(items)
+                except Exception as e:
+                    logging.error(f"Enhanced email generation failed: {e}")
+                    content = self.generate_simple_email_from_items(items)
+                
                 if content:
                     # Use plain text email sender
                     self.send_email_plain_text(content)
@@ -1740,14 +1751,94 @@ Focus on: investment implications, market dynamics, tenant demand, property valu
                     ''', (cutoff_time,))
                     self.conn.commit()
                     
-                    logging.info(f"Enhanced plain text email sent successfully")
+                    logging.info(f"Plain text email sent successfully")
                 else:
-                    logging.info("No content generated for enhanced email")
+                    logging.info("No content generated for email")
             else:
-                logging.info("No items found for enhanced email")
+                logging.info("No items found for email")
         except Exception as e:
-            logging.error(f"Enhanced plain text email error: {e}")
+            logging.error(f"Plain text email error: {e}")
             raise
+
+    def generate_simple_email_from_items(self, items: List[Tuple]) -> str:
+        """Simple email generation that always works"""
+        current_date = datetime.now().strftime('%B %d, %Y')
+        current_time = datetime.now().strftime('%I:%M %p AEST')
+        
+        # Filter items simply
+        filtered_items = []
+        for item in items:
+            title, link, description, score, summary, source_name = item[:6]
+            
+            # Basic filtering
+            if score >= 4 and title and link:
+                # Skip sensitive content
+                combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
+                sensitive_keywords = ['manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed']
+                
+                if not any(keyword in combined_text for keyword in sensitive_keywords):
+                    filtered_items.append(item)
+        
+        # Sort by score
+        sorted_items = sorted(filtered_items, key=lambda x: x[3], reverse=True)
+        
+        # Limit to reasonable number
+        display_items = sorted_items[:30]
+        
+        email_content = f"""🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING
+{current_date} • {current_time}
+
+===============================================================================
+
+📊 EXECUTIVE SUMMARY
+
+Total Items Analyzed: {len(display_items)}
+Market Analysis: Automated processing of commercial property intelligence
+
+===============================================================================
+
+📋 PRIORITY ITEMS
+
+"""
+        
+        # Add items
+        for i, item in enumerate(display_items, 1):
+            title, link, description, score, summary, source = item[:6]
+            
+            clean_title = title.strip()
+            clean_desc = (description or summary or "")[:150].strip()
+            
+            if clean_desc:
+                clean_desc = clean_desc.replace('\n', ' ').replace('\r', ' ')
+                clean_desc = re.sub('<[^<]+?>', '', clean_desc)
+            
+            email_content += f"""{i}. {clean_title}
+SCORE: {score}/10 | SOURCE: {source}
+LINK: {link}
+
+"""
+            
+            if clean_desc:
+                email_content += f"SUMMARY: {clean_desc}...\n\n"
+            
+            email_content += "-------------------------------------------------------------------------------\n\n"
+        
+        # Add footer
+        email_content += f"""===============================================================================
+
+🤖 AI-POWERED INTELLIGENCE PLATFORM
+
+Generated: {current_time} AEST
+Items Processed: {len(display_items)}
+Processing Mode: Simple email generation
+
+💼 Connect with Matt Whiteoak
+LinkedIn: https://www.linkedin.com/in/mattwhiteoak
+
+===============================================================================
+"""
+        
+        return email_content
 
     def send_daily_brief_incremental_plain_text(self):
         """Send plain text email with enhanced logic"""
@@ -1797,7 +1888,13 @@ Focus on: investment implications, market dynamics, tenant demand, property valu
             # Always try to send email for GitHub Actions, or based on schedule for local runs
             if os.getenv('GITHUB_ACTIONS') or self.should_send_email_now()[0]:
                 logging.info("Attempting to send plain text email...")
-                self.send_daily_brief_incremental_plain_text()
+                
+                # Check if enhanced email method exists
+                if hasattr(self, 'generate_daily_email_from_items_enhanced'):
+                    self.send_daily_brief_incremental_plain_text()
+                else:
+                    logging.warning("Enhanced email method not found, using fallback")
+                    self.send_daily_brief_enhanced_plain_text()
             else:
                 logging.info("Skipping email send based on schedule")
             
