@@ -905,7 +905,7 @@ See README.md for detailed setup instructions.
         return items
 
     def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
-        """Generate plain text formatted email that works across all email clients - with timeout protection"""
+        """Generate plain text formatted email that works across all email clients - with enhanced filtering"""
         logging.info(f"Starting email generation from {len(items)} items...")
         
         if not items:
@@ -922,6 +922,11 @@ See README.md for detailed setup instructions.
             for item in items:
                 title, link, description, score, summary, source_name = item[:6]
                 
+                # Exclude specific AFR commercial real estate URL
+                if link == "https://www.afr.com/topic/commercial-real-estate-5vu":
+                    logging.debug(f"Skipping AFR commercial real estate topic page: {title[:50]}...")
+                    continue
+                
                 # Combine title and description for comprehensive filtering
                 combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
                 
@@ -930,6 +935,11 @@ See README.md for detailed setup instructions.
                     'not found', 'sign up to rss.app', 'error 404', 'access denied', 
                     'page not found', 'forbidden', 'unauthorized'
                 ]):
+                    continue
+                
+                # Skip items with image summaries
+                if (summary and summary.strip().startswith('<img src=')) or (description and description.strip().startswith('<img src=')):
+                    logging.debug(f"Skipping item with image summary: {title[:50]}...")
                     continue
                 
                 # Skip sensitive content not relevant for commercial property intelligence
@@ -955,7 +965,7 @@ See README.md for detailed setup instructions.
                 if score >= 4:
                     filtered_items.append(item)
             
-            logging.info(f"Filtered items for email: {len(filtered_items)} (much more inclusive, sensitive content excluded)")
+            logging.info(f"Filtered items for email: {len(filtered_items)} (enhanced filtering applied)")
             
             if not filtered_items:
                 logging.warning("No items remaining after filtering")
@@ -1176,7 +1186,7 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
         return email_content
 
     def generate_plain_text_news_section_with_global_limit(self, items: List[Tuple], global_limit: int) -> str:
-        """Generate news items with global AI limit tracking"""
+        """Generate news items with global AI limit tracking and custom medium priority analysis"""
         if not items:
             return "No items in this category."
         
@@ -1191,25 +1201,35 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
         for i, item in enumerate(items, 1):
             title, link, description, score, summary, source = item[:6]
             
-            # Clean up title and description
+            # Clean up title and description - exclude image summaries
             clean_title = title.strip()
             clean_desc = (description or summary or "")[:200].strip()
+            
+            # Skip items with image summaries
+            if clean_desc.startswith('<img src='):
+                clean_desc = ""
+            
             if clean_desc:
                 clean_desc = clean_desc.replace('\n', ' ').replace('\r', ' ')
                 # Remove HTML tags
                 clean_desc = re.sub('<[^<]+?>', '', clean_desc)
             
-            # Generate context with global AI limit
+            # Generate context with global AI limit and custom medium priority handling
             try:
-                # Use AI for high-priority items OR if we haven't hit global limit
+                # Use AI for high-priority items (score ≥ 7) OR medium priority items (score 6) if AI available
                 if score >= 7 and self.global_ai_calls_used < global_limit:
                     relevance = self.generate_ai_market_context(title, description, score)
                     self.global_ai_calls_used += 1
                     logging.debug(f"Used AI for item {i} (score {score}) - Global AI: {self.global_ai_calls_used}/{global_limit}")
+                elif score == 6 and self.global_ai_calls_used < global_limit:
+                    # Custom AI analysis for medium priority items
+                    relevance = self.generate_medium_priority_market_context(title, description, score)
+                    self.global_ai_calls_used += 1
+                    logging.debug(f"Used custom AI for medium priority item {i} (score {score}) - Global AI: {self.global_ai_calls_used}/{global_limit}")
                 else:
                     # Use fallback
                     relevance = self.generate_fallback_market_context(title, description, score)
-                    reason = "low score" if score < 7 else "global limit reached"
+                    reason = "low score" if score < 6 else "global limit reached"
                     logging.debug(f"Used fallback for item {i} (score {score}) - {reason}")
                     
             except Exception as e:
@@ -1232,6 +1252,65 @@ COMMERCIAL PROPERTY MARKET CONTEXT:
         
         logging.info(f"Completed section: {len(items)} items processed (Global AI used: {self.global_ai_calls_used}/{global_limit})")
         return text_content
+
+    def generate_medium_priority_market_context(self, title: str, description: str, score: int) -> str:
+        """Generate AI-powered market context specifically for medium priority items (score 6)"""
+        try:
+            # Create a specialized prompt for medium priority items
+            prompt = f"""As a commercial property market analyst, this news item has medium relevance (score 6/10). Provide a focused 1-2 sentence analysis of its potential commercial property implications.
+
+Title: {title}
+Description: {description[:250]}
+
+Consider: indirect market effects, broader economic context, supply chain impacts, regulatory implications, or technology trends that could influence commercial real estate. Be concise and identify the most relevant connection to property markets."""
+
+            response = openai.ChatCompletion.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,  # Shorter for medium priority
+                temperature=0.1,
+                timeout=8  # Shorter timeout for medium priority
+            )
+            
+            ai_context = response.choices[0].message.content.strip()
+            
+            # Clean up the response
+            ai_context = ai_context.replace('\n', ' ').replace('\r', ' ')
+            ai_context = re.sub(r'\s+', ' ', ai_context)  # Remove extra whitespace
+            
+            return f"MEDIUM PRIORITY ANALYSIS: {ai_context}"
+            
+        except Exception as e:
+            logging.warning(f"Medium priority AI analysis failed: {e}")
+            return self.generate_enhanced_fallback_for_medium_priority(title, description, score)
+
+    def generate_enhanced_fallback_for_medium_priority(self, title: str, description: str, score: int) -> str:
+        """Generate enhanced fallback analysis specifically for medium priority items"""
+        title_lower = title.lower()
+        desc_lower = (description or "").lower()
+        combined = title_lower + " " + desc_lower
+        
+        # More nuanced analysis for medium priority items
+        if any(keyword in combined for keyword in ['employment', 'jobs', 'workforce', 'hiring', 'unemployment']):
+            return "EMPLOYMENT CONTEXT: Labor market dynamics influence commercial property demand through tenant employment levels, office space requirements, and regional economic activity affecting property fundamentals."
+        elif any(keyword in combined for keyword in ['supply chain', 'logistics', 'shipping', 'transport', 'freight']):
+            return "SUPPLY CHAIN IMPACT: Transportation and logistics developments affect industrial property demand, distribution hub locations, and last-mile delivery requirements for commercial real estate portfolios."
+        elif any(keyword in combined for keyword in ['china', 'asia', 'trade', 'import', 'export', 'global']):
+            return "GLOBAL TRADE CONTEXT: International trade dynamics impact port-adjacent industrial properties, import/export facility demand, and multinational corporate real estate strategies in key markets."
+        elif any(keyword in combined for keyword in ['energy', 'oil', 'gas', 'renewable', 'electricity', 'power']):
+            return "ENERGY SECTOR INFLUENCE: Energy market developments affect commercial property operating costs, sustainability requirements, and tenant attraction in energy-efficient buildings."
+        elif any(keyword in combined for keyword in ['consumer', 'spending', 'retail sales', 'shopping', 'consumption']):
+            return "CONSUMER BEHAVIOR: Consumer spending patterns influence retail property performance, tenant viability, and demand for experiential retail spaces versus traditional formats."
+        elif any(keyword in combined for keyword in ['healthcare', 'medical', 'hospital', 'pharmaceutical', 'health']):
+            return "HEALTHCARE SECTOR: Medical sector developments create specialized property demand including medical offices, research facilities, and healthcare-adjacent commercial spaces."
+        elif any(keyword in combined for keyword in ['education', 'university', 'school', 'student', 'campus']):
+            return "EDUCATION IMPACT: Educational sector changes affect student housing demand, campus-adjacent commercial properties, and research facility requirements in university markets."
+        elif any(keyword in combined for keyword in ['government', 'public sector', 'policy', 'regulation', 'compliance']):
+            return "REGULATORY ENVIRONMENT: Government policy changes may affect commercial property regulations, tax implications, development approvals, and public sector tenancy requirements."
+        elif any(keyword in combined for keyword in ['mining', 'resources', 'commodity', 'materials', 'extraction']):
+            return "RESOURCES SECTOR: Commodity market developments influence regional commercial property demand in resource-dependent markets and industrial facility requirements."
+        else:
+            return "MARKET CONTEXT: This development provides broader economic context that may indirectly influence commercial property market conditions and investment considerations."
 
     def generate_plain_text_executive_summary(self, top_items: List[Tuple], sentiment: str) -> str:
         """Generate executive summary in plain text format"""
