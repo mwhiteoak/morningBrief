@@ -2,7 +2,7 @@
 """
 RSS Feed Analyzer for A-REIT CEO/COO - Executive Intelligence Platform
 Monitors RSS feeds, evaluates content with OpenAI, and sends daily emails
-OPTIMIZED VERSION - 3x Daily Incremental Processing with Markdown Email
+OPTIMIZED VERSION - 3x Daily Incremental Processing with Plain Text Email
 """
 
 import feedparser
@@ -560,10 +560,26 @@ See README.md for detailed setup instructions.
         return False
 
     def auto_score_item_quick(self, item):
-        """Quick auto-scoring without AI"""
+        """Quick auto-scoring without AI - with sensitive content filtering"""
         title_lower = item.title.lower()
         desc_lower = item.description.lower()
         combined = title_lower + " " + desc_lower
+        
+        # Check for sensitive content first and score very low
+        sensitive_keywords = [
+            'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
+            'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
+            'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
+            'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
+            'plane crash', 'drowning', 'fire death', 'explosion death'
+        ]
+        
+        if any(keyword in combined for keyword in sensitive_keywords):
+            item.interest_score = 1  # Very low score for sensitive content
+            item.category = 'Filtered Content'
+            item.sentiment = 'Neutral'
+            item.ai_summary = f"Filtered: {item.title}"
+            return
         
         # Critical market-moving keywords
         if any(keyword in title_lower for keyword in [
@@ -625,15 +641,37 @@ See README.md for detailed setup instructions.
         item.ai_summary = f"Business news: {item.title}"
 
     def process_ai_batch_quick(self, items: List[FeedItem]) -> int:
-        """Quick AI batch processing with larger batches"""
+        """Quick AI batch processing with larger batches - with sensitive content filtering"""
         if not items:
             return 0
+        
+        # Pre-filter for sensitive content
+        filtered_items = []
+        sensitive_keywords = [
+            'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
+            'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
+            'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
+            'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
+            'plane crash', 'drowning', 'fire death', 'explosion death'
+        ]
+        
+        for item in items:
+            combined_text = (item.title + ' ' + item.description).lower()
+            if any(keyword in combined_text for keyword in sensitive_keywords):
+                # Score sensitive content very low without AI analysis
+                item.interest_score = 1
+                item.category = 'Filtered Content'
+                item.sentiment = 'Neutral'
+                item.ai_summary = f"Filtered: {item.title}"
+                logging.debug(f"Filtered sensitive content from AI batch: {item.title[:50]}...")
+            else:
+                filtered_items.append(item)
         
         batch_size = 15  # Larger batches for efficiency
         processed_count = 0
         
-        for i in range(0, len(items), batch_size):
-            batch = items[i:i + batch_size]
+        for i in range(0, len(filtered_items), batch_size):
+            batch = filtered_items[i:i + batch_size]
             
             # Create very concise prompt for speed
             prompt = f"Score these {len(batch)} news items for A-REIT CEO (1-10). Format: Item X: Score=Y\n\n"
@@ -681,6 +719,9 @@ See README.md for detailed setup instructions.
                 for item in batch:
                     self.auto_score_item_quick(item)
                     processed_count += 1
+        
+        # Include the filtered sensitive items in the total count
+        processed_count += len(items) - len(filtered_items)
         
         return processed_count
 
@@ -849,7 +890,7 @@ See README.md for detailed setup instructions.
         return items
 
     def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
-        """Generate markdown-formatted email that works across all email clients - MUCH MORE INCLUSIVE"""
+        """Generate plain text formatted email that works across all email clients"""
         logging.info(f"Generating email from {len(items)} items")
         
         if not items:
@@ -857,18 +898,33 @@ See README.md for detailed setup instructions.
             return None
         
         # MUCH MORE INCLUSIVE FILTERING - include everything potentially relevant
-        # Instead of aggressive filtering, just remove obvious errors and duplicates
         filtered_items = []
         seen_titles = set()
         
         for item in items:
             title, link, description, score, summary, source_name = item[:6]
             
-            # Only skip obvious errors - be very permissive
+            # Combine title and description for comprehensive filtering
+            combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
+            
+            # Skip obvious errors - be very permissive
             if any(phrase in title.lower() for phrase in [
                 'not found', 'sign up to rss.app', 'error 404', 'access denied', 
                 'page not found', 'forbidden', 'unauthorized'
             ]):
+                continue
+            
+            # Skip sensitive content not relevant for commercial property intelligence
+            sensitive_keywords = [
+                'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
+                'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
+                'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
+                'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
+                'plane crash', 'drowning', 'fire death', 'explosion death'
+            ]
+            
+            if any(keyword in combined_text for keyword in sensitive_keywords):
+                logging.debug(f"Skipping sensitive content: {title[:50]}...")
                 continue
             
             # Skip exact duplicates only
@@ -881,16 +937,16 @@ See README.md for detailed setup instructions.
             if score >= 4:
                 filtered_items.append(item)
         
-        logging.info(f"Filtered items for email: {len(filtered_items)} (much more inclusive)")
+        logging.info(f"Filtered items for email: {len(filtered_items)} (much more inclusive, sensitive content excluded)")
         
         if not filtered_items:
             logging.warning("No items remaining after filtering")
             return None
         
-        return self.build_markdown_email(filtered_items)
+        return self.build_plain_text_email(filtered_items)
 
-    def build_markdown_email(self, items: List[Tuple]) -> str:
-        """Build clean markdown email that works across ALL email clients"""
+    def build_plain_text_email(self, items: List[Tuple]) -> str:
+        """Build clean plain text email that works across ALL email clients"""
         
         current_date = datetime.now().strftime('%B %d, %Y')
         current_time = datetime.now().strftime('%I:%M %p AEST')
@@ -911,91 +967,91 @@ See README.md for detailed setup instructions.
         high_count = len(high_items)
         sentiment = self.calculate_simple_sentiment(sorted_items)
         
-        # Build markdown email
-        email_content = f"""**🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING**
-**{current_date} • {current_time}**
+        # Build plain text email (no markdown)
+        email_content = f"""🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING
+{current_date} • {current_time}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
-**📊 EXECUTIVE SUMMARY**
+📊 EXECUTIVE SUMMARY
 
-Total Items Analyzed: **{total_items}**
-Critical Priority: **{critical_count}** 
-High Priority: **{high_count}**
-Market Sentiment: **{sentiment}**
+Total Items Analyzed: {total_items}
+Critical Priority: {critical_count} 
+High Priority: {high_count}
+Market Sentiment: {sentiment}
 
-{self.generate_markdown_executive_summary(sorted_items[:5], sentiment)}
+{self.generate_plain_text_executive_summary(sorted_items[:5], sentiment)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
 """
 
         # Add each priority section
         if critical_items:
-            email_content += f"""**🚨 CRITICAL PRIORITY ITEMS ({len(critical_items)})**
+            email_content += f"""🚨 CRITICAL PRIORITY ITEMS ({len(critical_items)})
 
-{self.generate_markdown_news_section(critical_items)}
+{self.generate_plain_text_news_section(critical_items)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
 """
 
         if high_items:
-            email_content += f"""**🔴 HIGH PRIORITY ITEMS ({len(high_items)})**
+            email_content += f"""🔴 HIGH PRIORITY ITEMS ({len(high_items)})
 
-{self.generate_markdown_news_section(high_items)}
+{self.generate_plain_text_news_section(high_items)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
 """
 
         if medium_items:
-            email_content += f"""**🟡 MEDIUM PRIORITY ITEMS ({len(medium_items)})**
+            email_content += f"""🟡 MEDIUM PRIORITY ITEMS ({len(medium_items)})
 
-{self.generate_markdown_news_section(medium_items)}
+{self.generate_plain_text_news_section(medium_items)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
 """
 
         if normal_items:
-            email_content += f"""**🟢 NORMAL PRIORITY ITEMS ({len(normal_items)})**
+            email_content += f"""🟢 NORMAL PRIORITY ITEMS ({len(normal_items)})
 
-{self.generate_markdown_news_section(normal_items)}
+{self.generate_plain_text_news_section(normal_items)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
 """
 
         if other_items:
-            email_content += f"""**📋 OTHER RELEVANT ITEMS ({len(other_items)})**
+            email_content += f"""📋 OTHER RELEVANT ITEMS ({len(other_items)})
 
-{self.generate_markdown_news_section(other_items)}
+{self.generate_plain_text_news_section(other_items)}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 
 """
 
         # Add footer
-        email_content += f"""**🤖 AI-POWERED INTELLIGENCE PLATFORM**
+        email_content += f"""🤖 AI-POWERED INTELLIGENCE PLATFORM
 
 Generated: {current_time} AEST
 Sources Analyzed: {len(set(item[5] for item in sorted_items))}
-AI Processing: OpenAI GPT-4o
+AI Processing: OpenAI GPT-4o with Market Context Analysis
 Intelligence Threshold: Score ≥ 4/10
 
-**💼 Connect with Matt Whiteoak**
+💼 Connect with Matt Whiteoak
 LinkedIn: https://www.linkedin.com/in/mattwhiteoak
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+===============================================================================
 """
         
         return email_content
 
-    def generate_markdown_executive_summary(self, top_items: List[Tuple], sentiment: str) -> str:
-        """Generate executive summary in markdown format"""
+    def generate_plain_text_executive_summary(self, top_items: List[Tuple], sentiment: str) -> str:
+        """Generate executive summary in plain text format"""
         if not top_items:
-            return "**No significant developments requiring immediate attention.** Market monitoring continues across all commercial property sectors."
+            return "No significant developments requiring immediate attention. Market monitoring continues across all commercial property sectors."
         
         summary_parts = []
         
@@ -1037,27 +1093,27 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
             }
             
             primary_theme = theme_names.get(dominant_themes[0][0], 'market developments')
-            summary_parts.append(f"**Primary Focus:** {primary_theme.title()}")
+            summary_parts.append(f"PRIMARY FOCUS: {primary_theme.upper()}")
             
             if dominant_themes[1][1] > 0:
                 secondary_theme = theme_names.get(dominant_themes[1][0], 'market activity')
-                summary_parts.append(f"**Secondary Focus:** {secondary_theme.title()}")
+                summary_parts.append(f"SECONDARY FOCUS: {secondary_theme.upper()}")
         
-        summary_parts.append(f"**Market Sentiment:** {sentiment}")
+        summary_parts.append(f"MARKET SENTIMENT: {sentiment.upper()}")
         
         # Add action context
         critical_count = len([item for item in top_items if item[3] >= 8])
         if critical_count > 0:
-            summary_parts.append(f"**⚠️ {critical_count} critical items require immediate executive attention**")
+            summary_parts.append(f"⚠️ {critical_count} CRITICAL ITEMS REQUIRE IMMEDIATE EXECUTIVE ATTENTION")
         
         return "\n".join(summary_parts)
 
-    def generate_markdown_news_section(self, items: List[Tuple]) -> str:
-        """Generate news items in clean markdown format"""
+    def generate_plain_text_news_section(self, items: List[Tuple]) -> str:
+        """Generate news items in clean plain text format"""
         if not items:
-            return "_No items in this category._"
+            return "No items in this category."
         
-        markdown_content = ""
+        text_content = ""
         
         for i, item in enumerate(items, 1):
             title, link, description, score, summary, source = item[:6]
@@ -1070,48 +1126,78 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
                 # Remove HTML tags
                 clean_desc = re.sub('<[^<]+?>', '', clean_desc)
             
-            # Generate commercial property relevance
-            relevance = self.generate_commercial_property_relevance_markdown(title, description, score)
+            # Generate AI-powered commercial property relevance
+            relevance = self.generate_ai_market_context(title, description, score)
             
-            markdown_content += f"""**{i}. {clean_title}**
-**Score:** {score}/10 | **Source:** {source}
-**Link:** {link}
+            text_content += f"""{i}. {clean_title}
+SCORE: {score}/10 | SOURCE: {source}
+LINK: {link}
 
-**Commercial Property Impact:**
+COMMERCIAL PROPERTY MARKET CONTEXT:
 {relevance}
 
 """
             
             if clean_desc:
-                markdown_content += f"**Summary:** {clean_desc}...\n\n"
+                text_content += f"SUMMARY: {clean_desc}...\n\n"
             
-            markdown_content += "─────────────────────────────────────────────────────────────────────────────────────────────\n\n"
+            text_content += "-------------------------------------------------------------------------------\n\n"
         
-        return markdown_content
+        return text_content
 
-    def generate_commercial_property_relevance_markdown(self, title: str, description: str, score: int) -> str:
-        """Generate markdown-formatted commercial property relevance"""
-        title_lower = title.lower()
-        desc_lower = (description or "").lower()
-        combined = title_lower + " " + desc_lower
-        
-        # Quick relevance analysis
-        if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation']):
-            return "**MONETARY POLICY IMPACT:** Direct influence on commercial property valuations, cap rates, and debt servicing costs across all asset classes."
-        elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd']):
-            return "**WORKPLACE TRENDS:** Affects office demand, occupancy rates, and rental growth prospects in both CBD and suburban markets."
-        elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce']):
-            return "**RETAIL SECTOR:** Influences retail property demand, tenant mix strategies, and asset repositioning requirements."
-        elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain']):
-            return "**INDUSTRIAL/LOGISTICS:** Impacts industrial property demand, logistics hub valuations, and last-mile delivery infrastructure."
-        elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning']):
-            return "**DEVELOPMENT IMPACT:** Affects project feasibility, delivery timelines, development margins, and planning approvals."
-        elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech']):
-            return "**TECHNOLOGY DISRUPTION:** Influences property operations efficiency, tenant requirements, and smart building investment priorities."
-        elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance', 'reit']):
-            return "**CAPITAL MARKETS:** Affects property acquisition financing, portfolio strategies, and investment return expectations."
-        else:
-            return "**MARKET CONTEXT:** Provides important economic context for commercial property strategic decision-making and risk assessment."
+    def generate_ai_market_context(self, title: str, description: str, score: int) -> str:
+        """Generate AI-powered market context using OpenAI"""
+        try:
+            # Create a concise prompt for OpenAI
+            prompt = f"""As a commercial property market analyst, provide a 2-3 sentence analysis of how this news impacts commercial property markets (office, retail, industrial, logistics). Be specific and actionable for A-REIT executives.
+
+Title: {title}
+Description: {description[:300]}
+
+Focus on: investment implications, market dynamics, tenant demand, property valuations, or operational impacts. Be concise and professional."""
+
+            response = openai.ChatCompletion.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.1
+            )
+            
+            ai_context = response.choices[0].message.content.strip()
+            
+            # Clean up the response
+            ai_context = ai_context.replace('\n', ' ').replace('\r', ' ')
+            ai_context = re.sub(r'\s+', ' ', ai_context)  # Remove extra whitespace
+            
+            return ai_context
+            
+        except Exception as e:
+            logging.warning(f"AI market context generation failed: {e}")
+            
+            # Fallback to rule-based analysis
+            title_lower = title.lower()
+            desc_lower = (description or "").lower()
+            combined = title_lower + " " + desc_lower
+            
+            # Enhanced fallback analysis
+            if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation', 'cash rate']):
+                return "MONETARY POLICY IMPACT: Interest rate changes directly affect commercial property valuations through cap rate movements and debt servicing costs. Higher rates typically compress property values while lower rates support asset prices and investment activity."
+            elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd', 'co-working']):
+                return "WORKPLACE EVOLUTION: Changing work patterns influence office space demand, lease structures, and CBD vs suburban preferences. Flexible work arrangements may reduce space requirements but increase demand for premium, technology-enabled buildings."
+            elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce', 'mall', 'high street']):
+                return "RETAIL TRANSFORMATION: Consumer behavior shifts impact retail property demand, requiring asset repositioning strategies. E-commerce growth affects traditional retail formats while creating opportunities in logistics and last-mile delivery hubs."
+            elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain', 'distribution']):
+                return "INDUSTRIAL DEMAND: Supply chain developments drive industrial property requirements, particularly in logistics hubs and distribution centers. Automation trends may reduce labor needs but increase demand for specialized, technology-integrated facilities."
+            elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning', 'building approvals']):
+                return "DEVELOPMENT FUNDAMENTALS: Construction activity and planning policies affect supply pipelines, development feasibility, and project timelines. Regulatory changes can significantly impact development margins and market dynamics."
+            elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech', 'smart building']):
+                return "TECHNOLOGY INTEGRATION: Digital transformation affects property operations, tenant expectations, and investment requirements. Smart building technologies can improve operational efficiency and tenant satisfaction while requiring significant capital investment."
+            elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance', 'reit', 'portfolio']):
+                return "CAPITAL MARKET DYNAMICS: Investment flows and financing conditions directly impact property acquisition strategies, portfolio optimization, and return expectations. Capital availability affects market liquidity and pricing dynamics."
+            elif any(keyword in combined for keyword in ['economy', 'gdp', 'employment', 'inflation', 'recession', 'growth']):
+                return "ECONOMIC FUNDAMENTALS: Broader economic conditions influence tenant demand, rental growth, and property market performance. Economic strength supports occupancy rates and rent growth while downturns may pressure fundamentals."
+            else:
+                return "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making, potentially affecting market sentiment, investment flows, or operational considerations for property portfolios."
 
     def calculate_simple_sentiment(self, items: List[Tuple]) -> str:
         """Calculate market sentiment from news items"""
@@ -1144,17 +1230,17 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
         else:
             return "Neutral"
 
-    def send_email_markdown(self, content: str):
-        """Send email with markdown content as plain text"""
+    def send_email_plain_text(self, content: str):
+        """Send email with plain text content (no markdown)"""
         try:
-            logging.info(f"Preparing to send markdown email ({len(content)} characters)")
+            logging.info(f"Preparing to send plain text email ({len(content)} characters)")
             
             msg = MIMEMultipart('alternative')
             msg['Subject'] = f"Commercial Property Intelligence - {datetime.now().strftime('%B %d, %Y')}"
             msg['From'] = self.config['gmail_user']
             msg['To'] = self.config['recipient_email']
             
-            # Send as plain text (markdown formatting will work in most clients)
+            # Send as plain text with proper formatting
             text_part = MIMEText(content, 'plain', 'utf-8')
             msg.attach(text_part)
             
@@ -1164,22 +1250,22 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
                 server.login(self.config['gmail_user'], self.config['gmail_password'])
                 server.send_message(msg)
             
-            logging.info("Markdown email sent successfully")
+            logging.info("Plain text email sent successfully")
             
         except Exception as e:
-            logging.error(f"Failed to send markdown email: {e}")
+            logging.error(f"Failed to send plain text email: {e}")
             raise
 
-    def send_daily_brief_enhanced_markdown(self, include_all: bool = False):
-        """Enhanced daily brief using markdown formatting"""
+    def send_daily_brief_enhanced_plain_text(self, include_all: bool = False):
+        """Enhanced daily brief using plain text formatting"""
         try:
             # Get more items (last 24 hours) to be more inclusive
             items = self.get_items_for_email(24)
             if items:
                 content = self.generate_daily_email_from_items_enhanced(items)
                 if content:
-                    # Use markdown email sender
-                    self.send_email_markdown(content)
+                    # Use plain text email sender
+                    self.send_email_plain_text(content)
                     
                     # Mark items as sent
                     cutoff_time = datetime.now() - timedelta(hours=24)
@@ -1189,37 +1275,37 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
                     ''', (cutoff_time,))
                     self.conn.commit()
                     
-                    logging.info(f"Enhanced markdown email sent successfully")
+                    logging.info(f"Enhanced plain text email sent successfully")
                 else:
                     logging.info("No content generated for enhanced email")
             else:
                 logging.info("No items found for enhanced email")
         except Exception as e:
-            logging.error(f"Enhanced markdown email error: {e}")
+            logging.error(f"Enhanced plain text email error: {e}")
             raise
 
-    def send_daily_brief_incremental_markdown(self):
-        """Send markdown email with enhanced logic"""
+    def send_daily_brief_incremental_plain_text(self):
+        """Send plain text email with enhanced logic"""
         should_send, time_period = self.should_send_email_now()
         
         logging.info(f"Email decision: should_send={should_send}, time_period={time_period}")
         
         if should_send:
-            logging.info(f"Sending {time_period} markdown email brief...")
+            logging.info(f"Sending {time_period} plain text email brief...")
             
             # Get items from last 24 hours for email
             items = self.get_items_for_email(24)
             
             if items:
-                logging.info(f"Generating markdown email from {len(items)} items")
+                logging.info(f"Generating plain text email from {len(items)} items")
                 content = self.generate_daily_email_from_items_enhanced(items)
                 if content:
                     # Check content size and warn if too large
                     content_size = len(content.encode('utf-8'))
                     logging.info(f"Email content size: {content_size/1024:.1f}KB")
                     
-                    # Use markdown email sender
-                    self.send_email_markdown(content)
+                    # Use plain text email sender
+                    self.send_email_plain_text(content)
                     
                     # Mark items as sent
                     cutoff_time = datetime.now() - timedelta(hours=24)
@@ -1229,7 +1315,7 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
                     ''', (cutoff_time,))
                     self.conn.commit()
                     
-                    logging.info("Markdown email sent successfully")
+                    logging.info("Plain text email sent successfully")
                 else:
                     logging.warning("No content generated for email - all items filtered out")
             else:
@@ -1237,16 +1323,16 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
         else:
             logging.info(f"Skipping email send - {time_period} run")
 
-    def run_scheduled_processing_markdown(self):
-        """Main method for scheduled processing with markdown email"""
+    def run_scheduled_processing_plain_text(self):
+        """Main method for scheduled processing with plain text email"""
         try:
             # Process feeds with optimized method
             result = self.process_feeds_optimized_recent()
             
             # Always try to send email for GitHub Actions, or based on schedule for local runs
             if os.getenv('GITHUB_ACTIONS') or self.should_send_email_now()[0]:
-                logging.info("Attempting to send markdown email...")
-                self.send_daily_brief_incremental_markdown()
+                logging.info("Attempting to send plain text email...")
+                self.send_daily_brief_incremental_plain_text()
             else:
                 logging.info("Skipping email send based on schedule")
             
@@ -1289,7 +1375,7 @@ LinkedIn: https://www.linkedin.com/in/mattwhiteoak
 
 
 def main():
-    """Main function to run the RSS analyzer with markdown email support"""
+    """Main function to run the RSS analyzer with plain text email support"""
     try:
         analyzer = RSSAnalyzer()
         
@@ -1298,13 +1384,13 @@ def main():
             command = sys.argv[1].lower()
             
             if command in ['process', 'run', 'test']:
-                logging.info("Running single processing cycle with markdown email for GitHub Actions...")
-                analyzer.run_scheduled_processing_markdown()
+                logging.info("Running single processing cycle with plain text email for GitHub Actions...")
+                analyzer.run_scheduled_processing_plain_text()
                 logging.info("Processing completed successfully!")
                 
             elif command == 'email':
-                logging.info("Sending daily markdown email...")
-                analyzer.send_daily_brief_enhanced_markdown()
+                logging.info("Sending daily plain text email...")
+                analyzer.send_daily_brief_enhanced_plain_text()
                 logging.info("Email sent successfully!")
                 
             elif command == 'cleanup':
@@ -1315,23 +1401,23 @@ def main():
                 
             else:
                 print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
-                print("  process - Run RSS processing and send markdown email")
-                print("  email   - Send daily markdown email only")  
+                print("  process - Run RSS processing and send plain text email")
+                print("  email   - Send daily plain text email only")  
                 print("  cleanup - Remove old database entries (default: 7 days)")
                 sys.exit(1)
         else:
-            # Run continuous scheduled mode with markdown emails
-            logging.info("Starting continuous scheduled mode with markdown emails...")
+            # Run continuous scheduled mode with plain text emails
+            logging.info("Starting continuous scheduled mode with plain text emails...")
             
             # Schedule processing 3 times daily
-            schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing_markdown)  # Morning AEST
-            schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing_markdown)  # Midday AEST  
-            schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing_markdown)  # Evening AEST
+            schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing_plain_text)  # Morning AEST
+            schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing_plain_text)  # Midday AEST  
+            schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing_plain_text)  # Evening AEST
             
-            logging.info("RSS Analyzer started - running scheduled processing with markdown emails...")
+            logging.info("RSS Analyzer started - running scheduled processing with plain text emails...")
             
             # Run immediately on startup
-            analyzer.run_scheduled_processing_markdown()
+            analyzer.run_scheduled_processing_plain_text()
             
             # Keep running scheduled tasks
             while True:
