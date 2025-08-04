@@ -23,6 +23,7 @@ RSS_FEEDS = [
 
     # Property & Real Estate
     {'name': 'AFR - Commercial Property', 'url': 'https://rss.app/feeds/WnSkXwGk8h6HfKFJ.xml'},
+    {'name': 'RE Source', 'url': 'https://rss.app/feeds/KH9Mv5rKiUIrt6C7.xml'},
     {'name': 'Australian Financial Review Property', 'url': 'https://rss.app/feeds/abc123def456.xml'},
     {'name': 'Domain Business', 'url': 'https://rss.app/feeds/xyz789uvw012.xml'},
     {'name': 'Commercial Real Estate News', 'url': 'https://rss.app/feeds/mno345pqr678.xml'},
