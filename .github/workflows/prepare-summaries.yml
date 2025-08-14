@@ -1,8 +1,13 @@
 name: Prepare Summaries (05:30 AEST)
+
 on:
   schedule:
     - cron: '30 19 * * *'   # 05:30 AEST daily (Brisbane = UTC+10)
   workflow_dispatch: {}
+
+permissions:
+  contents: write
+
 concurrency:
   group: prepare-summaries
   cancel-in-progress: true
@@ -10,11 +15,28 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: Australia/Brisbane
+      PYTHONUNBUFFERED: "1"
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show analyzer version/hash
+        run: |
+          echo "HEAD of rss_analyzer.py (first 35 lines):"
+          sed -n '1,35p' rss_analyzer.py || echo "rss_analyzer.py missing"
+          echo ""
+          echo "sha256 of rss_analyzer.py:"
+          (sha256sum rss_analyzer.py || shasum -a 256 rss_analyzer.py) 2>/dev/null || true
+
+      - name: Setup Python 3.11 (with pip cache)
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
         run: |
@@ -25,22 +47,26 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NEWSLETTER_NAME: "Morning Briefing"
-          OAI_RPM: "25"             # increase if your account allows (e.g., 60)
+          OAI_RPM: "25"            # raise if your account allows (e.g., 60)
           OAI_MAX_RETRIES: "4"
-          MAX_WORKERS: "8"          # faster feed fetch
-          FEED_TIMEOUT: "15"        # each feed request timeout (s)
-          MIN_SCORE_FOR_AI: "5"     # skip AI on low-relevance noise
+          MAX_WORKERS: "8"         # parallel feed fetch
+          FEED_TIMEOUT: "15"       # per-feed seconds
+          MIN_SCORE_FOR_AI: "5"    # skip AI on low-signal items
           LOG_LEVEL: "INFO"
         run: |
           python rss_analyzer.py
 
-      - name: Show log tail
+      - name: Show SUMMARY + last log lines
         if: always()
         run: |
-          echo "==== rss_analyzer.log (last 200 lines) ===="
+          echo "=== SUMMARY ==="
+          grep -F "SUMMARY:" rss_analyzer.log || echo "No SUMMARY line found."
+          echo ""
+          echo "=== Tail (last 200 lines) ==="
           tail -n 200 rss_analyzer.log || true
 
-      - name: Persist DB & log
+      - name: Persist DB & logs
+        if: always()
         run: |
           git config user.name "rss-bot"
           git config user.email "rss-bot@example.com"
@@ -48,7 +74,7 @@ jobs:
           git commit -m "Cache AI packages + logs" || echo "Nothing to commit"
           git push || true
 
-      - name: Upload artifacts (debug)
+      - name: Upload artifacts (db + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
