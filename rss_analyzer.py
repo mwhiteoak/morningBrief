@@ -7,12 +7,15 @@ Morning Briefing — AU CRE Intelligence (Beehiiv-ready)
 - Stores everything in sqlite: rss_items.db
 """
 
-import feedparser, sqlite3, openai, os, re, json, time, socket, logging, concurrent.futures
+import feedparser, sqlite3, os, re, json, time, socket, logging, concurrent.futures
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
+
+# ---- OpenAI SDK >= 1.0 interface ----
+from openai import OpenAI
 
 from feeds import RSS_FEEDS
 load_dotenv()
@@ -26,7 +29,9 @@ logging.basicConfig(
 
 NEWSLETTER_NAME = os.getenv('NEWSLETTER_NAME', 'Morning Briefing')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
-openai.api_key = os.getenv('OPENAI_API_KEY')
+
+# Create a single OpenAI client (new SDK)
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # OpenAI throttle to stay under limits
 OAI_RPM = int(os.getenv('OAI_RPM', '25'))          # requests per minute (keep conservative)
@@ -181,8 +186,6 @@ class RSSAnalyzer:
         return None
 
     def summarise_for_beehiiv(self, item: FeedItem) -> Optional[dict]:
-        if not openai.api_key: return None
-
         # cached?
         row = self.conn.execute(
             "SELECT ai_package FROM items WHERE link_canonical = ? OR link = ?",
@@ -222,13 +225,14 @@ published_iso: "{published_iso}"
         for attempt in range(OAI_MAX_RETRIES):
             try:
                 self.oai.wait()
-                resp = openai.ChatCompletion.create(
+                resp = client.chat.completions.create(
                     model=OPENAI_MODEL,
                     messages=[{"role":"user","content":prompt}],
                     max_tokens=800,
                     temperature=0.2,
                 )
-                data = self._safe_json_extract(resp.choices[0].message.content)
+                content = resp.choices[0].message.content or ""
+                data = self._safe_json_extract(content)
                 if data and isinstance(data, dict):
                     return data
                 logging.warning("JSON extract failed; retrying…")
