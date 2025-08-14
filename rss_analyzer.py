@@ -20,22 +20,25 @@ from openai import OpenAI
 from feeds import RSS_FEEDS
 load_dotenv()
 
+# ---------- Tunables via env ----------
+LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
+OPENAI_MODEL     = os.getenv('OPENAI_MODEL', 'gpt-4o')
+NEWSLETTER_NAME  = os.getenv('NEWSLETTER_NAME', 'Morning Briefing')
+OAI_RPM          = int(os.getenv('OAI_RPM', '25'))            # requests/min cap
+OAI_MAX_RETRIES  = int(os.getenv('OAI_MAX_RETRIES', '4'))
+MAX_WORKERS      = int(os.getenv("MAX_WORKERS", "6"))         # feed fetch concurrency
+FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))       # per-feed seconds
+MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "5"))    # skip AI below this
+# --------------------------------------
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.FileHandler('rss_analyzer.log', encoding='utf-8'),
               logging.StreamHandler()]
 )
 
-NEWSLETTER_NAME = os.getenv('NEWSLETTER_NAME', 'Morning Briefing')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
-
-# Create a single OpenAI client (new SDK)
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-# OpenAI throttle to stay under limits
-OAI_RPM = int(os.getenv('OAI_RPM', '25'))          # requests per minute (keep conservative)
-OAI_MAX_RETRIES = int(os.getenv('OAI_MAX_RETRIES', '4'))
 
 # AU relevance
 AU_TERMS = [
@@ -72,7 +75,7 @@ def canonicalize_link(url: str) -> str:
     """Strip tracking params & fragments to create stable GUIDs & fingerprints."""
     try:
         u = urlparse(url)
-        keep = set(['id','p','article','story'])  # keep only essential params
+        keep = set(['id','p','article','story'])
         q = [(k,v) for k,v in parse_qsl(u.query, keep_blank_values=False) if k.lower() in keep]
         clean = u._replace(query=urlencode(q), fragment='')
         return urlunparse(clean)
@@ -99,13 +102,24 @@ class OpenAIThrottle:
 class RSSAnalyzer:
     def __init__(self):
         self.conn = sqlite3.connect('rss_items.db', check_same_thread=False)
+        self.ensure_schema()
+        self.rss_feeds = RSS_FEEDS
+        self.oai = OpenAIThrottle(OAI_RPM)
+        self.metrics = {
+            'fetched':0, 'deduped_out':0, 'sensitive_out':0,
+            'kept_new':0, 'cache_hits':0, 'ai_calls':0, 'ai_success':0, 'ai_fail':0,
+            'skipped_low_score':0
+        }
+        logging.info(f"Loaded {len(self.rss_feeds)} feeds | MAX_WORKERS={MAX_WORKERS} FEED_TIMEOUT={FEED_TIMEOUT}s OAI_RPM={OAI_RPM} MIN_SCORE_FOR_AI={MIN_SCORE_FOR_AI}")
+
+    def ensure_schema(self):
         self.conn.execute('''
             CREATE TABLE IF NOT EXISTS items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 link TEXT NOT NULL,
                 link_canonical TEXT,
-                fp TEXT UNIQUE,  -- fingerprint
+                fp TEXT UNIQUE,
                 description TEXT,
                 published DATETIME,
                 source_feed TEXT,
@@ -119,22 +133,9 @@ class RSSAnalyzer:
                 export_batch TEXT
             )
         ''')
-        # backfill columns/index (no-op if exist)
-        try: self.conn.execute("ALTER TABLE items ADD COLUMN link_canonical TEXT")
-        except sqlite3.OperationalError: pass
-        try: self.conn.execute("ALTER TABLE items ADD COLUMN fp TEXT")
-        except sqlite3.OperationalError: pass
-        try: self.conn.execute("ALTER TABLE items ADD COLUMN exported_to_rss INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: self.conn.execute("ALTER TABLE items ADD COLUMN export_batch TEXT")
-        except sqlite3.OperationalError: pass
         try: self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_fp ON items(fp)")
         except sqlite3.OperationalError: pass
         self.conn.commit()
-
-        self.rss_feeds = RSS_FEEDS
-        self.oai = OpenAIThrottle(OAI_RPM)
-        logging.info(f"Loaded {len(self.rss_feeds)} feeds")
 
     # --- DB checks ---
     def item_exists_fp(self, fp: str) -> bool:
@@ -170,7 +171,8 @@ class RSSAnalyzer:
     def auto_score(self, item: FeedItem):
         combined = (item.title + " " + (item.description or "")).lower()
         if any(k in combined for k in SENSITIVE):
-            item.interest_score = 1; item.category = 'Filtered'; item.ai_summary = f"Filtered: {item.title}"; return
+            item.interest_score = 1; item.category = 'Filtered'; item.ai_summary = f"Filtered: {item.title}"
+            return
         score = 4 + max(-3, min(6, self.property_relevance_boost(combined)))
         item.interest_score = max(1, min(10, score))
         item.category = 'AU CRE' if score >= 5 else 'General'
@@ -192,8 +194,11 @@ class RSSAnalyzer:
             (canonicalize_link(item.link), item.link)
         ).fetchone()
         if row and row[0]:
-            try: return json.loads(row[0])
-            except Exception: pass
+            try:
+                self.metrics['cache_hits'] += 1
+                return json.loads(row[0])
+            except Exception:
+                pass
 
         title = item.title or ""
         description = (item.description or item.ai_summary or "")[:1200]
@@ -225,28 +230,31 @@ published_iso: "{published_iso}"
         for attempt in range(OAI_MAX_RETRIES):
             try:
                 self.oai.wait()
+                self.metrics['ai_calls'] += 1
                 resp = client.chat.completions.create(
                     model=OPENAI_MODEL,
                     messages=[{"role":"user","content":prompt}],
                     max_tokens=800,
                     temperature=0.2,
                 )
-                content = resp.choices[0].message.content or ""
+                content = (resp.choices[0].message.content or "").strip()
                 data = self._safe_json_extract(content)
                 if data and isinstance(data, dict):
+                    self.metrics['ai_success'] += 1
                     return data
                 logging.warning("JSON extract failed; retrying…")
             except Exception as e:
                 logging.warning(f"OAI error (try {attempt+1}/{OAI_MAX_RETRIES}): {e}")
                 time.sleep(1.0 + attempt * 0.7)
-        # No fallback — we exclude items without a package at publish time
-        return None
+
+        self.metrics['ai_fail'] += 1
+        return None  # No fallback
 
     # --- fetching ---
     def fetch_feed_items_recent_only(self, feed_config: Dict, cutoff_time: datetime, max_items: int = 20) -> List[FeedItem]:
         feed_url, feed_name = feed_config['url'], feed_config['name']
         try:
-            old_t = socket.getdefaulttimeout(); socket.setdefaulttimeout(15)
+            old_t = socket.getdefaulttimeout(); socket.setdefaulttimeout(FEED_TIMEOUT)
             try: feed = feedparser.parse(feed_url)
             finally: socket.setdefaulttimeout(old_t)
             items, too_old, now = [], 0, datetime.now()
@@ -265,40 +273,66 @@ published_iso: "{published_iso}"
                     source_feed=feed_url, source_name=feed_name
                 ))
                 if len(items) >= max_items: break
-            items.sort(key=lambda x: x.published, reverse=True)
-            return items
+            return sorted(items, key=lambda x: x.published, reverse=True)
         except Exception as e:
             logging.error(f"Fetch error {feed_name}: {e}")
             return []
 
-    def fetch_all_parallel(self, cutoff_time: datetime, max_workers: int = 5) -> List[FeedItem]:
+    def fetch_all_parallel(self, cutoff_time: datetime) -> List[FeedItem]:
+        start = time.time()
         all_items = []
         def runner(cfg): return self.fetch_feed_items_recent_only(cfg, cutoff_time, 15)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             for items in ex.map(runner, self.rss_feeds):
                 all_items.extend(items)
+        dur = time.time() - start
+        logging.info(f"Fetched recent items from {len(self.rss_feeds)} feeds in {dur:.1f}s (items={len(all_items)})")
         return all_items
 
     # --- main ---
     def process_once(self) -> dict:
+        t0 = time.time()
         cutoff = datetime.now() - timedelta(hours=6)
         raw = self.fetch_all_parallel(cutoff)
-        if not raw: return {'scanned':0,'new':0,'saved':0}
+        self.metrics['fetched'] = len(raw)
+        if not raw:
+            logging.info("No recent items from any feed")
+            return {'scanned':0,'new':0,'saved':0}
 
-        new_items, saved = [], 0
+        new_items = []
         for it in raw:
             fpv = fingerprint(it.title, canonicalize_link(it.link), it.source_name)
-            if self.item_exists_fp(fpv): continue
+            if self.item_exists_fp(fpv):
+                self.metrics['deduped_out'] += 1
+                continue
             combined = (it.title + " " + (it.description or "")).lower()
-            if any(k in combined for k in SENSITIVE): continue
+            if any(k in combined for k in SENSITIVE):
+                self.metrics['sensitive_out'] += 1
+                continue
             self.auto_score(it)
             new_items.append(it)
 
+        self.metrics['kept_new'] = len(new_items)
+
+        saved, ai_attempted = 0, 0
         for it in new_items:
-            pkg = self.summarise_for_beehiiv(it)  # throttled + cached + retries
+            if it.interest_score < MIN_SCORE_FOR_AI:
+                self.metrics['skipped_low_score'] += 1
+                pkg = None
+            else:
+                ai_attempted += 1
+                pkg = self.summarise_for_beehiiv(it)  # throttled + cached + retries
             self.save_item(it, ai_package=pkg)
             saved += 1
 
+        dur = time.time() - t0
+        logging.info(
+            "SUMMARY: fetched=%d deduped=%d sensitive=%d kept=%d | "
+            "ai_attempted=%d cache_hits=%d ai_calls=%d ai_ok=%d ai_fail=%d skipped_low=%d | duration=%.1fs",
+            self.metrics['fetched'], self.metrics['deduped_out'], self.metrics['sensitive_out'], self.metrics['kept_new'],
+            ai_attempted, self.metrics['cache_hits'], self.metrics['ai_calls'], self.metrics['ai_success'], self.metrics['ai_fail'], self.metrics['skipped_low_score'],
+            dur
+        )
         return {'scanned':len(raw),'new':len(new_items),'saved':saved}
 
 def main():
