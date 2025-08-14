@@ -13,15 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: |
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Fetch & summarise (throttled)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NEWSLETTER_NAME: "Morning Briefing"
-          OAI_RPM: "25"         # stay well under limits
+          OAI_RPM: "25"
           OAI_MAX_RETRIES: "4"
         run: |
           python rss_analyzer.py
