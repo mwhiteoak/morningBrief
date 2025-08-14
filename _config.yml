@@ -1,16 +1,7 @@
-# _config.yml
 title: Morning Briefing
 description: AU commercial property intel — asset, fund & acquisitions
-# Pick ONE from: minima, jekyll-theme-cayman, jekyll-theme-slate, jekyll-theme-primer, etc.
 theme: jekyll-theme-cayman
 
-# Make sure beehiiv.xml is published
+# Always publish the RSS file
 include:
   - beehiiv.xml
-
-# (optional) Basic nav links
-nav:
-  - title: Home
-    url: /
-  - title: RSS
-    url: /beehiiv.xml
