@@ -1,0 +1,38 @@
+name: Publish RSS (05:58 AEST)
+on:
+  schedule:
+    - cron: '58 19 * * *'   # 05:58 AEST daily
+  workflow_dispatch: {}
+concurrency:
+  group: publish-rss
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Generate today’s beehiiv.xml (AI-only, no repeats)
+        env:
+          RSS_DB_PATH: rss_items.db
+          OUT_PATH: public/beehiiv.xml
+          NEWSLETTER_NAME: "Morning Briefing"
+          BASE_URL: "https://YOUR_GH_USER.github.io/YOUR_REPO"
+          TZ_REGION: "Australia/Brisbane"
+          REQUIRE_AI: "1"          # exclude items without AI packages
+        run: |
+          python write_beehiiv_xml.py
+      - name: Commit & push feed
+        run: |
+          git config user.name "rss-bot"
+          git config user.email "rss-bot@example.com"
+          git add public/beehiiv.xml
+          git commit -m "Update daily beehiiv.xml" || echo "Nothing to commit"
+          git push
