@@ -13,26 +13,34 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: |
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Generate today’s beehiiv.xml (AI-only, no repeats)
         env:
           RSS_DB_PATH: rss_items.db
-          OUT_PATH: public/beehiiv.xml
+          OUT_PATH: beehiiv.xml            # <-- write to REPO ROOT
           NEWSLETTER_NAME: "Morning Briefing"
-          BASE_URL: "https://YOUR_GH_USER.github.io/YOUR_REPO"
+          BASE_URL: "https://mwhiteoak.github.io/morningbrief"
           TZ_REGION: "Australia/Brisbane"
-          REQUIRE_AI: "1"          # exclude items without AI packages
+          REQUIRE_AI: "1"                  # exclude items without AI package
         run: |
           python write_beehiiv_xml.py
+
       - name: Commit & push feed
         run: |
           git config user.name "rss-bot"
           git config user.email "rss-bot@example.com"
-          git add public/beehiiv.xml
+          git add beehiiv.xml
           git commit -m "Update daily beehiiv.xml" || echo "Nothing to commit"
           git push
