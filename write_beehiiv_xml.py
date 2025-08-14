@@ -1,14 +1,39 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import sqlite3, os, re, html, json
+import sqlite3, os, html, json, sys
 
 DB_PATH    = os.getenv("RSS_DB_PATH", "rss_items.db")
-OUT_PATH   = os.getenv("OUT_PATH", "public/beehiiv.xml")
+OUT_PATH   = os.getenv("OUT_PATH", "beehiiv.xml")  # default to repo root
 SITE_TITLE = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
 SITE_LINK  = os.getenv("BASE_URL", "https://yourname.github.io/yourrepo")
 FEED_DESC  = "Daily AU commercial property briefing — asset, fund, and acquisitions focused."
 TZ_REGION  = os.getenv("TZ_REGION", "Australia/Brisbane")
 REQUIRE_AI = os.getenv("REQUIRE_AI", "1") == "1"  # exclude items without AI package
+
+def ensure_schema(conn: sqlite3.Connection):
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            link TEXT NOT NULL,
+            link_canonical TEXT,
+            fp TEXT UNIQUE,
+            description TEXT,
+            published DATETIME,
+            source_feed TEXT,
+            source_name TEXT,
+            interest_score INTEGER,
+            ai_summary TEXT,
+            category TEXT,
+            processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ai_package TEXT,
+            exported_to_rss INTEGER DEFAULT 0,
+            export_batch TEXT
+        )
+    ''')
+    try: conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_fp ON items(fp)")
+    except sqlite3.OperationalError: pass
+    conn.commit()
 
 def rfc822(dt_local: datetime) -> str:
     return dt_local.strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -26,10 +51,13 @@ def item_block_from_pkg(pkg: dict, link: str) -> str:
     block = pkg.get("newsletter_block_html") or f'<p><a href="{html.escape(link)}">Read more</a></p>'
     return block.replace("<script", "&lt;script")
 
+# --- main ---
+conn = sqlite3.connect(DB_PATH)
+ensure_schema(conn)
+
 start_local, start_utc, end_utc = today_bounds_utc()
 batch_id = start_local.strftime("%Y%m%d")
 
-conn = sqlite3.connect(DB_PATH)
 cur = conn.execute("""
     SELECT id, title, link, description, interest_score, ai_summary, source_name, processed_at, ai_package, exported_to_rss
     FROM items
@@ -57,7 +85,7 @@ for row in rows:
         cats += "".join(f"<category>{html.escape(c)}</category>" for c in (pkg.get("sector_tags") or []))
         cats += "".join(f"<category>{html.escape(c)}</category>" for c in (pkg.get("geo_tags") or []))
 
-    pub_local = start_local  # set all items to today's issue date/time window for consistency
+    pub_local = start_local
     items_xml.append(f"""
 <item>
   <title>{html.escape(hed)}</title>
@@ -85,11 +113,10 @@ xml = f"""<?xml version="1.0" encoding="UTF-8"?>
   </channel>
 </rss>"""
 
-os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+os.makedirs(os.path.dirname(OUT_PATH) or ".", exist_ok=True)
 with open(OUT_PATH, "w", encoding="utf-8") as f:
     f.write(xml)
 
-# Mark exported (prevents repeats tomorrow)
 if selected_ids:
     q = f"UPDATE items SET exported_to_rss = 1, export_batch = ? WHERE id IN ({','.join(['?']*len(selected_ids))})"
     conn.execute(q, (batch_id, *selected_ids))
@@ -97,3 +124,5 @@ if selected_ids:
 
 conn.close()
 print(f"Wrote RSS to {OUT_PATH} (items={len(items_xml)}), batch={batch_id}")
+if not selected_ids:
+    print("NOTE: No eligible items today (DB present but none matched window/AI gating).")
