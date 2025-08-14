@@ -65,14 +65,26 @@ jobs:
           echo "=== Tail (last 200 lines) ==="
           tail -n 200 rss_analyzer.log || true
 
-      - name: Persist DB & logs (force-add so Publish can read them)
+      - name: Persist DB & logs (force-add + rebase-safe push)
         if: always()
         run: |
+          set -e
           git config user.name "rss-bot"
           git config user.email "rss-bot@example.com"
-          git add -f rss_items.db rss_analyzer.log   # force add even if .gitignore ignores them
-          git commit -m "Cache AI packages + logs" || echo "Nothing to commit"
-          git push || true
+          # Stage outputs even if .gitignore blocks them
+          git add -f rss_items.db rss_analyzer.log || true
+          git commit -m "Prepare: update DB/logs [skip ci]" || echo "Nothing to commit"
+
+          # Push with up-to-date base; retry a few times if main moved
+          for i in 1 2 3; do
+            if git push; then
+              echo "Push succeeded"; break
+            else
+              echo "Push rejected, rebasing onto origin/main (attempt $i)..."
+              git fetch origin
+              git pull --rebase origin main || true
+            fi
+          done
 
       - name: Upload artifacts (db + logs)
         if: always()
