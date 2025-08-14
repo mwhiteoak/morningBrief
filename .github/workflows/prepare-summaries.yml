@@ -15,22 +15,45 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Fetch & summarise (throttled)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NEWSLETTER_NAME: "Morning Briefing"
-          OAI_RPM: "25"
+          OAI_RPM: "25"             # increase if your account allows (e.g., 60)
           OAI_MAX_RETRIES: "4"
+          MAX_WORKERS: "8"          # faster feed fetch
+          FEED_TIMEOUT: "15"        # each feed request timeout (s)
+          MIN_SCORE_FOR_AI: "5"     # skip AI on low-relevance noise
+          LOG_LEVEL: "INFO"
         run: |
           python rss_analyzer.py
-      - name: Persist DB (cache packages)
+
+      - name: Show log tail
+        if: always()
+        run: |
+          echo "==== rss_analyzer.log (last 200 lines) ===="
+          tail -n 200 rss_analyzer.log || true
+
+      - name: Persist DB & log
         run: |
           git config user.name "rss-bot"
           git config user.email "rss-bot@example.com"
           git add rss_items.db rss_analyzer.log || true
-          git commit -m "Cache AI packages" || echo "Nothing to commit"
+          git commit -m "Cache AI packages + logs" || echo "Nothing to commit"
           git push || true
+
+      - name: Upload artifacts (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-and-logs
+          path: |
+            rss_items.db
+            rss_analyzer.log
+          retention-days: 7
