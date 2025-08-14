@@ -29,11 +29,11 @@ jobs:
       - name: Generate today’s beehiiv.xml (AI-only, no repeats)
         env:
           RSS_DB_PATH: rss_items.db
-          OUT_PATH: beehiiv.xml            # <-- write to REPO ROOT
+          OUT_PATH: beehiiv.xml
           NEWSLETTER_NAME: "Morning Briefing"
-          BASE_URL: "https://mwhiteoak.github.io/morningbrief"
+          BASE_URL: "https://mwhiteoak.github.io/morningBrief"
           TZ_REGION: "Australia/Brisbane"
-          REQUIRE_AI: "1"                  # exclude items without AI package
+          REQUIRE_AI: "1"
         run: |
           python write_beehiiv_xml.py
 
