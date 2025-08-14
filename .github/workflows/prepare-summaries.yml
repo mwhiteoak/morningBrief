@@ -65,12 +65,12 @@ jobs:
           echo "=== Tail (last 200 lines) ==="
           tail -n 200 rss_analyzer.log || true
 
-      - name: Persist DB & logs
+      - name: Persist DB & logs (force-add so Publish can read them)
         if: always()
         run: |
           git config user.name "rss-bot"
           git config user.email "rss-bot@example.com"
-          git add rss_items.db rss_analyzer.log || true
+          git add -f rss_items.db rss_analyzer.log   # force add even if .gitignore ignores them
           git commit -m "Cache AI packages + logs" || echo "Nothing to commit"
           git push || true
 
