@@ -122,40 +122,39 @@ def heuristic_score(source: str, title: str, summary: str) -> int:
     return score
 
 # ---------- DB ----------
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  source_name TEXT,
-  source_feed TEXT,
-  link TEXT,
-  link_canonical TEXT UNIQUE,
-  title TEXT,
-  summary TEXT,
-  published_at TEXT,
-  fetched_at TEXT,
-  interest_score INTEGER DEFAULT 0,
-  relevant INTEGER DEFAULT 0,
-  ai_json TEXT,
-  ai_title TEXT,
-  ai_desc TEXT,
-  ai_tags TEXT,
-  processed_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS newsletter_metadata (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_date TEXT,
-  headline TEXT,
-  subhead TEXT,
-  created_at TEXT,
-  item_count INTEGER DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at);
-CREATE INDEX IF NOT EXISTS idx_items_rel ON items(relevant);
-CREATE INDEX IF NOT EXISTS idx_items_canonical ON items(link_canonical);
-CREATE INDEX IF NOT EXISTS idx_newsletter_date ON newsletter_metadata(run_date);
-"""
+def create_base_schema(conn: sqlite3.Connection):
+    """Create base tables if they don't exist"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT,
+            source_feed TEXT,
+            link TEXT,
+            link_canonical TEXT UNIQUE,
+            title TEXT,
+            summary TEXT,
+            published_at TEXT,
+            fetched_at TEXT
+        )
+    """)
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS newsletter_metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT,
+            headline TEXT,
+            subhead TEXT,
+            created_at TEXT,
+            item_count INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Create indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_canonical ON items(link_canonical)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_newsletter_date ON newsletter_metadata(run_date)")
+    
+    conn.commit()
 
 NEEDED_COLS = set([
     "source_name","source_feed","link","link_canonical","title","summary","published_at",
@@ -163,50 +162,78 @@ NEEDED_COLS = set([
 ])
 
 def ensure_schema(conn: sqlite3.Connection):
-    conn.executescript(SCHEMA_SQL)
-    # add any missing columns (safe for existing DBs)
+    """Safely migrate database schema"""
+    # First create base tables
+    create_base_schema(conn)
+    
+    # Check existing columns in items table
     cur = conn.execute("PRAGMA table_info(items)")
-    have = {r[1] for r in cur.fetchall()}
-    missing = [c for c in NEEDED_COLS if c not in have]
-    for c in missing:
-        if c == "interest_score":
-            conn.execute("ALTER TABLE items ADD COLUMN interest_score INTEGER DEFAULT 0")
-        elif c == "relevant":
-            conn.execute("ALTER TABLE items ADD COLUMN relevant INTEGER DEFAULT 0")
-        else:
-            conn.execute(f"ALTER TABLE items ADD COLUMN {c} TEXT")
-        logging.info(f"DB: added missing column {c}")
+    existing_cols = {row[1]: row[2] for row in cur.fetchall()}
+    
+    # Add missing columns one by one (safe for existing DBs)
+    columns_to_add = {
+        'interest_score': 'INTEGER DEFAULT 0',
+        'relevant': 'INTEGER DEFAULT 0', 
+        'ai_json': 'TEXT',
+        'ai_title': 'TEXT',
+        'ai_desc': 'TEXT',
+        'ai_tags': 'TEXT',
+        'processed_at': 'TEXT'
+    }
+    
+    for col_name, col_def in columns_to_add.items():
+        if col_name not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE items ADD COLUMN {col_name} {col_def}")
+                logging.info(f"DB: added missing column {col_name}")
+            except sqlite3.OperationalError as e:
+                logging.warning(f"DB: could not add column {col_name}: {e}")
+    
+    # Create additional indexes
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_rel ON items(relevant)")
+    except sqlite3.OperationalError:
+        pass  # Index might not be creatable if column doesn't exist yet
+    
     conn.commit()
 
 def is_database_empty(conn: sqlite3.Connection) -> bool:
     """Check if database has any relevant items"""
-    cur = conn.execute("SELECT COUNT(*) FROM items WHERE relevant = 1")
-    count = cur.fetchone()[0]
-    return count == 0
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM items WHERE relevant = 1")
+        count = cur.fetchone()[0]
+        return count == 0
+    except sqlite3.OperationalError:
+        # Column doesn't exist yet, database is effectively empty
+        return True
 
 def has_sufficient_categories(conn: sqlite3.Connection) -> bool:
     """Check if we have minimum items per main category"""
-    category_counts = defaultdict(int)
-    
-    cur = conn.execute("""
-        SELECT ai_tags FROM items 
-        WHERE relevant = 1 AND ai_tags IS NOT NULL AND ai_tags != ''
-    """)
-    
-    for row in cur.fetchall():
-        tags = [tag.strip() for tag in (row[0] or "").split(",")]
-        for tag in tags:
-            if tag in MAIN_CATEGORIES:
-                category_counts[tag] += 1
-    
-    # Check if we have at least MIN_ITEMS_PER_CATEGORY for each main category
-    sufficient_categories = sum(1 for count in category_counts.values() 
-                               if count >= MIN_ITEMS_PER_CATEGORY)
-    
-    logging.info(f"Category counts: {dict(category_counts)}")
-    logging.info(f"Categories with sufficient items: {sufficient_categories}/{len(MAIN_CATEGORIES)}")
-    
-    return sufficient_categories >= len(MAIN_CATEGORIES) // 2  # At least half the categories
+    try:
+        category_counts = defaultdict(int)
+        
+        cur = conn.execute("""
+            SELECT ai_tags FROM items 
+            WHERE relevant = 1 AND ai_tags IS NOT NULL AND ai_tags != ''
+        """)
+        
+        for row in cur.fetchall():
+            tags = [tag.strip() for tag in (row[0] or "").split(",")]
+            for tag in tags:
+                if tag in MAIN_CATEGORIES:
+                    category_counts[tag] += 1
+        
+        # Check if we have at least MIN_ITEMS_PER_CATEGORY for each main category
+        sufficient_categories = sum(1 for count in category_counts.values() 
+                                   if count >= MIN_ITEMS_PER_CATEGORY)
+        
+        logging.info(f"Category counts: {dict(category_counts)}")
+        logging.info(f"Categories with sufficient items: {sufficient_categories}/{len(MAIN_CATEGORIES)}")
+        
+        return sufficient_categories >= len(MAIN_CATEGORIES) // 2  # At least half the categories
+    except sqlite3.OperationalError:
+        # Columns don't exist yet, not sufficient
+        return False
 
 def item_exists(conn: sqlite3.Connection, canonical_link: str) -> bool:
     """Check if item already exists in database"""
@@ -319,16 +346,30 @@ def generate_headline_and_subhead(conn: sqlite3.Connection) -> Tuple[str, str]:
     if not client:
         return "Morning Property Brief", "Latest updates from Australian commercial property"
     
-    # Get recent relevant items for context
-    cur = conn.execute("""
-        SELECT ai_title, ai_desc, ai_tags, source_name
-        FROM items 
-        WHERE relevant = 1 AND ai_desc IS NOT NULL 
-        ORDER BY published_at DESC 
-        LIMIT 15
-    """)
+    try:
+        # Get recent relevant items for context
+        cur = conn.execute("""
+            SELECT ai_title, ai_desc, ai_tags, source_name
+            FROM items 
+            WHERE relevant = 1 AND ai_desc IS NOT NULL 
+            ORDER BY published_at DESC 
+            LIMIT 15
+        """)
+        
+        items = cur.fetchall()
+    except sqlite3.OperationalError:
+        # AI columns don't exist yet, fallback to basic items
+        try:
+            cur = conn.execute("""
+                SELECT title, summary, '', source_name
+                FROM items 
+                ORDER BY published_at DESC 
+                LIMIT 15
+            """)
+            items = cur.fetchall()
+        except sqlite3.OperationalError:
+            items = []
     
-    items = cur.fetchall()
     if not items:
         return "Morning Property Brief", "Latest updates from Australian commercial property"
     
@@ -518,32 +559,55 @@ def fetch_until_duplicates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 
 # ---------- Main pipeline ----------
 def upsert(conn: sqlite3.Connection, row: Dict[str, Any]):
-    conn.execute("""
-        INSERT OR IGNORE INTO items
-          (source_name,source_feed,link,link_canonical,title,summary,published_at,fetched_at,interest_score,relevant)
-        VALUES (?,?,?,?,?,?,?,?,?,0)
-    """, (row["source_name"], row["source_feed"], row["link"], row["link_canonical"],
-          row["title"], row["summary"], row["published_at"], row["fetched_at"], 0))
+    """Insert item, handling potential missing columns gracefully"""
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO items
+              (source_name,source_feed,link,link_canonical,title,summary,published_at,fetched_at,interest_score,relevant)
+            VALUES (?,?,?,?,?,?,?,?,?,0)
+        """, (row["source_name"], row["source_feed"], row["link"], row["link_canonical"],
+              row["title"], row["summary"], row["published_at"], row["fetched_at"], 0))
+    except sqlite3.OperationalError:
+        # Fallback for older schema - insert without new columns
+        conn.execute("""
+            INSERT OR IGNORE INTO items
+              (source_name,source_feed,link,link_canonical,title,summary,published_at,fetched_at)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (row["source_name"], row["source_feed"], row["link"], row["link_canonical"],
+              row["title"], row["summary"], row["published_at"], row["fetched_at"]))
     conn.commit()
 
 def update_ai(conn: sqlite3.Connection, link_canonical: str, interest_score: int,
               relevant: int, ai_pkg: Optional[Dict[str,Any]]):
-    if ai_pkg and ai_pkg.get("relevant"):
-        conn.execute("""
-          UPDATE items SET
-            interest_score=?, relevant=1, ai_json=?, ai_title=?, ai_desc=?, ai_tags=?, processed_at=?
-          WHERE link_canonical=?
-        """, (interest_score, json.dumps(ai_pkg, ensure_ascii=False),
-              ai_pkg.get("title"), ai_pkg.get("desc"),
-              ",".join(ai_pkg.get("tags") or []),
-              datetime.now(tz=TZ).isoformat(),
-              link_canonical))
-    else:
-        conn.execute("""
-          UPDATE items SET
-            interest_score=?, relevant=0, processed_at=?
-          WHERE link_canonical=?
-        """, (interest_score, datetime.now(tz=TZ).isoformat(), link_canonical))
+    """Update AI results, handling potential missing columns gracefully"""
+    try:
+        if ai_pkg and ai_pkg.get("relevant"):
+            conn.execute("""
+              UPDATE items SET
+                interest_score=?, relevant=1, ai_json=?, ai_title=?, ai_desc=?, ai_tags=?, processed_at=?
+              WHERE link_canonical=?
+            """, (interest_score, json.dumps(ai_pkg, ensure_ascii=False),
+                  ai_pkg.get("title"), ai_pkg.get("desc"),
+                  ",".join(ai_pkg.get("tags") or []),
+                  datetime.now(tz=TZ).isoformat(),
+                  link_canonical))
+        else:
+            conn.execute("""
+              UPDATE items SET
+                interest_score=?, relevant=0, processed_at=?
+              WHERE link_canonical=?
+            """, (interest_score, datetime.now(tz=TZ).isoformat(), link_canonical))
+    except sqlite3.OperationalError as e:
+        # Fallback for older schema - just log that we can't update AI fields yet
+        logging.warning(f"Could not update AI fields (schema migration needed): {e}")
+        # At minimum, we can still track that we processed this item
+        try:
+            conn.execute("UPDATE items SET title=?, summary=? WHERE link_canonical=?", 
+                        (ai_pkg.get("title") if ai_pkg else None, 
+                         ai_pkg.get("desc") if ai_pkg else None,
+                         link_canonical))
+        except sqlite3.OperationalError:
+            pass  # Give up gracefully
     conn.commit()
 
 def save_newsletter_metadata(conn: sqlite3.Connection, headline: str, subhead: str, item_count: int):
