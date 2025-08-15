@@ -2,12 +2,13 @@
 """
 Create a single Beehiiv-ready RSS file (beehiiv.xml)
 - Only items with AI rewrites (relevant=1 AND ai_desc present)
+- Incorporates AI-generated headline and subhead from newsletter_metadata
 - XML-safe (properly escaped)
 - Skips items with thin content
 """
-
 import os, sqlite3, html
 from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Tuple
 
 RSS_DB_PATH   = os.getenv("RSS_DB_PATH", "rss_items.db")
 OUT_PATH      = os.getenv("OUT_PATH", "beehiiv.xml")
@@ -23,7 +24,19 @@ def cdata(s: str) -> str:
     # protect CDATA terminator
     return "<![CDATA[" + (s or "").replace("]]>", "]]]]><![CDATA[>") + "]]>"
 
-def fetch(conn: sqlite3.Connection):
+def get_newsletter_metadata(conn: sqlite3.Connection) -> Tuple[str, str]:
+    """Get the latest headline and subhead from newsletter_metadata"""
+    cur = conn.execute("""
+        SELECT headline, subhead FROM newsletter_metadata 
+        ORDER BY created_at DESC 
+        LIMIT 1
+    """)
+    result = cur.fetchone()
+    if result:
+        return result[0] or "Morning Property Brief", result[1] or "Latest updates from Australian commercial property"
+    return "Morning Property Brief", "Latest updates from Australian commercial property"
+
+def fetch(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     since = datetime.now(tz=TZ) - timedelta(hours=SCAN_WINDOW_HRS)
     cur = conn.execute("""
         SELECT source_name, link, link_canonical, ai_title, ai_desc, ai_tags, published_at
@@ -47,6 +60,7 @@ def fetch(conn: sqlite3.Connection):
             "tags": (r[5] or "").split(",") if r[5] else [],
             "pub": pub,
         })
+    
     # Sort: most recent, then property-weighted by presence of classic CRE terms in title
     def score_title(t: str) -> int:
         t = (t or "").lower()
@@ -55,47 +69,8 @@ def fetch(conn: sqlite3.Connection):
             if kw in t:
                 bump += 1
         return bump
+    
     rows.sort(key=lambda x: (x["pub"], score_title(x["title"])), reverse=True)
     return rows
 
-def write_feed(items):
-    now = datetime.now(tz=TZ)
-    header = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
-<channel>
-<title>{esc(NEWSLETTER)}</title>
-<link>{esc(BASE_URL)}</link>
-<description>Daily AU commercial property briefing — assets, funds, deals, development.</description>
-<language>en-au</language>
-<lastBuildDate>{now.strftime('%a, %d %b %Y %H:%M:%S %z')}</lastBuildDate>
-<ttl>60</ttl>
-"""
-    items_xml = []
-    for it in items:
-        link = it["canon"] or it["link"]
-        pub = it["pub"].strftime('%a, %d %b %Y %H:%M:%S %z')
-        cats = "".join([f"<category>{esc(t)}</category>" for t in it["tags"][:5]])
-        body_html = f"<p>{esc(it['desc'])}</p>"
-        items_xml.append(
-            f"<item>\n"
-            f"  <title>{esc(it['title'])}</title>\n"
-            f"  <link>{esc(link)}</link>\n"
-            f"  <guid isPermaLink=\"false\">{esc(link)}</guid>\n"
-            f"  <pubDate>{pub}</pubDate>\n"
-            f"  <description>\n{cdata(body_html)}\n  </description>\n"
-            f"  <content:encoded>\n{cdata(body_html)}\n  </content:encoded>\n"
-            f"  {cats}\n"
-            f"</item>\n"
-        )
-    footer = "</channel>\n</rss>\n"
-    with open(OUT_PATH, "w", encoding="utf-8") as f:
-        f.write(header + "".join(items_xml) + footer)
-
-def main():
-    conn = sqlite3.connect(RSS_DB_PATH)
-    items = fetch(conn)
-    write_feed(items)
-    print(f"Wrote RSS to {OUT_PATH} (items={len(items)})")
-
-if __name__ == "__main__":
-    main()
+def create_newsletter_item
