@@ -5,7 +5,7 @@ Morning Briefing — AU CRE Intelligence (Beehiiv-ready, multi-feed)
 - Filters & scores for AU property pros (CRE-first)
 - Rewrites in a Shaan Puri-ish voice *without* inventing facts (Aussie English)
 - Classifies into sections for multi-RSS output
-- Stores everything in sqlite: rss_items.db
+- Stores everything in sqlite: rss_items.db (auto-migrates schema)
 """
 
 import os, re, json, time, sqlite3, logging, socket, concurrent.futures
@@ -32,6 +32,7 @@ FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))          # per-feed seco
 MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "5"))       # below this: skip AI
 TZ_REGION        = os.getenv("TZ_REGION", "Australia/Brisbane")
 SCAN_WINDOW_HRS  = int(os.getenv("SCAN_WINDOW_HRS", "36"))       # look-back
+DB_PATH          = os.getenv("RSS_DB_PATH", "rss_items.db")
 # --------------------------------------
 
 logging.basicConfig(
@@ -41,60 +42,122 @@ logging.basicConfig(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ---- DB helpers --------------------------------------------------------------
-DB_PATH = os.getenv("RSS_DB_PATH", "rss_items.db")
+# ---- DB helpers (self-healing schema) ---------------------------------------
+REQUIRED_COLS = [
+    "url","url_canonical","source","title","published_at","raw_summary","score",
+    "category_main","ai_title","ai_desc_html","ai_tags","created_at"
+]
 
-def db() -> sqlite3.Connection:
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url TEXT UNIQUE,
+  url_canonical TEXT,
+  source TEXT,
+  title TEXT,
+  published_at TEXT,
+  raw_summary TEXT,
+  score INTEGER,
+  category_main TEXT,
+  ai_title TEXT,
+  ai_desc_html TEXT,
+  ai_tags TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def ensure_schema(conn: sqlite3.Connection):
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS items(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      url TEXT UNIQUE,
-      url_canonical TEXT,
-      source TEXT,
-      title TEXT,
-      published_at TEXT,
-      raw_summary TEXT,
-      score INTEGER,
-      category_main TEXT,
-      ai_title TEXT,
-      ai_desc_html TEXT,
-      ai_tags TEXT,                -- JSON list
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    # Safe schema evolutions (no-op if columns already exist)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
-    for col, ddl in [
-        ("category_main", "ALTER TABLE items ADD COLUMN category_main TEXT"),
-        ("ai_title",      "ALTER TABLE items ADD COLUMN ai_title TEXT"),
-        ("ai_desc_html",  "ALTER TABLE items ADD COLUMN ai_desc_html TEXT"),
-        ("ai_tags",       "ALTER TABLE items ADD COLUMN ai_tags TEXT"),
-    ]:
-        if col not in cols:
-            try: conn.execute(ddl)
-            except sqlite3.OperationalError: pass
+def _cols(conn) -> set:
+    try:
+        return {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+    except Exception:
+        return set()
+
+def _create_fresh(conn):
+    conn.executescript(CREATE_SQL)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at)")
     conn.commit()
+
+def ensure_schema() -> sqlite3.Connection:
+    # If DB file missing → create
+    fresh = not os.path.exists(DB_PATH)
+    conn = _connect()
+    if fresh:
+        logging.info("DB not found; creating fresh schema.")
+        _create_fresh(conn)
+        return conn
+
+    # Ensure table exists
+    conn.execute("CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+    conn.commit()
+
+    cols = _cols(conn)
+    # Severe mismatch → nuke & pave (old schema without url/title/published_at)
+    severe = any(req in ("url","title","published_at") and req not in cols for req in ["url","title","published_at"])
+    if severe:
+        logging.warning("DB schema mismatch (missing critical cols in 'items': %s). Recreating DB.", ", ".join(sorted(cols)))
+        try:
+            conn.close()
+        finally:
+            try: os.remove(DB_PATH)
+            except FileNotFoundError: pass
+        conn = _connect()
+        _create_fresh(conn)
+        return conn
+
+    # Soft-migrate: add any missing optional columns
+    for col in REQUIRED_COLS:
+        if col not in cols:
+            try:
+                if col == "created_at":
+                    conn.execute("ALTER TABLE items ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
+                elif col in ("category_main","ai_title","ai_desc_html","ai_tags","url_canonical","raw_summary","source","score"):
+                    conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
+                    if col == "score":
+                        # score should be integer — keep as text-compatible in SQLite, values cast when read
+                        pass
+                else:
+                    # If a truly required base column is missing but not severe (edge), fall back to recreate
+                    logging.warning("Missing base column '%s'; recreating DB.", col)
+                    conn.close()
+                    try: os.remove(DB_PATH)
+                    except FileNotFoundError: pass
+                    conn = _connect()
+                    _create_fresh(conn)
+                    return conn
+            except sqlite3.OperationalError:
+                # If ALTER failed (older SQLite oddities), recreate
+                logging.warning("ALTER TABLE failed for '%s'; recreating DB.", col)
+                conn.close()
+                try: os.remove(DB_PATH)
+                except FileNotFoundError: pass
+                conn = _connect()
+                _create_fresh(conn)
+                return conn
+    # Ensure index
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at)")
+    conn.commit()
+    return conn
 
 # ---- Utilities ---------------------------------------------------------------
 def now_au() -> datetime:
-    # naive but effective for Actions; we only need local-ish wall time
-    return datetime.utcnow() + timedelta(hours=10)  # AEST (+10); set TZ_REGION in workflows if needed
+    # naive for Actions; adjust TZ if needed
+    return datetime.utcnow() + timedelta(hours=10)
 
 def canonicalise_url(u: str) -> str:
     try:
         p = urlparse(u)
-        q = [(k,v) for (k,v) in parse_qsl(p.query) if k.lower() not in {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}]
+        q = [(k,v) for (k,v) in parse_qsl(p.query) if k.lower() not in {
+            "utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}]
         return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
     except Exception:
         return u
 
 PUBLISHER_TIER = {
-    # Tiered preference (higher is better surfacing)
     "AFR": 5, "Australian Financial Review Property": 5, "Real Commercial": 5, "The Urban Developer": 4,
     "Domain Business": 4, "realestate.com.au News": 4, "PCA News": 4, "Business News - Property": 4,
     "The Australian - Business": 3, "The Age - Business": 3, "The Age Federal Politics": 3, "ABC News": 3,
@@ -115,7 +178,7 @@ CATEGORY_MAP = {
     "development_planning": ["development","DA","planning","approval","construction","rezoning","masterplan"],
     "leasing": ["lease","leasing","pre-commitment","tenant","tenancy","occupancy","rent"],
     "macro": ["rates","inflation","bond","employment","GDP","CPI","RBA","economy","AUD"],
-    "reits": ["REIT","A-REIT","distribution","NTA","FFO","earnings","guidance","vape? nope"],
+    "reits": ["REIT","A-REIT","distribution","NTA","FFO","earnings","guidance"],
     "retail": ["retail","shopping","mall","centre","center","foot traffic"],
     "industrial": ["industrial","logistics","warehouse","sheds"],
     "office": ["office","CBD","fringe","workspace","fitted","coworking"],
@@ -126,12 +189,9 @@ CATEGORY_MAP = {
 def score_item(title: str, summary: str, source: str) -> int:
     txt = f"{title} {summary}".lower()
     base = 0
-    # CRE signal
     for kw in CRE_KEYWORDS:
         if kw in txt: base += 2
-    # Publisher weight
     base += PUBLISHER_TIER.get(source, 1)
-    # Obvious de-prioritisers
     if "podcast" in txt: base -= 2
     if "newsletter" in txt and "subscribe" in txt: base -= 2
     return max(0, base)
@@ -206,9 +266,7 @@ def fetch_feed(feed: Dict) -> List[Dict]:
             if not link: continue
             title = (e.get("title") or "").strip()
             if not title: continue
-            # prefer summary/description
             summary = (e.get("summary") or e.get("description") or "").strip()
-            # published
             pub = None
             for k in ("published_parsed","updated_parsed"):
                 if e.get(k):
@@ -228,8 +286,7 @@ def fetch_feed(feed: Dict) -> List[Dict]:
     return out
 
 def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,int]:
-    new, saved = 0, 0
-    kept = 0
+    new, saved, kept = 0, 0, 0
     with conn:
         for it in items:
             url = it["url"]
@@ -238,6 +295,7 @@ def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,
             source = it["source"]
             pub = it["published_at"]
             score = score_item(title, summary, source)
+
             if score < MIN_SCORE_FOR_AI:
                 conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score)
                                 VALUES(?,?,?,?,?,?,?)""",
@@ -259,7 +317,6 @@ def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,
             tags = json.dumps(data.get("tags") or [])
 
             if exclude:
-                # still record but without AI body
                 conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score,category_main)
                                 VALUES(?,?,?,?,?,?,?,?)""",
                              (url, canonicalise_url(url), source, title, pub, summary, score, cat))
@@ -275,11 +332,9 @@ def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,
     return new, saved, kept
 
 def main():
-    conn = db()
-    ensure_schema(conn)
+    conn = ensure_schema()
     start = time.time()
 
-    # fetch window
     since = now_au() - timedelta(hours=SCAN_WINDOW_HRS)
 
     logging.info("Loaded %d feeds | MAX_WORKERS=%s FEED_TIMEOUT=%ss OAI_RPM=%s MIN_SCORE_FOR_AI=%s",
