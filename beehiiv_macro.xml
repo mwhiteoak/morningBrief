@@ -1,25 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
 <channel>
-<title>Morning Briefing — Macro in a Minute</title>
+<title>Morning Briefing · Macro</title>
 <link>https://mwhiteoak.github.io/morningBrief</link>
-<description>Tiny daily macro block for Beehiiv.</description>
+<description>Macro snapshot: ASX200, AUD/USD, AU 10-yr, RBA cash &amp; odds.</description>
 <language>en-au</language>
-<lastBuildDate>Fri, 15 Aug 2025 11:14:57 +1000</lastBuildDate>
-<ttl>30</ttl>
+<lastBuildDate>Fri, 15 Aug 2025 01:50:04 +0000</lastBuildDate>
+<ttl>60</ttl>
 <item>
-<title>Macro in a Minute — 2025-08-15</title>
-<link>https://mwhiteoak.github.io/morningBrief</link>
-<guid isPermaLink="false">macro-20250815</guid>
-<pubDate>Fri, 15 Aug 2025 11:14:57 +1000</pubDate>
-<description><![CDATA[ <p><strong>ASX200:</strong> — &nbsp;|&nbsp; <strong>AUD/USD:</strong> —
-&nbsp;|&nbsp; <strong>AU 10-yr:</strong> — &nbsp;|&nbsp; <strong>RBA cash:</strong> —
-&nbsp;|&nbsp; <strong>Next move prob:</strong> —</p>
-<p><em>Risk-on morning; lenders bid; dev feasos ease a touch.</em></p> ]]></description>
-<content:encoded><![CDATA[ <p><strong>ASX200:</strong> — &nbsp;|&nbsp; <strong>AUD/USD:</strong> —
-&nbsp;|&nbsp; <strong>AU 10-yr:</strong> — &nbsp;|&nbsp; <strong>RBA cash:</strong> —
-&nbsp;|&nbsp; <strong>Next move prob:</strong> —</p>
-<p><em>Risk-on morning; lenders bid; dev feasos ease a touch.</em></p> ]]></content:encoded>
+<title><![CDATA[ Macro in a Minute ]]></title>
+<link><![CDATA[ https://mwhiteoak.github.io/morningBrief ]]></link>
+<guid isPermaLink="false"><![CDATA[ https://mwhiteoak.github.io/morningBrief ]]></guid>
+<pubDate>Fri, 15 Aug 2025 01:50:04 +0000</pubDate>
+<description>
+<![CDATA[ <p><ul>
+          <li>ASX200: <strong>—</strong> (—%)</li>
+          <li>AUD/USD: <strong>—</strong> (—%)</li>
+          <li>AU 10-yr: <strong>—</strong></li>
+          <li>RBA cash rate: <strong>—</strong> | Next move prob: <strong>—</strong></li>
+        </ul>
+        <p><em>Neutral morning.</em></p></p> ]]>
+</description>
+<content:encoded>
+<![CDATA[ <p><ul>
+          <li>ASX200: <strong>—</strong> (—%)</li>
+          <li>AUD/USD: <strong>—</strong> (—%)</li>
+          <li>AU 10-yr: <strong>—</strong></li>
+          <li>RBA cash rate: <strong>—</strong> | Next move prob: <strong>—</strong></li>
+        </ul>
+        <p><em>Neutral morning.</em></p></p> ]]>
+</content:encoded>
+<category>other</category>
 <category>macro</category>
 </item>
 </channel>
