@@ -1,279 +1,159 @@
 #!/usr/bin/env python3
-"""
-Writes multiple Beehiiv-ready RSS files from sqlite:
-- beehiiv_top.xml (smart sorted, ~5-min skim total)
-- beehiiv_{category}.xml for each category present
-- beehiiv_macro.xml ("Macro in a Minute": ASX200, A-REIT (^AXPJ), AUDUSD, AU 10-yr, RBA cash rate & next-move prob)
-Notes:
-- Excludes items without AI content or marked 'Insufficient data'
-- No hallucinations: descriptions come from rss_analyzer's constrained rewrites
-- Macro feed shows '—' for any missing datapoint
-"""
-
-import os, json, sqlite3, logging, math
+import os, re, sqlite3, logging
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape
-import httpx
 
-NEWSLETTER_NAME = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
-BASE_URL        = os.getenv("BASE_URL", "https://mwhiteoak.github.io/morningBrief")
-DB_PATH         = os.getenv("RSS_DB_PATH", "rss_items.db")
-TZ_REGION       = os.getenv("TZ_REGION", "Australia/Brisbane")
+# ---- Env / defaults ----
+DB_PATH = os.getenv("RSS_DB_PATH", "rss_items.db")
+OUT_PREFIX = os.getenv("OUT_PREFIX", "beehiiv")  # files like beehiiv_all.xml, beehiiv_deals.xml, ...
+BASE_URL = os.getenv("BASE_URL", "https://mwhiteoak.github.io/morningBrief")
+TITLE = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
+LANG = "en-au"
+WINDOW_HR = int(os.getenv("SCAN_WINDOW_HRS", "36"))
+MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "80"))
 
-LOOKBACK_HRS    = int(os.getenv("FEED_WINDOW_HOURS", "36"))
-TOP_WORD_BUDGET = int(os.getenv("TOP_WORD_BUDGET", "1100"))  # ~5 mins @ 200–250 wpm
-MIN_DESC_CHARS  = int(os.getenv("MIN_DESC_CHARS", "60"))
+# Category order (most relevant for CRE pros first)
+CAT_ORDER = [
+    "deals_capital","development_planning","reits","leasing",
+    "industrial","office","retail","residential","proptech_finance","macro"
+]
+CAT_INDEX = {c:i for i,c in enumerate(CAT_ORDER)}
 
-# Optional overrides if you want to set these from Actions secrets
-RBA_CASH_RATE_OVERRIDE = os.getenv("RBA_CASH_RATE", None)       # e.g. "3.85%"
-RBA_NEXT_MOVE_PROB_OVR = os.getenv("RBA_NEXT_MOVE_PROB", None)  # e.g. "Cut 55%"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-CATEGORY_META = {
-    "deals_capital":      ("Deals & Capital", "beehiiv_deals.xml"),
-    "development_planning":("Development & Planning", "beehiiv_development.xml"),
-    "leasing":            ("Leasing", "beehiiv_leasing.xml"),
-    "macro":              ("Macro & Policy", "beehiiv_macro_news.xml"),
-    "reits":              ("A-REITs & Listed", "beehiiv_reits.xml"),
-    "retail":             ("Retail", "beehiiv_retail.xml"),
-    "industrial":         ("Industrial & Logistics", "beehiiv_industrial.xml"),
-    "office":             ("Office", "beehiiv_office.xml"),
-    "residential":        ("Residential (market)", "beehiiv_residential.xml"),
-    "proptech_finance":   ("Proptech & Finance", "beehiiv_proptech.xml"),
+# Feed groups -> which categories to include (None = all)
+GROUPS = {
+    "all": None,
+    "deals": ["deals_capital"],
+    "development": ["development_planning"],
+    "reits": ["reits"],
+    "leasing": ["leasing"],
+    "industrial": ["industrial"],
+    "office": ["office"],
+    "retail": ["retail"],
+    "residential": ["residential"],
+    "proptech": ["proptech_finance"],
+    # keep macro separate via write_macro_xml.py
 }
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-def au_now():
-    return datetime.utcnow() + timedelta(hours=10)  # AEST naive
+# ---- Helpers ----
+def now_au():
+    return datetime.utcnow() + timedelta(hours=10)
 
-def read_recent(conn):
-    since = au_now() - timedelta(hours=LOOKBACK_HRS)
-    rows = conn.execute("""
-        SELECT url, url_canonical, source, title, published_at, score, category_main, ai_title, ai_desc_html, ai_tags
-        FROM items
-        WHERE published_at >= ? 
-        ORDER BY datetime(published_at) DESC
-    """, (since.isoformat(),)).fetchall()
-    out = []
-    for r in rows:
-        ai_html = (r["ai_desc_html"] or "").strip()
-        if not ai_html: 
-            continue
-        if "Insufficient data" in ai_html:
-            continue
-        if len(ai_html) < MIN_DESC_CHARS:
-            continue
-        out.append(r)
-    return out
+def strip_html(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s or "").strip()
 
-def words(text_html: str) -> int:
-    txt = text_html
-    # simple text-ish word count
-    txt = txt.replace("<br>", " ").replace("<br/>", " ").replace("</p>"," ").replace("<p>"," ")
-    return len([w for w in txt.split() if w.strip()])
+def iso_to_rfc2822(iso_s: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_s)
+    except Exception:
+        dt = now_au()
+    return dt.strftime("%a, %d %b %Y %H:%M:%S +1000")
 
-def build_rss(channel_title: str, items: list) -> str:
-    now_rfc = au_now().strftime("%a, %d %b %Y %H:%M:%S +1000")
-    head = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
-<channel>
-<title>{escape(channel_title)}</title>
-<link>{escape(BASE_URL)}</link>
-<description>Daily AU commercial property briefing — asset, fund, deals, development.</description>
-<language>en-au</language>
-<lastBuildDate>{now_rfc}</lastBuildDate>
-<ttl>60</ttl>
-"""
+def build_xml(items):
+    now = now_au()
+    head = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">',
+        "<channel>",
+        f"<title>{escape(TITLE)}</title>",
+        f"<link>{escape(BASE_URL)}</link>",
+        "<description>Daily AU commercial property briefing — asset, fund, and acquisitions focused.</description>",
+        f"<language>{LANG}</language>",
+        f"<lastBuildDate>{iso_to_rfc2822(now.isoformat())}</lastBuildDate>",
+        "<ttl>60</ttl>",
+    ]
     body = []
     for it in items:
-        title = it["ai_title"] or it["title"]
-        link  = it["url_canonical"] or it["url"]
-        pub   = datetime.fromisoformat(it["published_at"]).strftime("%a, %d %b %Y %H:%M:%S +1000")
-        desc  = it["ai_desc_html"]
-        cats  = [it["source"], it["category_main"] or ""]
-        try:
-            tags = json.loads(it["ai_tags"] or "[]")
-            cats += tags
-        except Exception:
-            pass
+        ai_title = it["ai_title"].strip()
+        ai_desc  = it["ai_desc_html"].strip()
+        body.extend([
+            "<item>",
+            f"<title>{escape(ai_title)}</title>",
+            f"<link>{escape(it['url'])}</link>",
+            f"<guid isPermaLink=\"false\">{escape(it['url'])}</guid>",
+            f"<pubDate>{iso_to_rfc2822(it['published_at'])}</pubDate>",
+            "<description><![CDATA[ " + ai_desc + " ]]></description>",
+            "<content:encoded><![CDATA[ " + ai_desc + " ]]></content:encoded>",
+            f"<category>{escape(it['source'])}</category>",
+            f"<category>{escape(it['category_main'])}</category>",
+            "</item>"
+        ])
+    tail = ["</channel>", "</rss>"]
+    return "\n".join(head + body + tail)
 
-        body.append(f"""<item>
-<title>{escape(title)}</title>
-<link>{escape(link)}</link>
-<guid isPermaLink="false">{escape(link)}</guid>
-<pubDate>{pub}</pubDate>
-<description><![CDATA[ {desc} ]]></description>
-<content:encoded><![CDATA[ {desc} ]]></content:encoded>
-""" + "".join(f"<category>{escape(c)}</category>\n" for c in cats if c) + "</item>\n")
-    tail = "</channel>\n</rss>\n"
-    return head + "".join(body) + tail
+def read_recent(conn):
+    since = now_au() - timedelta(hours=WINDOW_HR)
+    # grab everything; adapt to whatever schema is there
+    cur = conn.execute("SELECT * FROM items WHERE datetime(COALESCE(published_at,published,created_at)) >= datetime(?)", (since.isoformat(),))
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
 
-# ---- Macro in a Minute -------------------------------------------------------
+    def pick(d, *names):
+        for n in names:
+            if n in d and d[n]: return d[n]
+        return None
 
-def yahoo_quotes(symbols: list) -> dict:
-    # Returns {symbol: {"price": float, "pct": float}}
-    s = ",".join(symbols)
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={s}"
-    out = {}
-    try:
-        with httpx.Client(timeout=8) as x:
-            r = x.get(url)
-            r.raise_for_status()
-            data = r.json().get("quoteResponse", {}).get("result", [])
-            for q in data:
-                sym = q.get("symbol")
-                out[sym] = {
-                    "price": q.get("regularMarketPrice"),
-                    "pct":   q.get("regularMarketChangePercent"),
-                }
-    except Exception as e:
-        logging.warning("Yahoo quotes failed: %s", e)
-    return out
+    out = []
+    for r in rows:
+        rec = {cols[i]: r[i] for i in range(len(cols))}
+        url = pick(rec, "url","link","url_canonical","link_canonical")
+        if not url: continue
 
-def fmt_pct(v):
-    try:
-        if v is None: return "—"
-        return f"{v:+.2f}%"
-    except Exception:
-        return "—"
+        ai_title = pick(rec, "ai_title")
+        ai_desc  = pick(rec, "ai_desc_html")
+        # Require AI-ready entries only (prevents filler)
+        if not ai_title or not ai_desc: 
+            continue
+        if len(strip_html(ai_desc)) < 60:
+            continue
 
-def fmt_price(v, digits=4):
-    try:
-        if v is None: return "—"
-        if v >= 100: return f"{v:.1f}"
-        if v >= 10:  return f"{v:.2f}"
-        return f"{v:.{digits}f}"
-    except Exception:
-        return "—"
+        source = pick(rec, "source","source_name","source_feed") or ""
+        category_main = pick(rec, "category_main","category") or "macro"
+        published_at = pick(rec, "published_at","published","created_at") or now_au().isoformat()
+        ai_tags = pick(rec, "ai_tags","tags") or "[]"
 
-def macro_fetch():
-    # ^AXJO = ASX200, ^AXPJ = S&P/ASX 200 A-REIT, AUDUSD=X = AUDUSD spot
-    q = yahoo_quotes(["^AXJO", "^AXPJ", "AUDUSD=X"])
-    asx2k = q.get("^AXJO", {})
-    areit = q.get("^AXPJ", {})
-    aud   = q.get("AUDUSD=X", {})
+        out.append({
+            "url": url,
+            "source": source,
+            "ai_title": ai_title,
+            "ai_desc_html": ai_desc,
+            "category_main": category_main,
+            "published_at": published_at,
+            "ai_tags": ai_tags,
+        })
 
-    au10y = "—"  # hard to fetch reliably without a paid API; leave as em dash
-    rba   = RBA_CASH_RATE_OVERRIDE or "—"
-    prob  = RBA_NEXT_MOVE_PROB_OVR or "—"
+    # de-dupe by URL
+    seen, deduped = set(), []
+    for it in out:
+        if it["url"] in seen: continue
+        seen.add(it["url"]); deduped.append(it)
 
-    # one-liner take
-    # Simple rule-based vibe read
-    ax = asx2k.get("pct")
-    ap = areit.get("pct")
-    if ax is not None and ap is not None:
-        if ax > 0 and ap > 0:
-            take = "Risk-on; lenders bid; dev feasos ease a touch."
-        elif ax < 0 and ap < 0:
-            take = "Risk-off; yields bite; expect quieter bids."
-        else:
-            take = "Mixed tape; stock pickers’ day; watch debt costs."
-    else:
-        take = "Mixed open; watch rates and credit prints."
+    # sort by bucket, then newest
+    deduped.sort(key=lambda r: (CAT_INDEX.get(r["category_main"], 999), r["published_at"]), reverse=True)
+    return deduped
 
-    payload = {
-        "ASX200": fmt_pct(asx2k.get("pct")),
-        "A-REIT": fmt_pct(areit.get("pct")),
-        "AUDUSD": fmt_price(aud.get("price")),
-        "AU10Y":  au10y,
-        "RBA_Cash_Rate": rba,
-        "Next_Move_Prob": prob,
-        "take": take
-    }
-    return payload
-
-def write_macro_feed():
-    p = macro_fetch()
-    now_rfc = au_now().strftime("%a, %d %b %Y %H:%M:%S +1000")
-    title = f"{NEWSLETTER_NAME}: Macro in a Minute"
-    body_html = f"""
-<p><strong>ASX200:</strong> {p['ASX200']} &nbsp; | &nbsp; <strong>A-REIT:</strong> {p['A-REIT']} &nbsp; | &nbsp;
-<strong>AUDUSD:</strong> {p['AUDUSD']} &nbsp; | &nbsp; <strong>AU 10-yr:</strong> {p['AU10Y']} &nbsp; | &nbsp;
-<strong>RBA cash:</strong> {p['RBA_Cash_Rate']} &nbsp; | &nbsp; <strong>Next move prob:</strong> {p['Next_Move_Prob']}</p>
-<p><em>{p['take']}</em></p>
-""".strip()
-
-    rss = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
-<channel>
-<title>{escape(NEWSLETTER_NAME)} — Macro in a Minute</title>
-<link>{escape(BASE_URL)}</link>
-<description>Tiny daily macro block for Beehiiv. Never empty; em dashes if inputs missing.</description>
-<language>en-au</language>
-<lastBuildDate>{now_rfc}</lastBuildDate>
-<ttl>15</ttl>
-<item>
-<title>Macro in a Minute — {datetime.utcnow().strftime('%Y-%m-%d')}</title>
-<link>{escape(BASE_URL)}</link>
-<guid isPermaLink="false">{escape(BASE_URL)}/macro-{datetime.utcnow().strftime('%Y%m%d')}</guid>
-<pubDate>{now_rfc}</pubDate>
-<description><![CDATA[ {body_html} ]]></description>
-<content:encoded><![CDATA[ {body_html} ]]></content:encoded>
-<category>macro</category>
-</item>
-</channel>
-</rss>
-"""
-    with open("beehiiv_macro.xml", "w", encoding="utf-8") as f:
-        f.write(rss)
-    logging.info("Wrote beehiiv_macro.xml")
-
-# ---- Main write --------------------------------------------------------------
+def write_feed(items, out_path, cats=None):
+    if cats is not None:
+        items = [i for i in items if i["category_main"] in cats]
+    items = items[:MAX_ITEMS_PER_FEED]
+    xml = build_xml(items)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(xml)
+    logging.info("Wrote %s (items=%d)", out_path, len(items))
 
 def main():
-    conn = db()
-    rows = read_recent(conn)
-    if not rows:
-        logging.info("No eligible items; still write macro.")
-        write_macro_feed()
-        # also write an empty top for Beehiiv to accept
-        with open("beehiiv_top.xml","w",encoding="utf-8") as f:
-            f.write(build_rss(f"{NEWSLETTER_NAME} — Top", []))
-        return
+    if not os.path.exists(DB_PATH):
+        logging.info("No DB present; writing empty RSS shells.")
+        items = []
+    else:
+        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+        items = read_recent(conn)
 
-    # GROUP by category
-    by_cat = {}
-    for r in rows:
-        cat = r["category_main"] or "macro"
-        by_cat.setdefault(cat, []).append(r)
-
-    # Top feed (budget ~5 min read)
-    # Sort by (score desc, recency), light publisher bias already in score
-    all_sorted = sorted(rows, key=lambda r: (int(r["score"] or 0), r["published_at"]), reverse=True)
-    bag, total_words = [], 0
-    for r in all_sorted:
-        w = words(r["ai_desc_html"] or "")
-        if total_words + w > TOP_WORD_BUDGET:
-            continue
-        bag.append(r); total_words += w
-    with open("beehiiv_top.xml","w",encoding="utf-8") as f:
-        f.write(build_rss(f"{NEWSLETTER_NAME} — Top", bag))
-    logging.info("Wrote beehiiv_top.xml (items=%d, ~%d words)", len(bag), total_words)
-
-    # Per-category feeds
-    for cat, (label, filename) in CATEGORY_META.items():
-        items = by_cat.get(cat, [])
-        if not items:
-            continue
-        items = sorted(items, key=lambda r: (int(r["score"] or 0), r["published_at"]), reverse=True)
-        # Soft cap per feed: keep it snackable (~600–800 words)
-        picked, wc = [], 0
-        for r in items:
-            w = words(r["ai_desc_html"] or "")
-            if wc + w > 800: 
-                continue
-            picked.append(r); wc += w
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(build_rss(f"{NEWSLETTER_NAME} — {label}", picked))
-        logging.info("Wrote %s (cat=%s, items=%d, ~%d words)", filename, cat, len(picked), wc)
-
-    # Always write macro block
-    write_macro_feed()
+    # all + category feeds
+    for key, cats in GROUPS.items():
+        out = f"{OUT_PREFIX}_{key}.xml" if key != "all" else f"{OUT_PREFIX}_all.xml"
+        write_feed(items, out, cats)
 
 if __name__ == "__main__":
     main()
