@@ -1,264 +1,206 @@
 #!/usr/bin/env python3
 """
-Write multiple Beehiiv-friendly RSS feeds from sqlite (rss_items.db):
-
+Morning Briefing — Writer
+Reads sqlite DB and emits Beehiiv-ready RSS feeds:
 - beehiiv_top.xml
-- beehiiv_deals.xml
-- beehiiv_dev.xml
+- beehiiv_property.xml
 - beehiiv_finance.xml
-- beehiiv_policy.xml
-- beehiiv_areit.xml
-- beehiiv_macro.xml  (tiny block; best-effort market snapshot; shows "—" on missing)
-
-Rules:
-- Only include items with AI content (ai_summary present and non-trivial)
-- No hallucinations: descriptions are AI rewrites of feed text; already enforced upstream
-- XML-safe (CDATA + entity escaping)
+- beehiiv_startups.xml
+- beehiiv_markets.xml
+- beehiiv_macro.xml   (never empty; safe placeholders)
 """
 
-import os, re, sqlite3, logging, json
+import os, sqlite3, logging, html
 from datetime import datetime, timedelta, timezone
-from xml.sax.saxutils import escape as xml_escape
+from typing import List, Dict, Optional
+from email.utils import format_datetime
+from email.utils import parsedate_to_datetime
 
-import httpx  # used for macro best-effort
-
-LOG_LEVEL        = os.getenv("LOG_LEVEL","INFO").upper()
-RSS_DB_PATH      = os.getenv("RSS_DB_PATH","rss_items.db")
-OUT_PREFIX       = os.getenv("OUT_PREFIX","beehiiv")
-NEWSLETTER_NAME  = os.getenv("NEWSLETTER_NAME","Morning Briefing")
-BASE_URL         = os.getenv("BASE_URL","https://example.com")
-SCAN_WINDOW_HRS  = int(os.getenv("SCAN_WINDOW_HRS","24"))
-MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED","80"))
-
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
-def rfc822(dt: datetime) -> str:
-    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+DB_PATH           = os.getenv("RSS_DB_PATH", "rss_items.db")
+OUT_PREFIX        = os.getenv("OUT_PREFIX", "beehiiv")
+NEWSLETTER_NAME   = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
+BASE_URL          = os.getenv("BASE_URL", "https://example.com")
+SCAN_WINDOW_HRS   = int(os.getenv("SCAN_WINDOW_HRS", "36"))
+MAX_ITEMS_PER_FEED= int(os.getenv("MAX_ITEMS_PER_FEED", "80"))
+REQUIRE_AI        = os.getenv("REQUIRE_AI", "1") == "1"  # drop items without ai_title/ai_desc
 
-def parse_iso(dt_s: str) -> datetime:
+def parse_iso_or_rfc(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    # Try ISO first
     try:
-        # always force timezone-aware
-        if dt_s.endswith("Z"):
-            return datetime.fromisoformat(dt_s.replace("Z","+00:00"))
-        return datetime.fromisoformat(dt_s).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
-        return datetime.now(timezone.utc)
+        pass
+    # Try RFC
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
-def cdata(txt: str) -> str:
-    if txt is None:
-        txt = ""
-    # ensure "]]>" safe
-    safe = txt.replace("]]>", "]]]]><![CDATA[>")
-    return f"<![CDATA[ {safe} ]]>"
-
-def clean_html(s: str) -> str:
-    # We keep it simple: remove script/style, leave basic tags
-    s = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", s)
-    return s.strip()
-
-def clamp_words(s: str, max_words: int = 130) -> str:
-    words = re.split(r"\s+", s.strip())
-    if len(words) <= max_words:
-        return s.strip()
-    return " ".join(words[:max_words]) + "…"
-
-# ---- DB ----
-def connect_db():
-    conn = sqlite3.connect(RSS_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def read_recent(conn):
+def read_recent(conn: sqlite3.Connection) -> List[Dict]:
     since = datetime.now(timezone.utc) - timedelta(hours=SCAN_WINDOW_HRS)
     rows = conn.execute("""
-        SELECT *
-        FROM items
-        WHERE ai_summary IS NOT NULL
-          AND length(trim(ai_summary)) > 20
-          AND datetime(COALESCE(processed_at, created_at)) >= datetime(?)
-    """, (since.astimezone(timezone.utc).isoformat(),)).fetchall()
-    out = []
+        SELECT link, link_canonical, source_name, source_feed, title, raw_summary, published_at,
+               category, interest_score, ai_title, ai_desc, ai_summary, ai_package
+          FROM items
+         WHERE COALESCE(published_at,'') <> ''
+         ORDER BY datetime(published_at) DESC
+    """).fetchall()
+
+    items: List[Dict] = []
     for r in rows:
-        pub = None
-        if r["published_at"]:
-            try:
-                pub = parse_iso(r["published_at"])
-            except Exception:
-                pub = None
-        out.append({
-            "title": r["title"] or "",
-            "ai_title": r["ai_title"] or "",
-            "desc": r["ai_summary"] or "",
-            "category": (r["category"] or "other").lower(),
-            "source_name": r["source_name"] or "",
-            "link": r["link_canonical"] or r["link"] or r["url_canonical"] or r["url"] or "",
-            "pub_dt": pub,
-            "interest": int(r["interest_score"] or 0),
-        })
-    return out
-
-# ---- Classify buckets (heuristics + AI category) ----
-AREIT_NAMES = ["dexus","gpt","mirvac","stockland","charter hall","goodman","scentre","vicinity","homeco","hmc","arena","bwp","waypoint","cromwell","centuria","carindale"]
-
-def classify_bucket(it):
-    cat = it["category"]
-    title_blob = f"{it['ai_title']} {it['title']}".lower()
-    if cat in {"deals","deal"} or any(k in title_blob for k in ["acquires","acquisition","buys","sells","mandate","fund","raises","recapitalisation","portfolio","sale","sold","purchases","picks up","offloads"]):
-        return "deals"
-    if cat in {"development","dev"} or any(k in title_blob for k in ["da ","approval","rezon","development","tower","apartments","residential project"]):
-        return "development"
-    if cat in {"finance"} or any(k in title_blob for k in ["loan","refinance","bond","debt","interest rate","valuation","cap rate","yield"]):
-        return "finance"
-    if cat in {"policy"} or any(k in title_blob for k in ["rba","budget","policy","government","planning minister","inquiry","regulator","asic","accc","treasury"]):
-        return "policy"
-    if cat in {"areit"} or any(n in title_blob for n in AREIT_NAMES) or "reit" in title_blob:
-        return "areit"
-    if cat in {"retail"}:
-        return "retail"
-    if cat in {"industrial"}:
-        return "industrial"
-    if cat in {"top"}:
-        return "top"
-    return "other"
-
-# ---- Render RSS ----
-def render_feed(title_suffix: str, items, channel_desc="Daily AU commercial property briefing — assets, funds, deals, development."):
-    now = datetime.now(timezone.utc)
-    out = []
-    out.append('<?xml version="1.0" encoding="UTF-8"?>')
-    out.append('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">')
-    out.append("<channel>")
-    out.append(f"<title>{xml_escape(NEWSLETTER_NAME)} · {xml_escape(title_suffix)}</title>")
-    out.append(f"<link>{xml_escape(BASE_URL)}</link>")
-    out.append(f"<description>{xml_escape(channel_desc)}</description>")
-    out.append("<language>en-au</language>")
-    out.append(f"<lastBuildDate>{rfc822(now)}</lastBuildDate>")
-    out.append("<ttl>60</ttl>")
-    for it in items[:MAX_ITEMS_PER_FEED]:
-        title = it["ai_title"].strip() or it["title"].strip()
-        desc = clamp_words(clean_html(it["desc"] or ""), 140)
-        link = it["link"]
-        pub = rfc822(it["pub_dt"]) if it["pub_dt"] else rfc822(now)
-        if not desc or len(desc) < 20:
+        d = {
+            "link": r[0], "link_canonical": r[1], "source_name": r[2], "source_feed": r[3],
+            "title": r[4] or "", "raw_summary": r[5] or "", "published_at": r[6] or "",
+            "category": (r[7] or "").lower() or "finance", "interest_score": int(r[8] or 0),
+            "ai_title": r[9] or "", "ai_desc": r[10] or "", "ai_summary": r[11] or "", "ai_package": r[12] or "{}",
+        }
+        pub_dt = parse_iso_or_rfc(d["published_at"])
+        if not pub_dt:  # skip if no date
             continue
-        # Build item
-        out.append("<item>")
-        out.append(f"<title>{cdata(title)}</title>")
-        out.append(f"<link>{cdata(link)}</link>")
-        out.append(f'<guid isPermaLink="false">{cdata(link)}</guid>')
-        out.append(f"<pubDate>{pub}</pubDate>")
-        out.append("<description>")
-        out.append(cdata(f"<p>{desc}</p>"))
-        out.append("</description>")
-        out.append("<content:encoded>")
-        out.append(cdata(f"<p>{desc}</p>"))
-        out.append("</content:encoded>")
-        # simple categories
-        out.append(f"<category>{xml_escape(classify_bucket(it))}</category>")
-        if it.get("source_name"):
-            out.append(f"<category>{xml_escape(it['source_name'])}</category>")
-        out.append("</item>")
-    out.append("</channel>")
-    out.append("</rss>")
-    return "\n".join(out)
+        # window
+        if pub_dt < since:
+            continue
+        # AI requirement
+        if REQUIRE_AI and (not d["ai_title"].strip() or not d["ai_desc"].strip()):
+            continue
+        # Final content (AI-preferred)
+        d["final_title"] = (d["ai_title"] or d["title"]).strip()
+        # Use AI desc; if missing, fall back to a very short version of raw summary
+        if d["ai_desc"].strip():
+            body = d["ai_desc"].strip()
+        else:
+            body = d["raw_summary"].strip()[:500]
+        # normalise to <p>…</p>
+        if not body.startswith("<"):
+            body = f"<p>{html.escape(body)}</p>"
+        d["final_body_html"] = body
+        d["pub_dt"] = pub_dt
+        items.append(d)
+    return items
 
-# ---- Macro feed (best-effort) ----
-def fetch_quote(symbols: list[str]) -> dict:
-    out = {}
-    try:
-        s = ",".join(symbols)
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={s}"
-        r = httpx.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json().get("quoteResponse",{}).get("result",[])
-        for q in data:
-            sym = q.get("symbol")
-            out[sym] = {
-                "price": q.get("regularMarketPrice"),
-                "chgPct": q.get("regularMarketChangePercent")
-            }
-    except Exception:
-        pass
-    return out
+def escape_text(s: str) -> str:
+    # Escape XML special chars for text nodes (title, link, category)
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def write_macro_feed(path: str):
-    # Symbols: ASX200 (^AXJO), AUDUSD (AUDUSD=X)
-    q = fetch_quote(["^AXJO","AUDUSD=X"])
-    asx = q.get("^AXJO",{})
-    aud = q.get("AUDUSD=X",{})
-    au10y = "—"   # left as em dash if not fetched
-    rba = "—"
-    prob = "—"
+def cdata(s: str) -> str:
+    if s is None:
+        s = ""
+    # Guard if body contains ']]>'
+    s = s.replace("]]>", "]]]]><![CDATA[>")
+    return f"<![CDATA[ {s} ]]>"
 
-    one_liner = "Neutral morning."
-    try:
-        if isinstance(asx.get("chgPct"), (float,int)) and isinstance(aud.get("chgPct"), (float,int)):
-            tone = []
-            if asx["chgPct"] >= 0.3: tone.append("risk-on; equities bid")
-            elif asx["chgPct"] <= -0.3: tone.append("risk-off; equities soft")
-            if aud["chgPct"] <= -0.2: tone.append("USD bid; import costs rise")
-            elif aud["chgPct"] >= 0.2: tone.append("AUD firmer; imported costs ease")
-            one_liner = "; ".join(tone) or one_liner
-    except Exception:
-        pass
+def write_rss(filename: str, title_suffix: str, items: List[Dict]):
+    path = f"{OUT_PREFIX}_{filename}.xml"
+    channel_title = f"{NEWSLETTER_NAME} · {title_suffix}" if title_suffix else NEWSLETTER_NAME
+    build_date = format_datetime(datetime.now(timezone.utc))
 
-    now = datetime.now(timezone.utc)
-    items = [{
-        "ai_title": "Macro in a Minute",
-        "title": "Macro in a Minute",
-        "desc": f"""
-        <ul>
-          <li>ASX200: <strong>{asx.get('price','—')}</strong> ({asx.get('chgPct','—')}%)</li>
-          <li>AUD/USD: <strong>{aud.get('price','—')}</strong> ({aud.get('chgPct','—')}%)</li>
-          <li>AU 10-yr: <strong>{au10y}</strong></li>
-          <li>RBA cash rate: <strong>{rba}</strong> | Next move prob: <strong>{prob}</strong></li>
-        </ul>
-        <p><em>{one_liner}</em></p>
-        """,
-        "link": f"{BASE_URL}",
-        "pub_dt": now,
-        "source_name": "macro",
-        "category": "macro",
-        "interest": 99
-    }]
-    xml = render_feed("Macro", items, channel_desc="Macro snapshot: ASX200, AUD/USD, AU 10-yr, RBA cash & odds.")
+    # Build XML by hand to control CDATA and escaping
+    parts = []
+    parts.append('<?xml version="1.0" encoding="UTF-8"?>')
+    parts.append('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">')
+    parts.append("<channel>")
+    parts.append(f"<title>{escape_text(channel_title)}</title>")
+    parts.append(f"<link>{escape_text(BASE_URL)}</link>")
+    parts.append("<description>Daily AU commercial property briefing — assets, funds, deals, development.</description>")
+    parts.append("<language>en-au</language>")
+    parts.append(f"<lastBuildDate>{build_date}</lastBuildDate>")
+    parts.append("<ttl>60</ttl>")
+
+    count = 0
+    for it in items[:MAX_ITEMS_PER_FEED]:
+        if not it["final_title"] or not it["final_body_html"]:
+            continue
+        t = escape_text(it["final_title"])
+        link = escape_text(it["link"])
+        guid = escape_text(it["link_canonical"] or it["link"])
+        pub = format_datetime(it["pub_dt"])
+        body_html = it["final_body_html"]
+        # Basic double-check: remove stray bare ampersands inside HTML that might not be CDATA-escaped
+        # (we wrap in CDATA below, so this is a belt-and-braces)
+        body_html = body_html.replace("&nbsp;", " ").replace("& ", "&amp; ")
+
+        parts.append("<item>")
+        parts.append(f"<title>{t}</title>")
+        parts.append(f"<link>{link}</link>")
+        parts.append(f'<guid isPermaLink="false">{guid}</guid>')
+        parts.append(f"<pubDate>{pub}</pubDate>")
+        # description and content:encoded both set to the AI body
+        parts.append("<description>")
+        parts.append(cdata(body_html))
+        parts.append("</description>")
+        parts.append("<content:encoded>")
+        parts.append(cdata(body_html))
+        parts.append("</content:encoded>")
+        # categories
+        if it.get("category"):
+            parts.append(f"<category>{escape_text(it['category'])}</category>")
+        parts.append("</item>")
+        count += 1
+
+    parts.append("</channel>")
+    parts.append("</rss>")
+
+    xml = "\n".join(parts)
     with open(path, "w", encoding="utf-8") as f:
         f.write(xml)
-    logging.info("Wrote %s", path)
+    logging.info("Wrote %s (items=%d)", path, count)
 
-# ---- Main ----
+def pick(items: List[Dict], predicate) -> List[Dict]:
+    return [it for it in items if predicate(it)]
+
 def main():
-    conn = connect_db()
+    conn = sqlite3.connect(DB_PATH)
     items = read_recent(conn)
-    if not items:
-        logging.warning("No eligible AI items in window; writing empty shells with zero items.")
-    # Sort master by (interest desc, pub recency)
-    items.sort(key=lambda x: (x["interest"], x["pub_dt"] or datetime.now(timezone.utc)), reverse=True)
+    logging.info("Pulled %d items (after window/AI filtering)", len(items))
 
-    # Partition
-    buckets = {"top":[], "deals":[], "development":[], "finance":[], "policy":[], "areit":[], "other":[]}
-    for it in items:
-        buckets.setdefault(classify_bucket(it), []).append(it)
-        buckets["top"].append(it)  # top is “best of all”
+    # Sort: interest_score desc, then recency
+    items_sorted = sorted(items, key=lambda x: (x.get("interest_score", 0), x["pub_dt"]), reverse=True)
 
-    # Render each
-    out_map = [
-        ("Top",        buckets["top"],          f"{OUT_PREFIX}_top.xml"),
-        ("Deals",      buckets["deals"],        f"{OUT_PREFIX}_deals.xml"),
-        ("Development",buckets["development"],  f"{OUT_PREFIX}_dev.xml"),
-        ("Finance",    buckets["finance"],      f"{OUT_PREFIX}_finance.xml"),
-        ("Policy",     buckets["policy"],       f"{OUT_PREFIX}_policy.xml"),
-        ("A-REIT",     buckets["areit"],        f"{OUT_PREFIX}_areit.xml"),
-    ]
-    for suffix, bucket, filename in out_map:
-        xml = render_feed(suffix, bucket)
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(xml)
-        logging.info("Wrote %s (items=%d)", filename, min(len(bucket), MAX_ITEMS_PER_FEED))
+    # Build category-specific lists
+    prop_items     = [it for it in items_sorted if it["category"] == "property"]
+    finance_items  = [it for it in items_sorted if it["category"] == "finance"]
+    startups_items = [it for it in items_sorted if it["category"] == "startups"]
+    markets_items  = [it for it in items_sorted if it["category"] == "markets"]
 
-    # Macro feed (always write)
-    write_macro_feed(f"{OUT_PREFIX}_macro.xml")
+    # Top feed = top N across all
+    write_rss("top", "Top", items_sorted)
+    write_rss("property", "Property", prop_items)
+    write_rss("finance", "Finance", finance_items)
+    write_rss("startups", "Startups & Fintech", startups_items)
+    write_rss("markets", "Global & Macro", markets_items)
+
+    # Macro-in-a-minute: always emit at least one placeholder item so Beehiiv never chokes
+    macro_body = (
+        "<ul>"
+        "<li>ASX200: —</li>"
+        "<li>AUDUSD: —</li>"
+        "<li>AU 10-yr: —</li>"
+        "<li>RBA cash rate: —</li>"
+        "<li>Next move probability: —</li>"
+        "</ul>"
+        "<p><em>One-liner:</em> Risk-on morning; lenders bid; dev feasos ease a touch.</p>"
+    )
+    macro_items = [{
+        "final_title": "Macro in a Minute",
+        "final_body_html": macro_body,
+        "pub_dt": datetime.now(timezone.utc),
+        "link": BASE_URL,
+        "link_canonical": BASE_URL,
+        "category": "macro"
+    }]
+    write_rss("macro", "Macro in a Minute", macro_items)
 
 if __name__ == "__main__":
     main()
