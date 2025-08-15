@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced Beehiiv Feed Writer with 100x More Engaging Content
-- Maximum engagement newsletter summary
-- Priority-based content organization
-- Rich HTML formatting with psychological triggers
-- Enhanced visual presentation
+QUICK FIX - Enhanced Beehiiv Feed Writer 
+Replace your current write_beehiiv_feed.py with this version
 """
 
 import os, sqlite3, html, re, logging
@@ -13,12 +10,10 @@ from typing import List, Dict, Any, Tuple
 
 RSS_DB_PATH = os.getenv("RSS_DB_PATH", "rss_items.db")
 OUT_PATH = os.getenv("OUT_PATH", "beehiiv.xml")
-NEWSLETTER = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
+NEWSLETTER = os.getenv("NEWSLETTER_NAME", "Property Intelligence Network")
 BASE_URL = os.getenv("BASE_URL", "https://mwhiteoak.github.io/morningBrief")
 SCAN_WINDOW_HRS = int(os.getenv("SCAN_WINDOW_HRS", "24"))
 TZ = timezone(timedelta(hours=10))
-
-logging.basicConfig(level=logging.INFO)
 
 def esc(t: str) -> str:
     return html.escape(t or "", quote=True)
@@ -26,8 +21,8 @@ def esc(t: str) -> str:
 def cdata(s: str) -> str:
     return "<![CDATA[" + (s or "").replace("]]>", "]]]]><![CDATA[>") + "]]>"
 
-def get_newsletter_metadata(conn: sqlite3.Connection) -> Tuple[str, str, float]:
-    """Get latest headline, subhead, and money tracked"""
+def get_enhanced_metadata(conn: sqlite3.Connection) -> Tuple[str, str, float]:
+    """Get AI-generated headline, subhead, and money tracked"""
     try:
         cur = conn.execute("""
             SELECT headline, subhead, total_money_tracked 
@@ -35,25 +30,25 @@ def get_newsletter_metadata(conn: sqlite3.Connection) -> Tuple[str, str, float]:
             ORDER BY created_at DESC LIMIT 1
         """)
         result = cur.fetchone()
-        if result:
+        if result and result[0] and result[0] != "Morning Property Brief":
             return (
-                result[0] or "🚨 Property Intelligence Alert",
-                result[1] or "Exclusive deals and insider moves",
+                result[0],
+                result[1] or "Exclusive intel from Australia's property intelligence network",
                 result[2] or 0.0
             )
     except sqlite3.OperationalError:
         pass
     
-    return "🚨 Property Intelligence Alert", "Exclusive deals and insider moves", 0.0
+    return "🚨 Property Intelligence Alert", "Exclusive deals and market moves you won't find anywhere else", 0.0
 
 def calculate_engagement_score(item: Dict[str, Any]) -> int:
-    """Calculate engagement potential"""
+    """Calculate engagement potential of content"""
     title = (item.get('title') or '').lower()
     desc = (item.get('desc') or '').lower()
     
     score = 0
     
-    # Money = engagement
+    # Money = massive engagement
     if re.search(r'\$[\d,.]+ ?billion', desc, re.IGNORECASE):
         score += 15
     elif re.search(r'\$[\d,.]+ ?million', desc, re.IGNORECASE):
@@ -64,16 +59,17 @@ def calculate_engagement_score(item: Dict[str, Any]) -> int:
     # Big names = authority
     major_players = [
         'blackstone', 'brookfield', 'charter hall', 'goodman', 'gpt', 
-        'mirvac', 'stockland', 'westfield', 'lendlease', 'dexus', 'vicinity'
+        'mirvac', 'stockland', 'westfield', 'lendlease', 'dexus', 'vicinity',
+        'scentre', 'homeco', 'elanor'
     ]
     for player in major_players:
-        if player in desc:
+        if player in desc or player in title:
             score += 5
     
     # Urgent keywords = clicks
     urgent_words = [
         'breaking', 'exclusive', 'secret', 'leaked', 'emergency', 'crisis',
-        'surge', 'plunge', 'crash', 'soar', 'alert', 'warning'
+        'surge', 'plunge', 'crash', 'soar', 'alert', 'warning', 'drops', 'nets'
     ]
     for word in urgent_words:
         if word in title or word in desc:
@@ -82,41 +78,81 @@ def calculate_engagement_score(item: Dict[str, Any]) -> int:
     # Transaction words = relevance
     transaction_words = [
         'acquires', 'sells', 'buys', 'divests', 'merger', 'takeover', 
-        'transaction', 'deal', 'purchase', 'sale'
+        'transaction', 'deal', 'purchase', 'sale', 'offloads', 'drops'
     ]
     for word in transaction_words:
-        if word in desc:
+        if word in desc or word in title:
             score += 4
-    
-    # Urgency score from AI
-    score += item.get('urgency_score', 0)
     
     return score
 
-def fetch_prioritized_items(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """Fetch and prioritize items by engagement potential"""
+def enhance_title_for_maximum_engagement(title: str, engagement_score: int) -> str:
+    """Add maximum engagement multipliers to titles"""
+    
+    # Don't double-enhance
+    if any(emoji in title for emoji in ['🚨', '🔥', '💥', '⚡', '💰', '📈']):
+        return title
+    
+    if engagement_score >= 15:
+        if not title.startswith(('🚨', '🔥', '💥')):
+            return f"🚨 {title}"
+    elif engagement_score >= 10:
+        if not title.startswith(('⚡', '💰', '🔥')):
+            return f"⚡ {title}"
+    elif engagement_score >= 5:
+        if not title.startswith(('📈', '🎯', '💰')):
+            return f"💰 {title}"
+    
+    return title
+
+def enhance_description_for_engagement(desc: str, source: str, engagement_score: int) -> str:
+    """Add engagement multipliers to descriptions"""
+    if len(desc) < 50:
+        return desc
+    
+    enhanced_desc = desc
+    
+    # Add strategic context based on engagement level
+    if engagement_score >= 15:
+        if not desc.endswith('.'):
+            enhanced_desc += '.'
+        enhanced_desc += " <strong>🎯 Critical intelligence for major players.</strong>"
+    elif engagement_score >= 10:
+        if not desc.endswith('.'):
+            enhanced_desc += '.'
+        enhanced_desc += " <strong>📈 Significant market implications ahead.</strong>"
+    elif engagement_score >= 5:
+        if not desc.endswith('.'):
+            enhanced_desc += '.'
+        enhanced_desc += " <strong>💡 Smart money is watching this closely.</strong>"
+    
+    return enhanced_desc
+
+def fetch_and_prioritize_items(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Fetch items with AI enhancements and prioritize by engagement"""
     since = datetime.now(tz=TZ) - timedelta(hours=SCAN_WINDOW_HRS)
     
     try:
         # Try with AI columns first
         cur = conn.execute("""
             SELECT source_name, link, link_canonical, ai_title, ai_desc, ai_tags, 
-                   published_at, urgency_score
+                   published_at, urgency_score, title, summary
             FROM items 
             WHERE relevant=1 AND ai_desc IS NOT NULL AND length(ai_desc) > 40
             ORDER BY published_at DESC
         """)
         rows = cur.fetchall()
         use_ai_columns = True
-        logging.info(f"Found {len(rows)} relevant items with AI processing")
+        logging.info(f"Found {len(rows)} AI-enhanced items")
     except sqlite3.OperationalError:
         # Fall back to basic columns
         cur = conn.execute("""
             SELECT source_name, link, link_canonical, title, summary, '', 
-                   published_at, 0
+                   published_at, 0, title, summary
             FROM items 
             WHERE length(summary) > 40
             ORDER BY published_at DESC
+            LIMIT 50
         """)
         rows = cur.fetchall()
         use_ai_columns = False
@@ -134,8 +170,9 @@ def fetch_prioritized_items(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         
         # Handle both AI and basic column formats
         if use_ai_columns:
-            title = r[3] or r[0]  # ai_title or source fallback
-            desc = r[4] or ""     # ai_desc
+            # Use AI-enhanced content if available, fallback to original
+            title = r[3] or r[8] or r[0]  # ai_title or original title or source
+            desc = r[4] or r[9] or ""     # ai_desc or original summary
             tags = (r[5] or "").split(",") if r[5] else []
             urgency_score = r[7] or 0
         else:
@@ -150,7 +187,7 @@ def fetch_prioritized_items(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             "canon": r[2] or r[1] or "",
             "title": title,
             "desc": desc,
-            "tags": tags,
+            "tags": [t.strip() for t in tags if t.strip()],
             "pub": pub,
             "urgency_score": urgency_score
         }
@@ -163,44 +200,11 @@ def fetch_prioritized_items(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     items.sort(key=lambda x: (x["engagement_score"], x["pub"]), reverse=True)
     
     logging.info(f"Prioritized {len(items)} items by engagement score")
+    if items:
+        top_scores = [item['engagement_score'] for item in items[:5]]
+        logging.info(f"Top 5 engagement scores: {top_scores}")
+    
     return items
-
-def enhance_title_for_feed(title: str, engagement_score: int) -> str:
-    """Add visual engagement multipliers to titles"""
-    if engagement_score >= 15:
-        if not title.startswith(('🚨', '🔥', '💥')):
-            title = f"🚨 {title}"
-    elif engagement_score >= 10:
-        if not title.startswith(('📈', '⚡', '💰')):
-            title = f"⚡ {title}"
-    elif engagement_score >= 5:
-        if not title.startswith(('📊', '🎯')):
-            title = f"📊 {title}"
-    
-    return title
-
-def enhance_description_for_feed(desc: str, source: str, engagement_score: int) -> str:
-    """Add engagement multipliers to descriptions"""
-    if len(desc) < 50:
-        return desc
-    
-    enhanced_desc = desc
-    
-    # Add strategic context based on engagement level
-    if engagement_score >= 15:
-        if not desc.endswith('.'):
-            enhanced_desc += '.'
-        enhanced_desc += " 🎯 <strong>High-impact intelligence for major players.</strong>"
-    elif engagement_score >= 10:
-        if not desc.endswith('.'):
-            enhanced_desc += '.'
-        enhanced_desc += " 📈 <strong>Significant market implications ahead.</strong>"
-    elif engagement_score >= 5:
-        if not desc.endswith('.'):
-            enhanced_desc += '.'
-        enhanced_desc += " 💡 <strong>Smart money is watching this closely.</strong>"
-    
-    return enhanced_desc
 
 def create_maximum_engagement_summary(items: List[Dict[str, Any]], headline: str, 
                                    subhead: str, total_money: float) -> str:
@@ -244,7 +248,7 @@ def create_maximum_engagement_summary(items: List[Dict[str, Any]], headline: str
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; text-align: center;">
                 <div>
                     <div style="font-size: 28px; font-weight: bold; color: #FFD700;">⚡ {total_items}</div>
-                    <div style="font-size: 12px; color: #F0F8FF;">EXCLUSIVE STORIES</div>
+                    <div style="font-size: 12px; color: #F0F8FF;">INTELLIGENCE STORIES</div>
                 </div>
                 <div>
                     <div style="font-size: 28px; font-weight: bold; color: #FFD700;">🔥 {len(high_impact_items)}</div>
@@ -252,26 +256,13 @@ def create_maximum_engagement_summary(items: List[Dict[str, Any]], headline: str
                 </div>
                 <div>
                     <div style="font-size: 28px; font-weight: bold; color: #FFD700;">💰 ${money_flow_today:,.0f}M</div>
-                    <div style="font-size: 12px; color: #F0F8FF;">MONEY FLOW TRACKED</div>
+                    <div style="font-size: 12px; color: #F0F8FF;">MONEY TRACKED</div>
                 </div>
             </div>
         </div>
         
-        <div style="background: rgba(255,215,0,0.1); padding: 15px; border-left: 4px solid #FFD700; margin: 20px 0;">
-            <h3 style="color: #FFD700; margin: 0 0 10px 0; font-size: 18px;">🎯 PRIORITY INTELLIGENCE</h3>
-            <p style="margin: 5px 0; font-size: 14px;">
-                <strong>🕐 Generated:</strong> {now.strftime('%I:%M %p AEST, %d %B %Y')}
-            </p>
-            <p style="margin: 5px 0; font-size: 14px;">
-                <strong>🔐 Classification:</strong> Subscriber-Only Intelligence
-            </p>
-            <p style="margin: 5px 0; font-size: 14px;">
-                <strong>📊 Coverage:</strong> Australian Commercial Property Ecosystem
-            </p>
-        </div>
-        
         <div style="margin: 20px 0;">
-            <h3 style="color: #FFD700; margin: 0 0 15px 0; font-size: 18px;">🚨 TODAY'S POWER MOVES</h3>
+            <h3 style="color: #FFD700; margin: 0 0 15px 0; font-size: 18px;">🚨 TODAY'S PRIORITY INTELLIGENCE</h3>
     """
     
     # Top 5 stories with maximum engagement formatting
@@ -298,11 +289,13 @@ def create_maximum_engagement_summary(items: List[Dict[str, Any]], headline: str
             priority_label = "STANDARD"
             border_color = "#CCCCCC"
         
+        enhanced_title = enhance_title_for_maximum_engagement(title, engagement_score)
+        
         summary_content += f"""
             <div style="background: rgba(255,255,255,0.05); padding: 15px; margin: 10px 0; border-left: 3px solid {border_color}; border-radius: 5px;">
                 <div style="display: flex; align-items: center; margin-bottom: 8px;">
                     <span style="font-size: 20px; margin-right: 8px;">{priority_emoji}</span>
-                    <strong style="color: #FFD700; font-size: 16px;">{esc(title)}</strong>
+                    <strong style="color: #FFD700; font-size: 16px;">{esc(enhanced_title)}</strong>
                     <span style="background: {border_color}; color: black; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-left: 10px; font-weight: bold;">
                         {priority_label}
                     </span>
@@ -328,7 +321,7 @@ def create_maximum_engagement_summary(items: List[Dict[str, Any]], headline: str
         
         <div style="text-align: center; margin-top: 25px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
             <p style="margin: 0; font-size: 14px; color: #B0C4DE; font-weight: bold;">
-                🏢 Australian Commercial Property Intelligence Network
+                🏢 Australian Property Intelligence Network
             </p>
             <p style="margin: 5px 0 0 0; font-size: 12px; color: #87CEEB; font-style: italic;">
                 "Where Smart Money Gets Smarter" ™
@@ -362,12 +355,12 @@ def create_enhanced_item_html(item: Dict[str, Any]) -> str:
         badge = "📰 STANDARD"
         badge_color = "#6c757d"
     
-    enhanced_title = enhance_title_for_feed(item['title'], engagement_score)
-    enhanced_desc = enhance_description_for_feed(item['desc'], item['source'], engagement_score)
+    enhanced_title = enhance_title_for_maximum_engagement(item['title'], engagement_score)
+    enhanced_desc = enhance_description_for_engagement(item['desc'], item['source'], engagement_score)
     
     return f"""
     <div style="{container_style} padding: 20px; margin: 15px 0; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
-        <div style="display: flex; justify-content: between; align-items: center; margin-bottom: 10px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
             <span style="background: {badge_color}; color: white; padding: 4px 8px; border-radius: 15px; font-size: 11px; font-weight: bold;">
                 {badge}
             </span>
@@ -454,7 +447,7 @@ def write_enhanced_feed(items: List[Dict[str, Any]], headline: str, subhead: str
             cats += "    <category>important</category>\n"
         
         enhanced_html = create_enhanced_item_html(item)
-        enhanced_title = enhance_title_for_feed(item['title'], engagement_score)
+        enhanced_title = enhance_title_for_maximum_engagement(item['title'], engagement_score)
         
         items_xml.append(f"""<item>
     <title>{esc(enhanced_title)}</title>
@@ -476,14 +469,13 @@ def main():
     conn = sqlite3.connect(RSS_DB_PATH)
     
     # Get AI-generated metadata
-    headline, subhead, total_money = get_newsletter_metadata(conn)
+    headline, subhead, total_money = get_enhanced_metadata(conn)
     
     # Get prioritized items
-    items = fetch_prioritized_items(conn)
+    items = fetch_and_prioritize_items(conn)
     
     if not items:
         logging.warning("No relevant items found for feed generation")
-        # Create minimal feed with placeholder
         items = [{
             'source': 'System',
             'link': BASE_URL,
