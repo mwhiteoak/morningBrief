@@ -45,7 +45,6 @@ jobs:
           OAI_MAX_RETRIES: "4"
           MAX_WORKERS: "8"
           FEED_TIMEOUT: "15"
-          MIN_SCORE_FOR_AI: "5"
         run: |
           set -euxo pipefail
           python rss_analyzer.py
