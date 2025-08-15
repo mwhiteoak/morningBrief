@@ -2,7 +2,7 @@
 """
 RSS Feed Analyzer for A-REIT CEO/COO - Executive Intelligence Platform
 Monitors RSS feeds, evaluates content with OpenAI, and sends daily emails
-OPTIMIZED VERSION - 3x Daily Incremental Processing with Plain Text Email
+ENHANCED VERSION - Shaan Puri Style with HTML Formatting
 """
 
 import feedparser
@@ -26,6 +26,7 @@ from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
+import random
 
 # Import RSS feeds from separate file
 from feeds import RSS_FEEDS
@@ -904,605 +905,157 @@ See README.md for detailed setup instructions.
         
         return items
 
-    def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
-        """Generate plain text formatted email that works across all email clients - with enhanced filtering"""
-        logging.info(f"Starting email generation from {len(items)} items...")
+    def get_spicy_subject_suffix(self, items: List[Tuple]) -> str:
+        """Generate a Shaan Puri style subject line suffix based on top news"""
+        if not items or len(items) == 0:
+            return "The Market's Moving (You Should Too)"
         
-        if not items:
-            logging.warning("No items provided for email generation")
-            return None
+        top_item = items[0]
+        title = top_item[0].lower()
         
-        start_time = time.time()
-        
+        # Generate contextual subject lines
+        if 'interest rate' in title or 'rba' in title:
+            return "Rate Cuts = Property Party 🎉"
+        elif 'crash' in title or 'fall' in title:
+            return "Blood in the Streets (Time to Buy?)"
+        elif 'boom' in title or 'surge' in title:
+            return "Everyone's Getting Rich (Except You?)"
+        elif any(word in title for word in ['ai', 'technology', 'digital']):
+            return "Robots Are Coming for Real Estate"
+        elif 'china' in title or 'asia' in title:
+            return "The Dragon Moves (Markets Follow)"
+        else:
+            return "Big Moves You're Missing"
+
+    def get_ai_powered_opening(self, sentiment: str, critical_count: int, top_items: List[Tuple]) -> str:
+        """Generate AI-powered custom opening based on actual news"""
         try:
-            # MUCH MORE INCLUSIVE FILTERING - include everything potentially relevant
-            filtered_items = []
-            seen_titles = set()
+            # Build context from top items
+            news_context = ""
+            for i, item in enumerate(top_items[:3], 1):
+                news_context += f"{i}. {item[0]}\n"
             
-            for item in items:
-                title, link, description, score, summary, source_name = item[:6]
-                
-                # Exclude specific AFR commercial real estate URL
-                if link == "https://www.afr.com/topic/commercial-real-estate-5vu":
-                    logging.debug(f"Skipping AFR commercial real estate topic page: {title[:50]}...")
-                    continue
-                
-                # Combine title and description for comprehensive filtering
-                combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
-                
-                # Skip obvious errors - be very permissive
-                if any(phrase in title.lower() for phrase in [
-                    'not found', 'sign up to rss.app', 'error 404', 'access denied', 
-                    'page not found', 'forbidden', 'unauthorized'
-                ]):
-                    continue
-                
-                # Skip items with image summaries
-                if (summary and summary.strip().startswith('<img src=')) or (description and description.strip().startswith('<img src=')):
-                    logging.debug(f"Skipping item with image summary: {title[:50]}...")
-                    continue
-                
-                # Skip sensitive content not relevant for commercial property intelligence
-                sensitive_keywords = [
-                    'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death', 'killed',
-                    'sexual assault', 'rape', 'domestic violence', 'suicide', 'homicide',
-                    'overdose', 'fatal', 'shooting', 'stabbing', 'assault', 'kidnapping',
-                    'trafficking', 'abuse', 'violence', 'crash victim', 'car accident',
-                    'plane crash', 'drowning', 'fire death', 'explosion death'
-                ]
-                
-                if any(keyword in combined_text for keyword in sensitive_keywords):
-                    logging.debug(f"Skipping sensitive content: {title[:50]}...")
-                    continue
-                
-                # Skip exact duplicates only
-                title_key = title.lower().strip()
-                if title_key in seen_titles:
-                    continue
-                seen_titles.add(title_key)
-                
-                # Include ALL items with score >= 4 (much more inclusive)
-                if score >= 4:
-                    filtered_items.append(item)
-            
-            logging.info(f"Filtered items for email: {len(filtered_items)} (enhanced filtering applied)")
-            
-            if not filtered_items:
-                logging.warning("No items remaining after filtering")
-                return None
-            
-            # Generate email with timeout protection
-            email_content = self.build_plain_text_email(filtered_items)
-            
-            elapsed_time = time.time() - start_time
-            logging.info(f"Email generation completed in {elapsed_time:.1f} seconds")
-            
-            return email_content
-            
-        except Exception as e:
-            elapsed_time = time.time() - start_time
-            logging.error(f"Email generation failed after {elapsed_time:.1f} seconds: {e}")
-            
-            # Return a simple fallback email
-            return self.generate_fallback_email(items)
-    
-    def generate_fallback_email(self, items: List[Tuple]) -> str:
-        """Generate a simple fallback email if main generation fails"""
-        logging.info("Generating fallback email due to main generation failure")
-        
-        current_date = datetime.now().strftime('%B %d, %Y')
-        current_time = datetime.now().strftime('%I:%M %p AEST')
-        
-        # Filter and sort items simply
-        filtered_items = [item for item in items if item[3] >= 4][:20]  # Limit to 20 items
-        sorted_items = sorted(filtered_items, key=lambda x: x[3], reverse=True)
-        
-        email_content = f"""🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING
-{current_date} • {current_time}
+            prompt = f"""You're a sharp, witty property market analyst with personality like Shaan Puri. 
+Write a 2-3 sentence opening hook for today's property intelligence briefing.
 
-===============================================================================
+Market sentiment: {sentiment}
+Critical alerts: {critical_count}
+Top headlines:
+{news_context}
 
-📊 EXECUTIVE SUMMARY
-
-Total Items Analyzed: {len(sorted_items)}
-Status: FALLBACK MODE - Simplified Analysis
-
-Due to processing limitations, this briefing contains simplified analysis.
-For full AI-powered insights, please check the system logs.
-
-===============================================================================
-
-📋 TOP PRIORITY ITEMS
-
-"""
-        
-        # Add top items without AI analysis
-        for i, item in enumerate(sorted_items[:10], 1):
-            title, link, description, score, summary, source = item[:6]
-            
-            clean_title = title.strip()
-            clean_desc = (description or summary or "")[:150].strip()
-            
-            email_content += f"""{i}. {clean_title}
-SCORE: {score}/10 | SOURCE: {source}
-LINK: {link}
-
-SUMMARY: {clean_desc}...
-
--------------------------------------------------------------------------------
-
-"""
-        
-        email_content += f"""===============================================================================
-
-🤖 AI-POWERED INTELLIGENCE PLATFORM
-
-Generated: {current_time} AEST (Fallback Mode)
-Items Processed: {len(sorted_items)}
-Status: Simplified analysis due to processing constraints
-
-💼 Connect with Matt Whiteoak
-LinkedIn: https://www.linkedin.com/in/mattwhiteoak
-
-===============================================================================
-"""
-        
-        return email_content
-
-    def build_plain_text_email(self, items: List[Tuple]) -> str:
-        """Build clean plain text email that works across ALL email clients - with global AI limit"""
-        
-        logging.info(f"Building plain text email for {len(items)} items...")
-        
-        current_date = datetime.now().strftime('%B %d, %Y')
-        current_time = datetime.now().strftime('%I:%M %p AEST')
-        
-        # Sort items by score (highest first)
-        sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
-        
-        # Group items by priority for better organization
-        critical_items = [item for item in sorted_items if item[3] >= 8]
-        high_items = [item for item in sorted_items if item[3] == 7]
-        medium_items = [item for item in sorted_items if item[3] == 6]
-        normal_items = [item for item in sorted_items if item[3] == 5]
-        other_items = [item for item in sorted_items if item[3] == 4]
-        
-        # Calculate summary stats
-        total_items = len(sorted_items)
-        critical_count = len(critical_items)
-        high_count = len(high_items)
-        medium_count = len(medium_items)
-        total_high_priority = critical_count + high_count
-        total_ai_eligible = critical_count + high_count + medium_count  # Now includes medium priority
-        sentiment = self.calculate_simple_sentiment(sorted_items)
-        
-        logging.info(f"Email stats: {total_items} total, {critical_count} critical, {high_count} high, {medium_count} medium priority")
-        logging.info(f"Total AI-eligible items (score ≥6): {total_ai_eligible}")
-        
-        # GLOBAL AI LIMIT: Prioritize AI for high-priority items first, then medium priority
-        global_ai_limit = 50  # Increased limit to accommodate medium priority items
-        self.global_ai_calls_used = 0
-        
-        # Build plain text email (no markdown)
-        email_content = f"""🏢 COMMERCIAL PROPERTY INTELLIGENCE BRIEFING
-{current_date} • {current_time}
-
-===============================================================================
-
-📊 EXECUTIVE SUMMARY
-
-Total Items Analyzed: {total_items}
-Critical Priority: {critical_count} 
-High Priority: {high_count}
-Medium Priority: {medium_count}
-Total AI-Eligible Items: {total_ai_eligible}
-Market Sentiment: {sentiment}
-
-{self.generate_plain_text_executive_summary(sorted_items[:5], sentiment)}
-
-===============================================================================
-
-"""
-
-        # Add each priority section with progress logging
-        try:
-            if critical_items:
-                logging.info(f"Processing {len(critical_items)} critical items...")
-                email_content += f"""🚨 CRITICAL PRIORITY ITEMS ({len(critical_items)})
-
-{self.generate_plain_text_news_section_with_global_limit(critical_items, global_ai_limit)}
-
-===============================================================================
-
-"""
-
-            if high_items:
-                logging.info(f"Processing {len(high_items)} high priority items...")
-                email_content += f"""🔴 HIGH PRIORITY ITEMS ({len(high_items)})
-
-{self.generate_plain_text_news_section_with_global_limit(high_items, global_ai_limit)}
-
-===============================================================================
-
-"""
-
-            if medium_items:
-                logging.info(f"Processing {len(medium_items)} medium priority items...")
-                email_content += f"""🟡 MEDIUM PRIORITY ITEMS ({len(medium_items)})
-
-{self.generate_plain_text_news_section_with_global_limit(medium_items, global_ai_limit)}
-
-===============================================================================
-
-"""
-
-            if normal_items:
-                logging.info(f"Processing {len(normal_items)} normal priority items...")
-                email_content += f"""🟢 NORMAL PRIORITY ITEMS ({len(normal_items)})
-
-{self.generate_plain_text_news_section_with_global_limit(normal_items, global_ai_limit)}
-
-===============================================================================
-
-"""
-
-            if other_items:
-                logging.info(f"Processing {len(other_items)} other relevant items...")
-                email_content += f"""📋 OTHER RELEVANT ITEMS ({len(other_items)})
-
-{self.generate_plain_text_news_section_with_global_limit(other_items, global_ai_limit)}
-
-===============================================================================
-
-"""
-        
-        except Exception as e:
-            logging.error(f"Error generating email sections: {e}")
-            # Add fallback content if section generation fails
-            email_content += f"""⚠️ ERROR IN EMAIL GENERATION
-
-An error occurred while generating detailed analysis for some items.
-{len(sorted_items)} items were found but detailed analysis failed.
-
-Please check the logs for more details.
-
-===============================================================================
-
-"""
-        
-        # Add footer with AI usage stats
-        email_content += f"""🤖 AI-POWERED INTELLIGENCE PLATFORM
-
-Generated: {current_time} AEST
-Sources Analyzed: {len(set(item[5] for item in sorted_items)) if sorted_items else 0}
-AI Processing: OpenAI GPT-4o with Enhanced Market Context Analysis
-AI Calls Used: {getattr(self, 'global_ai_calls_used', 0)}/{global_ai_limit}
-AI Priority: Critical (≥8) > High (7) > Medium (6) > Others (≤5)
-Intelligence Threshold: Score ≥ 4/10
-Content Filters: AFR topic pages, image summaries, sensitive content
-
-💼 Connect with Matt Whiteoak
-LinkedIn: https://www.linkedin.com/in/mattwhiteoak
-
-===============================================================================
-"""
-        
-        logging.info(f"Completed email generation: {len(email_content)} characters, AI calls: {getattr(self, 'global_ai_calls_used', 0)}/{global_ai_limit}")
-        return email_content
-
-    def generate_plain_text_news_section_with_global_limit(self, items: List[Tuple], global_limit: int) -> str:
-        """Generate news items with global AI limit tracking and custom medium priority analysis"""
-        if not items:
-            return "No items in this category."
-        
-        text_content = ""
-        
-        # Initialize global counter if not exists
-        if not hasattr(self, 'global_ai_calls_used'):
-            self.global_ai_calls_used = 0
-            
-        logging.info(f"Generating section for {len(items)} items (Global AI: {self.global_ai_calls_used}/{global_limit})")
-        
-        for i, item in enumerate(items, 1):
-            title, link, description, score, summary, source = item[:6]
-            
-            # Clean up title and description - exclude image summaries
-            clean_title = title.strip()
-            clean_desc = (description or summary or "")[:200].strip()
-            
-            # Skip items with image summaries
-            if clean_desc.startswith('<img src='):
-                clean_desc = ""
-            
-            if clean_desc:
-                clean_desc = clean_desc.replace('\n', ' ').replace('\r', ' ')
-                # Remove HTML tags
-                clean_desc = re.sub('<[^<]+?>', '', clean_desc)
-            
-            # Generate context with global AI limit and custom medium priority handling
-            try:
-                # Use AI for high-priority items (score ≥ 7) OR medium priority items (score 6) if AI available
-                if score >= 7 and self.global_ai_calls_used < global_limit:
-                    relevance = self.generate_ai_market_context(title, description, score)
-                    self.global_ai_calls_used += 1
-                    logging.debug(f"Used AI for item {i} (score {score}) - Global AI: {self.global_ai_calls_used}/{global_limit}")
-                elif score == 6 and self.global_ai_calls_used < global_limit:
-                    # Custom AI analysis for medium priority items
-                    relevance = self.generate_medium_priority_market_context(title, description, score)
-                    self.global_ai_calls_used += 1
-                    logging.debug(f"Used custom AI for medium priority item {i} (score {score}) - Global AI: {self.global_ai_calls_used}/{global_limit}")
-                else:
-                    # Use fallback
-                    relevance = self.generate_fallback_market_context(title, description, score)
-                    reason = "low score" if score < 6 else "global limit reached"
-                    logging.debug(f"Used fallback for item {i} (score {score}) - {reason}")
-                    
-            except Exception as e:
-                logging.warning(f"Failed to generate context for item {i}: {e}")
-                relevance = "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making."
-            
-            text_content += f"""{i}. {clean_title}
-SCORE: {score}/10 | SOURCE: {source}
-LINK: {link}
-
-COMMERCIAL PROPERTY MARKET CONTEXT:
-{relevance}
-
-"""
-            
-            if clean_desc:
-                text_content += f"SUMMARY: {clean_desc}...\n\n"
-            
-            text_content += "-------------------------------------------------------------------------------\n\n"
-        
-        logging.info(f"Completed section: {len(items)} items processed (Global AI used: {self.global_ai_calls_used}/{global_limit})")
-        return text_content
-
-    def generate_medium_priority_market_context(self, title: str, description: str, score: int) -> str:
-        """Generate AI-powered market context specifically for medium priority items (score 6)"""
-        try:
-            # Create a specialized prompt for medium priority items
-            prompt = f"""As a commercial property market analyst, this news item has medium relevance (score 6/10). Provide a focused 1-2 sentence analysis of its potential commercial property implications.
-
-Title: {title}
-Description: {description[:250]}
-
-Consider: indirect market effects, broader economic context, supply chain impacts, regulatory implications, or technology trends that could influence commercial real estate. Be concise and identify the most relevant connection to property markets."""
+Make it conversational, slightly edgy, and engaging. Reference the actual news but keep it punchy.
+No corporate speak. Talk like you're texting a smart friend who needs to know what's up.
+If there's big news, lead with it. If it's quiet, acknowledge that but hint at opportunity."""
 
             response = openai.ChatCompletion.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,  # Shorter for medium priority
-                temperature=0.1,
-                timeout=8  # Shorter timeout for medium priority
+                max_tokens=100,
+                temperature=0.7,
+                timeout=5
             )
             
-            ai_context = response.choices[0].message.content.strip()
+            opening = response.choices[0].message.content.strip()
             
-            # Clean up the response
-            ai_context = ai_context.replace('\n', ' ').replace('\r', ' ')
-            ai_context = re.sub(r'\s+', ' ', ai_context)  # Remove extra whitespace
+            if critical_count > 0:
+                opening += f"\n\n🚨 HOLD UP - {critical_count} thing{'s' if critical_count > 1 else ''} you NEED to see right now."
             
-            return f"MEDIUM PRIORITY ANALYSIS: {ai_context}"
+            return opening
             
         except Exception as e:
-            logging.warning(f"Medium priority AI analysis failed: {e}")
-            return self.generate_enhanced_fallback_for_medium_priority(title, description, score)
+            logging.warning(f"AI opening generation failed: {e}, using fallback")
+            return self.get_fallback_opening(sentiment, critical_count)
 
-    def generate_enhanced_fallback_for_medium_priority(self, title: str, description: str, score: int) -> str:
-        """Generate enhanced fallback analysis specifically for medium priority items"""
-        title_lower = title.lower()
-        desc_lower = (description or "").lower()
-        combined = title_lower + " " + desc_lower
-        
-        # More nuanced analysis for medium priority items
-        if any(keyword in combined for keyword in ['employment', 'jobs', 'workforce', 'hiring', 'unemployment']):
-            return "EMPLOYMENT CONTEXT: Labor market dynamics influence commercial property demand through tenant employment levels, office space requirements, and regional economic activity affecting property fundamentals."
-        elif any(keyword in combined for keyword in ['supply chain', 'logistics', 'shipping', 'transport', 'freight']):
-            return "SUPPLY CHAIN IMPACT: Transportation and logistics developments affect industrial property demand, distribution hub locations, and last-mile delivery requirements for commercial real estate portfolios."
-        elif any(keyword in combined for keyword in ['china', 'asia', 'trade', 'import', 'export', 'global']):
-            return "GLOBAL TRADE CONTEXT: International trade dynamics impact port-adjacent industrial properties, import/export facility demand, and multinational corporate real estate strategies in key markets."
-        elif any(keyword in combined for keyword in ['energy', 'oil', 'gas', 'renewable', 'electricity', 'power']):
-            return "ENERGY SECTOR INFLUENCE: Energy market developments affect commercial property operating costs, sustainability requirements, and tenant attraction in energy-efficient buildings."
-        elif any(keyword in combined for keyword in ['consumer', 'spending', 'retail sales', 'shopping', 'consumption']):
-            return "CONSUMER BEHAVIOR: Consumer spending patterns influence retail property performance, tenant viability, and demand for experiential retail spaces versus traditional formats."
-        elif any(keyword in combined for keyword in ['healthcare', 'medical', 'hospital', 'pharmaceutical', 'health']):
-            return "HEALTHCARE SECTOR: Medical sector developments create specialized property demand including medical offices, research facilities, and healthcare-adjacent commercial spaces."
-        elif any(keyword in combined for keyword in ['education', 'university', 'school', 'student', 'campus']):
-            return "EDUCATION IMPACT: Educational sector changes affect student housing demand, campus-adjacent commercial properties, and research facility requirements in university markets."
-        elif any(keyword in combined for keyword in ['government', 'public sector', 'policy', 'regulation', 'compliance']):
-            return "REGULATORY ENVIRONMENT: Government policy changes may affect commercial property regulations, tax implications, development approvals, and public sector tenancy requirements."
-        elif any(keyword in combined for keyword in ['mining', 'resources', 'commodity', 'materials', 'extraction']):
-            return "RESOURCES SECTOR: Commodity market developments influence regional commercial property demand in resource-dependent markets and industrial facility requirements."
-        else:
-            return "MARKET CONTEXT: This development provides broader economic context that may indirectly influence commercial property market conditions and investment considerations."
-
-    def generate_plain_text_executive_summary(self, top_items: List[Tuple], sentiment: str) -> str:
-        """Generate executive summary in plain text format"""
-        if not top_items:
-            return "No significant developments requiring immediate attention. Market monitoring continues across all commercial property sectors."
-        
-        summary_parts = []
-        
-        # Key themes analysis
-        themes = {
-            'monetary_policy': 0,
-            'property_market': 0,
-            'technology': 0,
-            'regulatory': 0,
-            'economic': 0
+    def get_fallback_opening(self, sentiment: str, critical_count: int) -> str:
+        """Fallback opening if AI fails"""
+        openings = {
+            'Positive': [
+                "Alright, the market's looking juicy today. Here's what's popping:",
+                "Bulls are running wild. Let me break down what's actually happening:",
+                "Everyone's making money today (are you?). Here's the scoop:",
+            ],
+            'Negative': [
+                "Oof. The market's taking a beating. But here's where the opportunity is:",
+                "Blood in the water. Smart money knows what to do. Here's the play:",
+                "Everyone's panicking. You know what that means? Opportunity. Let's dive in:",
+            ],
+            'Neutral': [
+                "Market's playing it cool today. But underneath? Big moves brewing:",
+                "Quiet on the surface, chaos underneath. Here's what matters:",
+                "While everyone's sleeping, smart money is moving. Pay attention:",
+            ]
         }
         
-        for item in top_items:
-            title_desc = (item[0] + ' ' + (item[2] or '')).lower()
-            score = item[3]
-            
-            if any(keyword in title_desc for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation']):
-                themes['monetary_policy'] += score
-            elif any(keyword in title_desc for keyword in ['property', 'real estate', 'reit', 'commercial', 'residential']):
-                themes['property_market'] += score
-            elif any(keyword in title_desc for keyword in ['technology', 'ai', 'digital', 'automation']):
-                themes['technology'] += score
-            elif any(keyword in title_desc for keyword in ['regulation', 'policy', 'government', 'law']):
-                themes['regulatory'] += score
-            else:
-                themes['economic'] += score
+        base = random.choice(openings.get(sentiment, openings['Neutral']))
         
-        # Find dominant themes
-        dominant_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)[:2]
-        
-        # Build summary
-        if dominant_themes[0][1] > 0:
-            theme_names = {
-                'monetary_policy': 'monetary policy developments',
-                'property_market': 'commercial property market activity',
-                'technology': 'technology and innovation impacts',
-                'regulatory': 'regulatory and policy changes',
-                'economic': 'broader economic developments'
-            }
-            
-            primary_theme = theme_names.get(dominant_themes[0][0], 'market developments')
-            summary_parts.append(f"PRIMARY FOCUS: {primary_theme.upper()}")
-            
-            if dominant_themes[1][1] > 0:
-                secondary_theme = theme_names.get(dominant_themes[1][0], 'market activity')
-                summary_parts.append(f"SECONDARY FOCUS: {secondary_theme.upper()}")
-        
-        summary_parts.append(f"MARKET SENTIMENT: {sentiment.upper()}")
-        
-        # Add action context
-        critical_count = len([item for item in top_items if item[3] >= 8])
         if critical_count > 0:
-            summary_parts.append(f"⚠️ {critical_count} CRITICAL ITEMS REQUIRE IMMEDIATE EXECUTIVE ATTENTION")
+            base += f"\n\n🚨 HOLD UP - {critical_count} thing{'s' if critical_count > 1 else ''} you NEED to see right now."
         
-        return "\n".join(summary_parts)
+        return base
 
-    def generate_plain_text_news_section(self, items: List[Tuple]) -> str:
-        """Generate news items in clean plain text format with rate limiting and AI call limits"""
-        if not items:
-            return "No items in this category."
-        
-        text_content = ""
-        
-        logging.info(f"Generating news section for {len(items)} items with AI context...")
-        
-        # Limit OpenAI API calls to prevent hanging - only use AI for high-priority items
-        ai_call_count = 0
-        max_ai_calls = 20  # Limit to 20 AI calls per section to prevent hanging
-        
-        for i, item in enumerate(items, 1):
-            title, link, description, score, summary, source = item[:6]
-            
-            # Clean up title and description
-            clean_title = title.strip()
-            clean_desc = (description or summary or "")[:200].strip()
-            if clean_desc:
-                clean_desc = clean_desc.replace('\n', ' ').replace('\r', ' ')
-                # Remove HTML tags
-                clean_desc = re.sub('<[^<]+?>', '', clean_desc)
-            
-            # Generate AI-powered commercial property relevance with limits
-            try:
-                # Only use AI for high-priority items or if we haven't hit the limit
-                if score >= 7 and ai_call_count < max_ai_calls:
-                    relevance = self.generate_ai_market_context(title, description, score)
-                    ai_call_count += 1
-                    logging.debug(f"Used AI for item {i}/{len(items)} (AI calls: {ai_call_count}/{max_ai_calls}): {title[:30]}...")
-                else:
-                    # Use fallback for lower priority items or when we've hit the AI limit
-                    relevance = self.generate_fallback_market_context(title, description, score)
-                    logging.debug(f"Used fallback for item {i}/{len(items)}: {title[:30]}...")
-                    
-            except Exception as e:
-                logging.warning(f"Failed to generate context for item {i}: {e}")
-                relevance = "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making."
-            
-            text_content += f"""{i}. {clean_title}
-SCORE: {score}/10 | SOURCE: {source}
-LINK: {link}
-
-COMMERCIAL PROPERTY MARKET CONTEXT:
-{relevance}
-
-"""
-            
-            if clean_desc:
-                text_content += f"SUMMARY: {clean_desc}...\n\n"
-            
-            text_content += "-------------------------------------------------------------------------------\n\n"
-            
-            # Progress logging every 10 items
-            if i % 10 == 0:
-                logging.info(f"Processed {i}/{len(items)} items (AI calls used: {ai_call_count}/{max_ai_calls})")
-        
-        logging.info(f"Completed news section generation for {len(items)} items (Total AI calls: {ai_call_count})")
-        return text_content
-
-    def generate_ai_market_context(self, title: str, description: str, score: int) -> str:
-        """Generate AI-powered market context using OpenAI with better error handling"""
+    def generate_shaan_style_context(self, title: str, description: str, score: int) -> str:
+        """Generate market context in Shaan Puri's conversational style with AI enhancement"""
         try:
-            # Create a concise prompt for OpenAI
-            prompt = f"""As a commercial property market analyst, provide a 2-3 sentence analysis of how this news impacts commercial property markets (office, retail, industrial, logistics). Be specific and actionable for A-REIT executives.
+            # For high-priority items, use AI for custom analysis
+            if score >= 7:
+                prompt = f"""You're a sharp commercial property analyst with personality like Shaan Puri.
+Give me a 2-sentence hot take on how this impacts commercial property markets.
+Be specific, conversational, and slightly edgy. No corporate speak.
+Talk like you're explaining to a smart friend over drinks.
 
 Title: {title}
 Description: {description[:300]}
 
-Focus on: investment implications, market dynamics, tenant demand, property valuations, or operational impacts. Be concise and professional."""
+Focus on the REAL impact - what actually changes for property investors/operators?
+Start with "THE PLAY:" or "REALITY CHECK:" or "WATCH THIS:" based on the news."""
 
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.1,
-                timeout=10  # 10 second timeout
-            )
-            
-            ai_context = response.choices[0].message.content.strip()
-            
-            # Clean up the response
-            ai_context = ai_context.replace('\n', ' ').replace('\r', ' ')
-            ai_context = re.sub(r'\s+', ' ', ai_context)  # Remove extra whitespace
-            
-            return ai_context
-            
-        except openai.error.RateLimitError as e:
-            logging.warning(f"OpenAI rate limit hit: {e}")
-            time.sleep(2)  # Wait 2 seconds and use fallback
-            return self.generate_fallback_market_context(title, description, score)
-            
-        except openai.error.APIError as e:
-            logging.warning(f"OpenAI API error: {e}")
-            return self.generate_fallback_market_context(title, description, score)
-            
+                response = openai.ChatCompletion.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=100,
+                    temperature=0.5,
+                    timeout=5
+                )
+                
+                return response.choices[0].message.content.strip()
         except Exception as e:
-            logging.warning(f"AI market context generation failed: {e}")
-            return self.generate_fallback_market_context(title, description, score)
-
-    def generate_fallback_market_context(self, title: str, description: str, score: int) -> str:
-        """Generate fallback market context without OpenAI"""
+            logging.debug(f"AI context generation failed, using fallback: {e}")
+        
+        # Fallback to pattern-based responses
         title_lower = title.lower()
         desc_lower = (description or "").lower()
         combined = title_lower + " " + desc_lower
         
-        # Enhanced fallback analysis
-        if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'inflation', 'cash rate']):
-            return "MONETARY POLICY IMPACT: Interest rate changes directly affect commercial property valuations through cap rate movements and debt servicing costs. Higher rates typically compress property values while lower rates support asset prices and investment activity."
-        elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd', 'co-working']):
-            return "WORKPLACE EVOLUTION: Changing work patterns influence office space demand, lease structures, and CBD vs suburban preferences. Flexible work arrangements may reduce space requirements but increase demand for premium, technology-enabled buildings."
-        elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce', 'mall', 'high street']):
-            return "RETAIL TRANSFORMATION: Consumer behavior shifts impact retail property demand, requiring asset repositioning strategies. E-commerce growth affects traditional retail formats while creating opportunities in logistics and last-mile delivery hubs."
-        elif any(keyword in combined for keyword in ['industrial', 'logistics', 'warehouse', 'supply chain', 'distribution']):
-            return "INDUSTRIAL DEMAND: Supply chain developments drive industrial property requirements, particularly in logistics hubs and distribution centers. Automation trends may reduce labor needs but increase demand for specialized, technology-integrated facilities."
-        elif any(keyword in combined for keyword in ['construction', 'development', 'planning', 'zoning', 'building approvals']):
-            return "DEVELOPMENT FUNDAMENTALS: Construction activity and planning policies affect supply pipelines, development feasibility, and project timelines. Regulatory changes can significantly impact development margins and market dynamics."
-        elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech', 'smart building']):
-            return "TECHNOLOGY INTEGRATION: Digital transformation affects property operations, tenant expectations, and investment requirements. Smart building technologies can improve operational efficiency and tenant satisfaction while requiring significant capital investment."
-        elif any(keyword in combined for keyword in ['investment', 'capital', 'funding', 'finance', 'reit', 'portfolio']):
-            return "CAPITAL MARKET DYNAMICS: Investment flows and financing conditions directly impact property acquisition strategies, portfolio optimization, and return expectations. Capital availability affects market liquidity and pricing dynamics."
-        elif any(keyword in combined for keyword in ['economy', 'gdp', 'employment', 'inflation', 'recession', 'growth']):
-            return "ECONOMIC FUNDAMENTALS: Broader economic conditions influence tenant demand, rental growth, and property market performance. Economic strength supports occupancy rates and rent growth while downturns may pressure fundamentals."
+        # Interest rates - the big one
+        if any(keyword in combined for keyword in ['interest rate', 'rba', 'fed', 'monetary', 'cash rate']):
+            if 'cut' in combined or 'lower' in combined or 'fall' in combined:
+                return "THE PLAY: Rate cuts = cheap money = property prices go brrr 📈. Every 0.25% cut adds ~3% to property values. Time to refi everything."
+            else:
+                return "REALITY CHECK: Higher rates = property values get crushed. But the best deals happen when everyone else is scared. Start stockpiling cash."
+        
+        # Office/workplace
+        elif any(keyword in combined for keyword in ['office', 'workplace', 'remote work', 'hybrid', 'cbd']):
+            return "THE OFFICE GAME: Premium offices are printing money while B-grade buildings become zombie assets. Flight to quality is real. Own the best or own nothing."
+        
+        # Retail
+        elif any(keyword in combined for keyword in ['retail', 'shopping', 'consumer', 'e-commerce', 'mall']):
+            return "RETAIL REALITY: Dead malls becoming fulfillment centers = 3x the rent. E-commerce didn't kill retail, it just changed the game. Adapt or die."
+        
+        # Technology
+        elif any(keyword in combined for keyword in ['technology', 'ai', 'automation', 'digital', 'proptech']):
+            if score >= 7:
+                return "TECH TSUNAMI: Properties without smart tech are becoming the Nokia phones of real estate. The companies adapting? They're printing money."
+            else:
+                return "TECH WATCH: 90% of PropTech dies, but the 10% that survive reshape entire markets. Keep an eye on this."
+        
+        # Default but make it spicy
         else:
-            return "MARKET CONTEXT: This development provides important context for commercial property strategic decision-making, potentially affecting market sentiment, investment flows, or operational considerations for property portfolios."
+            if score >= 8:
+                return "PAY ATTENTION: This is the kind of thing that triggers domino effects. The pros are already positioning."
+            elif score >= 6:
+                return "CONTEXT MATTERS: This is the undercurrent stuff that shapes next quarter's headlines."
+            else:
+                return "BREADCRUMB: Small move, but markets are conversations. File it, might matter later."
 
     def calculate_simple_sentiment(self, items: List[Tuple]) -> str:
         """Calculate market sentiment from news items"""
@@ -1535,206 +1088,647 @@ Focus on: investment implications, market dynamics, tenant demand, property valu
         else:
             return "Neutral"
 
-    def send_email_plain_text(self, content: str):
-        """Send email with plain text content (no markdown)"""
-        try:
-            logging.info(f"Preparing to send plain text email ({len(content)} characters)")
-            
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = f"Commercial Property Intelligence - {datetime.now().strftime('%B %d, %Y')}"
-            msg['From'] = self.config['gmail_user']
-            msg['To'] = self.config['recipient_email']
-            
-            # Send as plain text with proper formatting
-            text_part = MIMEText(content, 'plain', 'utf-8')
-            msg.attach(text_part)
-            
-            # Send email
-            with smtplib.SMTP('smtp.gmail.com', 587) as server:
-                server.starttls()
-                server.login(self.config['gmail_user'], self.config['gmail_password'])
-                server.send_message(msg)
-            
-            logging.info("Plain text email sent successfully")
-            
-        except Exception as e:
-            logging.error(f"Failed to send plain text email: {e}")
-            raise
-
-    def send_daily_brief_enhanced_plain_text(self, include_all: bool = False):
-        """Enhanced daily brief using plain text formatting"""
-        try:
-            # Get more items (last 24 hours) to be more inclusive
-            items = self.get_items_for_email(24)
-            if items:
-                content = self.generate_daily_email_from_items_enhanced(items)
-                if content:
-                    # Use plain text email sender
-                    self.send_email_plain_text(content)
-                    
-                    # Mark items as sent
-                    cutoff_time = datetime.now() - timedelta(hours=24)
-                    self.conn.execute('''
-                        UPDATE items SET email_sent = TRUE 
-                        WHERE processed_at >= ? AND email_sent = FALSE
-                    ''', (cutoff_time,))
-                    self.conn.commit()
-                    
-                    logging.info(f"Enhanced plain text email sent successfully")
-                else:
-                    logging.info("No content generated for enhanced email")
-            else:
-                logging.info("No items found for enhanced email")
-        except Exception as e:
-            logging.error(f"Enhanced plain text email error: {e}")
-            raise
-
-    def send_daily_brief_incremental_plain_text(self):
-        """Send plain text email with enhanced logic"""
-        should_send, time_period = self.should_send_email_now()
+    def build_html_email(self, items: List[Tuple]) -> str:
+        """Build engaging HTML email in Shaan Puri style"""
         
-        logging.info(f"Email decision: should_send={should_send}, time_period={time_period}")
+        logging.info(f"Building Shaan-style HTML email for {len(items)} items...")
         
-        if should_send:
-            logging.info(f"Sending {time_period} plain text email brief...")
+        current_date = datetime.now().strftime('%B %d, %Y')
+        current_time = datetime.now().strftime('%I:%M %p AEST')
+        
+        # Sort and group items
+        sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
+        
+        critical_items = [item for item in sorted_items if item[3] >= 8]
+        high_items = [item for item in sorted_items if item[3] == 7]
+        medium_items = [item for item in sorted_items if item[3] == 6]
+        normal_items = [item for item in sorted_items if item[3] == 5]
+        
+        total_items = len(sorted_items)
+        critical_count = len(critical_items)
+        sentiment = self.calculate_simple_sentiment(sorted_items)
+        
+        # Get AI-powered opening
+        opening_hook = self.get_ai_powered_opening(sentiment, critical_count, sorted_items[:5])
+        
+        # Build HTML email
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #2c3e50;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f8f9fa;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }}
+        .header h1 {{
+            margin: 0;
+            font-size: 28px;
+            font-weight: 700;
+        }}
+        .header .tagline {{
+            margin-top: 10px;
+            font-size: 16px;
+            opacity: 0.95;
+        }}
+        .scorecard {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }}
+        .scorecard-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }}
+        .stat-box {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }}
+        .stat-number {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #667eea;
+        }}
+        .stat-label {{
+            font-size: 12px;
+            color: #6c757d;
+            text-transform: uppercase;
+        }}
+        .opening {{
+            background: white;
+            padding: 25px;
+            border-left: 4px solid #667eea;
+            margin-bottom: 30px;
+            border-radius: 5px;
+            font-size: 16px;
+            color: #2c3e50;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }}
+        .section {{
+            background: white;
+            padding: 25px;
+            margin-bottom: 30px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        }}
+        .section-header {{
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }}
+        .critical {{ color: #dc3545; }}
+        .high {{ color: #fd7e14; }}
+        .medium {{ color: #ffc107; }}
+        .normal {{ color: #28a745; }}
+        .news-item {{
+            margin-bottom: 25px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 3px solid #667eea;
+        }}
+        .news-title {{
+            font-size: 16px;
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }}
+        .news-context {{
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-size: 14px;
+            line-height: 1.5;
+            color: #495057;
+            border: 1px solid #e9ecef;
+        }}
+        .news-meta {{
+            font-size: 12px;
+            color: #6c757d;
+            margin-top: 10px;
+        }}
+        .news-link {{
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }}
+        .news-link:hover {{
+            text-decoration: underline;
+        }}
+        .score-badge {{
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-left: 10px;
+        }}
+        .score-high {{ background: #dc3545; color: white; }}
+        .score-medium {{ background: #ffc107; color: #000; }}
+        .score-low {{ background: #28a745; color: white; }}
+        .bottom-line {{
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 10px;
+            margin: 30px 0;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }}
+        .footer {{
+            text-align: center;
+            padding: 20px;
+            color: #6c757d;
+            font-size: 14px;
+        }}
+        .footer a {{
+            color: #667eea;
+            text-decoration: none;
+        }}
+        @media (max-width: 600px) {{
+            body {{ padding: 10px; }}
+            .header {{ padding: 20px; }}
+            .section {{ padding: 15px; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏢 Property Intelligence Briefing</h1>
+        <div class="tagline">Your unfair advantage in commercial real estate</div>
+    </div>
+    
+    <div class="scorecard">
+        <strong style="font-size: 18px;">📊 THE SCORECARD</strong>
+        <div class="scorecard-grid">
+            <div class="stat-box">
+                <div class="stat-number">{total_items}</div>
+                <div class="stat-label">Items Analyzed</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{critical_count}</div>
+                <div class="stat-label">Red Alerts</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{len(high_items)}</div>
+                <div class="stat-label">High Priority</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{sentiment}</div>
+                <div class="stat-label">Market Vibe</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="opening">
+        {opening_hook.replace(chr(10), '<br>')}
+    </div>
+"""
+
+        # Add sections based on priority
+        if critical_items:
+            html_content += f"""
+    <div class="section">
+        <div class="section-header critical">🔥 STOP EVERYTHING - THIS MATTERS ({len(critical_items)} items)</div>
+        {self.generate_html_news_items(critical_items)}
+    </div>
+"""
+
+        if high_items:
+            html_content += f"""
+    <div class="section">
+        <div class="section-header high">👀 WORTH YOUR ATTENTION ({len(high_items)} items)</div>
+        {self.generate_html_news_items(high_items)}
+    </div>
+"""
+
+        if medium_items[:10]:  # Limit medium items
+            html_content += f"""
+    <div class="section">
+        <div class="section-header medium">📌 QUICK HITS ({min(len(medium_items), 10)} items)</div>
+        {self.generate_html_news_items(medium_items[:10])}
+    </div>
+"""
+
+        # Add bottom line
+        action_rec = self.get_action_recommendation(sentiment, critical_count)
+        html_content += f"""
+    <div class="bottom-line">
+        <strong style="font-size: 18px;">THE BOTTOM LINE</strong><br><br>
+        Market sentiment: <strong>{sentiment}</strong><br>
+        Your move: <strong>{action_rec}</strong><br><br>
+        <em>Fortune favors the brave (and the informed). You're now both.</em>
+    </div>
+    
+    <div class="footer">
+        <strong>Keep building,</strong><br>
+        Your AI Property Intel System<br><br>
+        <em>P.S. - While your competitors are reading newspapers, you just got the cliff notes.<br>
+        Use this 15-minute advantage wisely.</em><br><br>
+        Built with 🤖 by <a href="https://www.linkedin.com/in/mattwhiteoak">Matt Whiteoak</a>
+    </div>
+</body>
+</html>"""
+
+        return html_content
+
+    def generate_html_news_items(self, items: List[Tuple]) -> str:
+        """Generate HTML for news items with Shaan style"""
+        html = ""
+        
+        for i, item in enumerate(items[:20], 1):  # Limit items per section
+            title, link, description, score, summary, source = item[:6]
             
-            # Get items from last 24 hours for email
-            items = self.get_items_for_email(24)
+            # Get context
+            context = self.generate_shaan_style_context(title, description, score)
             
-            if items:
-                logging.info(f"Generating plain text email from {len(items)} items")
-                content = self.generate_daily_email_from_items_enhanced(items)
-                if content:
-                    # Check content size and warn if too large
-                    content_size = len(content.encode('utf-8'))
-                    logging.info(f"Email content size: {content_size/1024:.1f}KB")
-                    
-                    # Use plain text email sender
-                    self.send_email_plain_text(content)
-                    
-                    # Mark items as sent
-                    cutoff_time = datetime.now() - timedelta(hours=24)
-                    self.conn.execute('''
-                        UPDATE items SET email_sent = TRUE 
-                        WHERE processed_at >= ? AND email_sent = FALSE
-                    ''', (cutoff_time,))
-                    self.conn.commit()
-                    
-                    logging.info("Plain text email sent successfully")
-                else:
-                    logging.warning("No content generated for email - all items filtered out")
+            # Score badge color
+            if score >= 8:
+                badge_class = "score-high"
+            elif score >= 6:
+                badge_class = "score-medium"
             else:
-                logging.warning("No items found for email")
+                badge_class = "score-low"
+            
+            html += f"""
+        <div class="news-item">
+            <div class="news-title">
+                {i}. {title}
+                <span class="score-badge {badge_class}">Score: {score}/10</span>
+            </div>
+            <div class="news-context">
+                {context}
+            </div>
+            <div class="news-meta">
+                Source: {source} | 
+                <a href="{link}" class="news-link">Read full story →</a>
+            </div>
+        </div>
+"""
+        
+        return html
+
+    def get_action_recommendation(self, sentiment: str, critical_count: int) -> str:
+        """Get Shaan-style action recommendation"""
+        if critical_count >= 2:
+            return "Multiple red flags. Time to call your CFO. Like, right now."
+        elif critical_count == 1:
+            return "One big thing to handle today. Block 30 minutes, handle it, then grab coffee."
+        elif sentiment == 'Positive':
+            return "Market's hot. Time to be aggressive (but not stupid)."
+        elif sentiment == 'Negative':
+            return "Market's scared. You know what Buffett says about fear and greed, right?"
         else:
-            logging.info(f"Skipping email send - {time_period} run")
+            return "Stay alert, stay liquid. Big moves coming, direction unclear."
 
-    def run_scheduled_processing_plain_text(self):
-        """Main method for scheduled processing with plain text email"""
+    def generate_daily_email_from_items_enhanced(self, items: List[Tuple]) -> Optional[str]:
+        """Generate HTML formatted email with Shaan Puri style"""
+        logging.info(f"Starting enhanced email generation from {len(items)} items...")
+        
+        if not items:
+            logging.warning("No items provided for email generation")
+            return None
+        
+        start_time = time.time()
+        
         try:
-            # Process feeds with optimized method
-            result = self.process_feeds_optimized_recent()
+            # Filter items
+            filtered_items = []
+            seen_titles = set()
             
-            # Always try to send email for GitHub Actions, or based on schedule for local runs
-            if os.getenv('GITHUB_ACTIONS') or self.should_send_email_now()[0]:
-                logging.info("Attempting to send plain text email...")
-                self.send_daily_brief_incremental_plain_text()
-            else:
-                logging.info("Skipping email send based on schedule")
-            
-            logging.info(f"Scheduled processing completed: {result}")
-            
-        except Exception as e:
-            logging.error(f"Scheduled processing error: {e}")
-            # Try emergency fallback
-            try:
-                self.emergency_simple_process_fallback()
-            except Exception as fallback_error:
-                logging.error(f"Emergency fallback also failed: {fallback_error}")
-
-    def cleanup_old_items(self, days: int = 7):
-        """Remove items older than specified days"""
-        try:
-            cutoff_date = datetime.now() - timedelta(days=days)
-            
-            # Count items to be deleted
-            cursor = self.conn.execute(
-                'SELECT COUNT(*) FROM items WHERE processed_at < ?', 
-                (cutoff_date,)
-            )
-            count = cursor.fetchone()[0]
-            
-            if count > 0:
-                # Delete old items
-                self.conn.execute(
-                    'DELETE FROM items WHERE processed_at < ?', 
-                    (cutoff_date,)
-                )
-                self.conn.commit()
-                logging.info(f"Cleaned up {count} items older than {days} days")
-            else:
-                logging.info(f"No items older than {days} days found")
+            for item in items:
+                title, link, description, score, summary, source_name = item[:6]
                 
+                # Skip specific URLs and sensitive content
+                if link == "https://www.afr.com/topic/commercial-real-estate-5vu":
+                    continue
+                
+                combined_text = (title + ' ' + (description or '') + ' ' + (summary or '')).lower()
+                
+                # Skip errors
+                if any(phrase in title.lower() for phrase in [
+                    'not found', 'sign up to rss.app', 'error 404', 'access denied'
+                ]):
+                    continue
+                
+                # Skip sensitive content
+                sensitive_keywords = [
+                    'manslaughter', 'murder', 'child abuse', 'dies', 'died', 'death',
+                    'sexual assault', 'rape', 'domestic violence', 'suicide'
+                ]
+                
+                if any(keyword in combined_text for keyword in sensitive_keywords):
+                    continue
+                
+                # Skip duplicates
+                title_key = title.lower().strip()
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
+                
+                # Include items with score >= 4
+                if score >= 4:
+                    filtered_items.append(item)
+            
+            logging.info(f"Filtered items for email: {len(filtered_items)}")
+            
+            if not filtered_items:
+                logging.warning("No items remaining after filtering")
+                return None
+            
+            # Generate HTML email
+            email_content = self.build_html_email(filtered_items)
+            
+            elapsed_time = time.time() - start_time
+            logging.info(f"Email generation completed in {elapsed_time:.1f} seconds")
+            
+            return email_content
+            
         except Exception as e:
-            logging.error(f"Cleanup error: {e}")
-            raise
+            logging.error(f"Email generation failed: {e}")
+            return self.generate_fallback_email(items)
+    
+    def generate_fallback_email(self, items: List[Tuple]) -> str:
+        """Generate a simple fallback email if main generation fails"""
+        logging.info("Generating fallback email")
+        
+        current_date = datetime.now().strftime('%B %d, %Y')
+        current_time = datetime.now().strftime('%I:%M %p AEST')
+        
+        filtered_items = [item for item in items if item[3] >= 4][:20]
+        sorted_items = sorted(filtered_items, key=lambda x: x[3], reverse=True)
+        
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+        h1 {{ color: #333; }}
+        .item {{ margin-bottom: 20px; padding: 15px; background: #f5f5f5; }}
+    </style>
+</head>
+<body>
+    <h1>🏢 Property Intelligence - {current_date}</h1>
+    <p>Fallback mode - {len(sorted_items)} items</p>
+"""
+        
+        for i, item in enumerate(sorted_items[:10], 1):
+            title, link, description, score, summary, source = item[:6]
+            html_content += f"""
+    <div class="item">
+        <strong>{i}. {title}</strong><br>
+        Score: {score}/10
+            | Source: {source}<br>
+       <a href="{link}">Read more</a>
+   </div>
+"""
+       
+       html_content += """
+</body>
+</html>"""
+       
+       return html_content
+
+   def send_email_html(self, content: str):
+       """Send email with HTML content"""
+       try:
+           logging.info(f"Preparing to send HTML email ({len(content)} characters)")
+           
+           # Get subject line
+           items = self.get_items_for_email(24)
+           subject_suffix = self.get_spicy_subject_suffix(items)
+           
+           msg = MIMEMultipart('alternative')
+           msg['Subject'] = f"🔥 Property Intel: {subject_suffix} - {datetime.now().strftime('%B %d')}"
+           msg['From'] = self.config['gmail_user']
+           msg['To'] = self.config['recipient_email']
+           
+           # Create plain text version (fallback)
+           plain_text = """
+Property Intelligence Briefing
+
+This email is best viewed in HTML format.
+Please enable HTML viewing in your email client for the full experience.
+
+---
+Built with AI by Matt Whiteoak
+"""
+           
+           # Attach parts
+           text_part = MIMEText(plain_text, 'plain', 'utf-8')
+           html_part = MIMEText(content, 'html', 'utf-8')
+           
+           msg.attach(text_part)
+           msg.attach(html_part)
+           
+           # Send email
+           with smtplib.SMTP('smtp.gmail.com', 587) as server:
+               server.starttls()
+               server.login(self.config['gmail_user'], self.config['gmail_password'])
+               server.send_message(msg)
+           
+           logging.info("HTML email sent successfully")
+           
+       except Exception as e:
+           logging.error(f"Failed to send HTML email: {e}")
+           raise
+
+   def send_daily_brief_enhanced(self):
+       """Enhanced daily brief with HTML formatting and Shaan Puri style"""
+       try:
+           # Get items from last 24 hours
+           items = self.get_items_for_email(24)
+           if items:
+               content = self.generate_daily_email_from_items_enhanced(items)
+               if content:
+                   # Send HTML email
+                   self.send_email_html(content)
+                   
+                   # Mark items as sent
+                   cutoff_time = datetime.now() - timedelta(hours=24)
+                   self.conn.execute('''
+                       UPDATE items SET email_sent = TRUE 
+                       WHERE processed_at >= ? AND email_sent = FALSE
+                   ''', (cutoff_time,))
+                   self.conn.commit()
+                   
+                   logging.info(f"Enhanced HTML email sent successfully")
+               else:
+                   logging.info("No content generated for email")
+           else:
+               logging.info("No items found for email")
+       except Exception as e:
+           logging.error(f"Enhanced email error: {e}")
+           raise
+
+   def send_daily_brief_incremental(self):
+       """Send HTML email with enhanced logic"""
+       should_send, time_period = self.should_send_email_now()
+       
+       logging.info(f"Email decision: should_send={should_send}, time_period={time_period}")
+       
+       if should_send:
+           logging.info(f"Sending {time_period} HTML email brief...")
+           
+           # Get items from last 24 hours
+           items = self.get_items_for_email(24)
+           
+           if items:
+               logging.info(f"Generating HTML email from {len(items)} items")
+               content = self.generate_daily_email_from_items_enhanced(items)
+               if content:
+                   # Check content size
+                   content_size = len(content.encode('utf-8'))
+                   logging.info(f"Email content size: {content_size/1024:.1f}KB")
+                   
+                   # Send HTML email
+                   self.send_email_html(content)
+                   
+                   # Mark items as sent
+                   cutoff_time = datetime.now() - timedelta(hours=24)
+                   self.conn.execute('''
+                       UPDATE items SET email_sent = TRUE 
+                       WHERE processed_at >= ? AND email_sent = FALSE
+                   ''', (cutoff_time,))
+                   self.conn.commit()
+                   
+                   logging.info("HTML email sent successfully")
+               else:
+                   logging.warning("No content generated for email")
+           else:
+               logging.warning("No items found for email")
+       else:
+           logging.info(f"Skipping email send - {time_period} run")
+
+   def run_scheduled_processing(self):
+       """Main method for scheduled processing with HTML email"""
+       try:
+           # Process feeds with optimized method
+           result = self.process_feeds_optimized_recent()
+           
+           # Always try to send email for GitHub Actions, or based on schedule
+           if os.getenv('GITHUB_ACTIONS') or self.should_send_email_now()[0]:
+               logging.info("Attempting to send HTML email...")
+               self.send_daily_brief_incremental()
+           else:
+               logging.info("Skipping email send based on schedule")
+           
+           logging.info(f"Scheduled processing completed: {result}")
+           
+       except Exception as e:
+           logging.error(f"Scheduled processing error: {e}")
+           # Try emergency fallback
+           try:
+               self.emergency_simple_process_fallback()
+           except Exception as fallback_error:
+               logging.error(f"Emergency fallback also failed: {fallback_error}")
+
+   def cleanup_old_items(self, days: int = 7):
+       """Remove items older than specified days"""
+       try:
+           cutoff_date = datetime.now() - timedelta(days=days)
+           
+           # Count items to be deleted
+           cursor = self.conn.execute(
+               'SELECT COUNT(*) FROM items WHERE processed_at < ?', 
+               (cutoff_date,)
+           )
+           count = cursor.fetchone()[0]
+           
+           if count > 0:
+               # Delete old items
+               self.conn.execute(
+                   'DELETE FROM items WHERE processed_at < ?', 
+                   (cutoff_date,)
+               )
+               self.conn.commit()
+               logging.info(f"Cleaned up {count} items older than {days} days")
+           else:
+               logging.info(f"No items older than {days} days found")
+               
+       except Exception as e:
+           logging.error(f"Cleanup error: {e}")
+           raise
 
 
 def main():
-    """Main function to run the RSS analyzer with plain text email support"""
-    try:
-        analyzer = RSSAnalyzer()
-        
-        # Handle command line arguments for GitHub Actions
-        if len(sys.argv) > 1:
-            command = sys.argv[1].lower()
-            
-            if command in ['process', 'run', 'test']:
-                logging.info("Running single processing cycle with plain text email for GitHub Actions...")
-                analyzer.run_scheduled_processing_plain_text()
-                logging.info("Processing completed successfully!")
-                
-            elif command == 'email':
-                logging.info("Sending daily plain text email...")
-                analyzer.send_daily_brief_enhanced_plain_text()
-                logging.info("Email sent successfully!")
-                
-            elif command == 'cleanup':
-                days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
-                logging.info(f"Cleaning up items older than {days} days...")
-                analyzer.cleanup_old_items(days)
-                logging.info("Cleanup completed!")
-                
-            else:
-                print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
-                print("  process - Run RSS processing and send plain text email")
-                print("  email   - Send daily plain text email only")  
-                print("  cleanup - Remove old database entries (default: 7 days)")
-                sys.exit(1)
-        else:
-            # Run continuous scheduled mode with plain text emails
-            logging.info("Starting continuous scheduled mode with plain text emails...")
-            
-            # Schedule processing 3 times daily
-            schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing_plain_text)  # Morning AEST
-            schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing_plain_text)  # Midday AEST  
-            schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing_plain_text)  # Evening AEST
-            
-            logging.info("RSS Analyzer started - running scheduled processing with plain text emails...")
-            
-            # Run immediately on startup
-            analyzer.run_scheduled_processing_plain_text()
-            
-            # Keep running scheduled tasks
-            while True:
-                schedule.run_pending()
-                time.sleep(60)  # Check every minute
-            
-    except KeyboardInterrupt:
-        logging.info("RSS Analyzer stopped by user")
-    except Exception as e:
-        logging.error(f"RSS Analyzer error: {e}")
-        raise
+   """Main function to run the RSS analyzer with HTML email support"""
+   try:
+       analyzer = RSSAnalyzer()
+       
+       # Handle command line arguments for GitHub Actions
+       if len(sys.argv) > 1:
+           command = sys.argv[1].lower()
+           
+           if command in ['process', 'run', 'test']:
+               logging.info("Running single processing cycle with HTML email for GitHub Actions...")
+               analyzer.run_scheduled_processing()
+               logging.info("Processing completed successfully!")
+               
+           elif command == 'email':
+               logging.info("Sending daily HTML email...")
+               analyzer.send_daily_brief_enhanced()
+               logging.info("Email sent successfully!")
+               
+           elif command == 'cleanup':
+               days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+               logging.info(f"Cleaning up items older than {days} days...")
+               analyzer.cleanup_old_items(days)
+               logging.info("Cleanup completed!")
+               
+           else:
+               print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
+               print("  process - Run RSS processing and send HTML email")
+               print("  email   - Send daily HTML email only")  
+               print("  cleanup - Remove old database entries (default: 7 days)")
+               sys.exit(1)
+       else:
+           # Run continuous scheduled mode with HTML emails
+           logging.info("Starting continuous scheduled mode with HTML emails...")
+           
+           # Schedule processing 3 times daily
+           schedule.every().day.at("06:00").do(analyzer.run_scheduled_processing)  # Morning AEST
+           schedule.every().day.at("12:00").do(analyzer.run_scheduled_processing)  # Midday AEST  
+           schedule.every().day.at("18:00").do(analyzer.run_scheduled_processing)  # Evening AEST
+           
+           logging.info("RSS Analyzer started - running scheduled processing with HTML emails...")
+           
+           # Run immediately on startup
+           analyzer.run_scheduled_processing()
+           
+           # Keep running scheduled tasks
+           while True:
+               schedule.run_pending()
+               time.sleep(60)  # Check every minute
+           
+   except KeyboardInterrupt:
+       logging.info("RSS Analyzer stopped by user")
+   except Exception as e:
+       logging.error(f"RSS Analyzer error: {e}")
+       raise
 
 
 if __name__ == "__main__":
-    main()
+   main()
