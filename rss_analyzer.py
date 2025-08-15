@@ -471,8 +471,16 @@ class RSSAnalyzer:
         items = []
         
         try:
-            # Parse feed with timeout
-            feed = feedparser.parse(feed_url, timeout=15)
+            # Set socket timeout for feedparser
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(15)
+            
+            try:
+                # Parse feed (feedparser doesn't accept timeout parameter directly)
+                feed = feedparser.parse(feed_url)
+            finally:
+                # Restore original timeout
+                socket.setdefaulttimeout(old_timeout)
             
             if feed.bozo:
                 logger.warning(f"Feed parse warning for {feed_name}: {feed.bozo_exception}")
