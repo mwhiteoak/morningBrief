@@ -73,4 +73,106 @@ def fetch(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows.sort(key=lambda x: (x["pub"], score_title(x["title"])), reverse=True)
     return rows
 
-def create_newsletter_item
+def create_newsletter_summary(items: List[Dict[str, Any]], headline: str, subhead: str) -> str:
+    """Create a newsletter summary item with headline and subhead"""
+    now = datetime.now(tz=TZ)
+    
+    # Create a summary of key stories
+    summary_content = f"<h2>{esc(headline)}</h2>"
+    summary_content += f"<p><em>{esc(subhead)}</em></p>"
+    
+    if items:
+        summary_content += "<h3>Today's Key Stories:</h3><ul>"
+        for item in items[:5]:  # Top 5 stories
+            summary_content += f'<li><strong>{esc(item["title"])}</strong> - {esc(item["desc"][:100])}...</li>'
+        summary_content += "</ul>"
+    
+    summary_content += f"<p><small>Generated on {now.strftime('%d %B %Y at %H:%M AEST')}</small></p>"
+    
+    return f"""<item>
+  <title>{esc(headline)}</title>
+  <link>{esc(BASE_URL)}</link>
+  <guid isPermaLink="false">newsletter-{now.strftime('%Y%m%d')}</guid>
+  <pubDate>{now.strftime('%a, %d %b %Y %H:%M:%S %z')}</pubDate>
+  <description>
+{cdata(summary_content)}
+  </description>
+  <content:encoded>
+{cdata(summary_content)}
+  </content:encoded>
+  <category>newsletter</category>
+  <category>summary</category>
+</item>
+"""
+
+def write_feed(items: List[Dict[str, Any]], headline: str, subhead: str):
+    now = datetime.now(tz=TZ)
+    
+    # Use AI-generated headline as the feed title
+    feed_title = headline if headline != "Morning Property Brief" else f"{NEWSLETTER} - {headline}"
+    
+    header = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+<channel>
+<title>{esc(feed_title)}</title>
+<link>{esc(BASE_URL)}</link>
+<description>{esc(subhead)}</description>
+<language>en-au</language>
+<lastBuildDate>{now.strftime('%a, %d %b %Y %H:%M:%S %z')}</lastBuildDate>
+<ttl>60</ttl>
+"""
+
+    items_xml = []
+    
+    # Add newsletter summary as first item
+    items_xml.append(create_newsletter_summary(items, headline, subhead))
+    
+    # Add individual items
+    for it in items:
+        link = it["canon"] or it["link"]
+        pub = it["pub"].strftime('%a, %d %b %Y %H:%M:%S %z')
+        cats = "".join([f"<category>{esc(t.strip())}</category>" for t in it["tags"][:5] if t.strip()])
+        
+        # Enhanced body with source attribution
+        body_html = f"""<div class="property-item">
+  <p class="source"><small>Source: {esc(it['source'])}</small></p>
+  <p>{esc(it['desc'])}</p>
+  <p><a href="{esc(link)}" target="_blank">Read full article →</a></p>
+</div>"""
+        
+        items_xml.append(
+            f"<item>\n"
+            f"  <title>{esc(it['title'])}</title>\n"
+            f"  <link>{esc(link)}</link>\n"
+            f"  <guid isPermaLink=\"false\">{esc(link)}</guid>\n"
+            f"  <pubDate>{pub}</pubDate>\n"
+            f"  <description>\n{cdata(body_html)}\n  </description>\n"
+            f"  <content:encoded>\n{cdata(body_html)}\n  </content:encoded>\n"
+            f"  {cats}\n"
+            f"</item>\n"
+        )
+
+    footer = "</channel>\n</rss>\n"
+    
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
+        f.write(header + "".join(items_xml) + footer)
+
+def main():
+    conn = sqlite3.connect(RSS_DB_PATH)
+    
+    # Get AI-generated headline and subhead
+    headline, subhead = get_newsletter_metadata(conn)
+    
+    # Get items
+    items = fetch(conn)
+    
+    # Write feed with AI-generated metadata
+    write_feed(items, headline, subhead)
+    
+    print(f"Wrote RSS to {OUT_PATH}")
+    print(f"Headline: {headline}")
+    print(f"Subhead: {subhead}")
+    print(f"Items: {len(items)}")
+
+if __name__ == "__main__":
+    main()
