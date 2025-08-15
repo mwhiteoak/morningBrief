@@ -1,383 +1,352 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Morning Briefing — AU Property Intelligence (Beehiiv-ready)
-
-- Fetches feeds (parallel)
-- Normalises + dedupes links
-- AI: rewrites title + summary in Shaan Puri/Milk Road tone (but factual, no guesses)
-- AI: classifies each item for multi-feed RSS export
-- Scores for property pros (CRE bias)
+Morning Briefing — AU CRE Intelligence (Beehiiv-ready)
+- Fetches feeds (incremental, parallel)
+- Filters & scores with AU/role weighting
+- Summarises with OpenAI (throttled, cached, no hallucinations)
 - Stores everything in sqlite: rss_items.db
-
-ENV:
-  LOG_LEVEL=INFO|DEBUG
-  OPENAI_API_KEY=...
-  OPENAI_MODEL=gpt-4o
-  OAI_RPM=25
-  OAI_MAX_RETRIES=4
-  MAX_WORKERS=8
-  FEED_TIMEOUT=15
-  MIN_SCORE_FOR_AI=5
-  RSS_DB_PATH=rss_items.db
 """
 
-from __future__ import annotations
-import os, re, json, time, logging, hashlib, html, socket, concurrent.futures
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+import os, re, sqlite3, time, json, logging, socket, hashlib, concurrent.futures
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+from dataclasses import dataclass
+from typing import List, Dict, Optional
 
 import feedparser
-import sqlite3
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ---- project feeds ----
-from feeds import RSS_FEEDS
-
 load_dotenv()
 
-LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
-OAI_RPM          = int(os.getenv("OAI_RPM", "25"))        # requests/min
-OAI_MAX_RETRIES  = int(os.getenv("OAI_MAX_RETRIES", "4"))
-MAX_WORKERS      = int(os.getenv("MAX_WORKERS", "8"))
-FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))
-MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "5"))
+# ---------- Tunables via env ----------
+LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
+OPENAI_MODEL      = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # fast + good
+NEWSLETTER_NAME   = os.getenv('NEWSLETTER_NAME', 'Morning Briefing')
+OAI_RPM           = int(os.getenv('OAI_RPM', '60'))           # requests/min cap
+OAI_MAX_RETRIES   = int(os.getenv('OAI_MAX_RETRIES', '3'))
+OAI_TIMEOUT_SECS  = int(os.getenv("OAI_TIMEOUT_SECS", "15"))
 
-DB_PATH = os.getenv("RSS_DB_PATH", "rss_items.db")
+MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "12"))       # feed fetch concurrency
+FEED_TIMEOUT      = int(os.getenv("FEED_TIMEOUT", "10"))      # per-feed seconds
+SCAN_WINDOW_HRS   = int(os.getenv("SCAN_WINDOW_HRS", "18"))   # recency window
+MIN_SCORE_FOR_AI  = int(os.getenv("MIN_SCORE_FOR_AI", "7"))   # skip AI below this
+MAX_AI_ITEMS      = int(os.getenv("MAX_AI_ITEMS", "28"))      # hard cap per run
+# --------------------------------------
+
+# ---- CRE hard filters for speed/precision ----
+HARD_FILTER_TERMS = [
+    "REIT","A-REIT","AREIT","cap rate","yield","WALE","vacancy","leasing","pre-commit",
+    "industrial","logistics","retail","office","hospitality","student","data centre",
+    "development","DA","rezoning","acquisition","disposal","portfolio","mandate","JV",
+    "anchor tenant","sqm","hectare","NLA","IRR","stabilised","value-add","core-plus",
+    "transaction","deal","fund","asset","valuation","auction","campaign","leasing deal",
+    "loan","refinance","capital raise","LVR","covenant",
+    # AU tickers/names
+    "Dexus","DXS","GPT","Mirvac","MGR","Stockland","SGP","Charter Hall","CHC","Centuria",
+    "CIP","COF","CNI","Cromwell","CMW","Goodman","GMG","Lendlease","LLC","Scentre","SCG",
+    "Vicinity","VCX","HomeCo","HMC","HMC Capital","Arena REIT","ARF","BWP","BWP Trust",
+    "Waypoint","WPR","Carindale","CDP","Rialto","Elanor","ENX"
+]
+
+TRUSTED_SOURCES = {
+    "Real Commercial","The Urban Developer","AFR - Commercial Property",
+    "Business News - Property","Real Commercial","realestate.com.au News",
+    "Domain Business","PCA News","Business News - Retail"
+}
+# ----------------------------------------------
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+socket.setdefaulttimeout(FEED_TIMEOUT)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Your feeds list
+from feeds import RSS_FEEDS
 
-# -------------------------- helpers --------------------------
+@dataclass
+class Item:
+    link: str
+    link_canonical: str
+    source_name: str
+    source_feed: str
+    title: str
+    raw_summary: str
+    published_at: Optional[str]
+    score: int
 
-BAD_XML_CHARS_RE = re.compile(
-    r"[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]"
-)
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def to_iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.astimezone(timezone.utc).isoformat() if dt else None
 
-def clean_text(s: str) -> str:
-    if not s:
-        return ""
-    s = html.unescape(s)
-    s = BAD_XML_CHARS_RE.sub("", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def canonicalise_url(u: str) -> str:
+def parse_rfc2822(dt_struct) -> Optional[datetime]:
+    if not dt_struct:
+        return None
     try:
-        if not u:
-            return ""
-        p = urlparse(u)
-        q = parse_qs(p.query, keep_blank_values=True)
-        # Drop common tracking params
-        for k in list(q.keys()):
-            if k.lower().startswith(("utm_", "mc_", "fbclid", "gclid", "igshid")):
-                q.pop(k, None)
-        new_query = urlencode({k:v[0] for k,v in q.items()}, doseq=False)
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, ""))  # drop fragment
+        return datetime(*dt_struct[:6], tzinfo=timezone.utc)
     except Exception:
-        return u
+        return None
 
-def fp_for_url(u: str) -> str:
-    return hashlib.sha1(u.encode("utf-8", errors="ignore")).hexdigest()
-
-def get_entry_body(entry: Any) -> str:
-    # Try typical RSS fields
-    cand = ""
-    if getattr(entry, "summary", None):
-        cand = entry.summary
-    if not cand and getattr(entry, "content", None):
-        try:
-            cand = entry.content[0].value or ""
-        except Exception:
-            pass
-    return clean_text(cand)
-
-def get_entry_published(entry: Any) -> str:
-    # Always store as UTC ISO 8601 with Z
+def canonicalise_url(url: str) -> str:
     try:
-        if getattr(entry, "published_parsed", None):
-            tt = entry.published_parsed
-        elif getattr(entry, "updated_parsed", None):
-            tt = entry.updated_parsed
-        else:
-            return now_utc_iso()
-        dt = datetime(*tt[:6], tzinfo=timezone.utc)
-        return dt.replace(microsecond=0).isoformat()
+        u = urlparse(url)
+        # drop tracking
+        q = [(k, v) for (k, v) in parse_qsl(u.query, keep_blank_values=True)
+             if not k.lower().startswith(("utm_", "gclid", "fbclid", "mc_eid"))]
+        new_q = urlencode(q, doseq=True)
+        scheme = "https" if u.scheme in ("http", "https") else u.scheme
+        canon = urlunparse((scheme, u.netloc.lower(), u.path, "", new_q, ""))
+        return canon.rstrip("/")
     except Exception:
-        return now_utc_iso()
+        return url
 
-# Simple CRE-biased score: source weight + numbers + recency-ish (handled at export)
-SOURCE_WEIGHTS = {
-    "Real Commercial": 6,
-    "AFR - Latest": 5,
-    "AFR - Commercial Property": 7,
-    "The Australian - Business": 4,
-    "The Age - Business": 3,
-    "Business News - Property": 4,
-    "realestate.com.au News": 5,
-    "Real Commercial": 6,
-    "The Urban Developer": 5,
-    "Domain Business": 4,
-    "PCA News": 4,
-    "RBA Media Releases": 6,
-    "WSJ - Markets": 2,
-    "WSJ - World News": 1,
-    "Motley Fool": 1,
-    "Small Caps": 2,
-    "Cointelegraph": 1,
-}
+def fingerprint(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", "ignore")).hexdigest()[:16]
 
-def score_item(source_name: str, title: str, desc: str, category: str) -> int:
-    s = SOURCE_WEIGHTS.get(source_name, 1)
-    if category.lower() in ("property", "development", "deals"):
-        s += 3
-    if category.lower() in ("reit", "finance", "markets"):
-        s += 2
-    if re.search(r"\b\d{2,}\b", title or ""):
-        s += 1
-    if re.search(r"\$\d", desc or ""):
-        s += 1
-    return max(1, s)
+def looks_like_cre(title: str, summary: str, source_name: str) -> bool:
+    if source_name in TRUSTED_SOURCES:
+        return True
+    blob = f"{title} {summary}".lower()
+    for term in HARD_FILTER_TERMS:
+        if term.lower() in blob:
+            return True
+    return False
 
-# ------------- AI rewrite + classify (single call) -------------
-AI_SYSTEM = (
-    "You write for Australian commercial property professionals (developers, fund managers, REIT CIOs). "
-    "Voice: Shaan Puri / Milk Road—punchy, clear, a bit witty, never cringe. "
-    "Constraints: 100% factual; no speculation or hallucinations; keep finance/asset numbers intact. "
-    "Aim: 10-word headline max; 60-word summary max. "
-    "Classify into one of: top, property, deals, development, reit, finance, markets, policy, startups, tech, global, other."
-)
+def score_item(title: str, source_name: str) -> int:
+    t = title.lower()
+    score = 0
+    # base AU CRE boosts
+    for k in ["reit","yield","cap rate","leasing","pre-commit","acquisition","sale","portfolio","loan","refinance","dexus","gpt","mirvac","stockland","charter hall","goodman","vicinity","scentre"]:
+        if k in t: score += 2
+    # source boost
+    if source_name in TRUSTED_SOURCES: score += 3
+    # deal/dev keywords
+    for k in ["buys","sells","acquires","acquisition","approval","da ","rezoning","mandate","fund","raises","recapitalisation","joint venture","jv"]:
+        if k in t: score += 1
+    return min(score, 10)
 
-AI_USER_TMPL = """Article data:
-Title: {title}
-Summary/body: {body}
-
-Return ONLY JSON:
-{{
-  "title": "Shaan-style headline, ≤10 words, factual",
-  "summary": "≤60 words, concise and useful for CRE pros",
-  "category": "one_of[top,property,deals,development,reit,finance,markets,policy,startups,tech,global,other]"
-}}"""
-
-def extract_json(s: str) -> Dict[str, Any]:
-    # Try raw JSON first
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    # Fallback: grab first {...} block
-    m = re.search(r"\{.*\}", s, flags=re.S)
-    if not m:
-        return {}
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return {}
-
-_last_ai_ts: float = 0.0
-def ai_rewrite_and_classify(title: str, body: str) -> Tuple[str, str, str]:
-    global _last_ai_ts
-    if not title and not body:
-        return "", "", "other"
-
-    # rate-limit to ~OAI_RPM
-    min_gap = 60.0 / max(1, OAI_RPM)
-    dt = time.time() - _last_ai_ts
-    if dt < min_gap:
-        time.sleep(min_gap - dt)
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": AI_SYSTEM},
-            {"role": "user", "content": AI_USER_TMPL.format(title=title or "", body=body or "")}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 220,
-    }
-
-    for attempt in range(1, OAI_MAX_RETRIES + 1):
-        try:
-            resp = client.chat.completions.create(**payload)
-            _last_ai_ts = time.time()
-            content = (resp.choices[0].message.content or "").strip()
-            data = extract_json(content)
-            ai_title = clean_text(data.get("title") or title)
-            ai_summary = clean_text(data.get("summary") or body)
-            cat = (data.get("category") or "other").strip().lower()
-            if cat not in {"top","property","deals","development","reit","finance","markets","policy","startups","tech","global","other"}:
-                cat = "other"
-            return ai_title, ai_summary, cat
-        except Exception as e:
-            logging.warning(f"AI error ({attempt}/{OAI_MAX_RETRIES}): {e}")
-            time.sleep(2 * attempt)
-
-    # fallback: trimmed originals
-    fallback_title = (title or "")[:120]
-    fallback_sum = " ".join((body or "").split()[:60])
-    return clean_text(fallback_title), clean_text(fallback_sum), "other"
-
-# -------------------------- DB schema --------------------------
-
-CREATE_ITEMS_SQL = """
-CREATE TABLE IF NOT EXISTS items (
-  id INTEGER PRIMARY KEY,
-  url TEXT UNIQUE,
-  url_canonical TEXT,
-  fp TEXT,                           -- fingerprint of canonical url
-  source_name TEXT,
-  source_feed TEXT,
-  title TEXT,
-  description TEXT,
-  ai_title TEXT,
-  ai_summary TEXT,
-  category TEXT,
-  score INTEGER,
-  interest_score INTEGER,
-  published_at TEXT,                 -- UTC ISO (with Z or +00:00)
-  processed_at TEXT DEFAULT (datetime('now')),
-  exported_to_rss INTEGER DEFAULT 0, -- 0/1
-  export_batch TEXT                  -- e.g., YYYYMMDD
-);
-"""
-
-REQUIRED_COLS = {
-    "url","url_canonical","fp","source_name","source_feed","title","description",
-    "ai_title","ai_summary","category","score","interest_score","published_at",
-    "processed_at","exported_to_rss","export_batch"
-}
+# ------------- DB -------------
+def connect_db(path: str="rss_items.db") -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    return conn
 
 def ensure_schema(conn: sqlite3.Connection):
-    conn.execute(CREATE_ITEMS_SQL)
-    cur = conn.execute("PRAGMA table_info(items)")
-    have = {r[1] for r in cur.fetchall()}
-    missing = REQUIRED_COLS - have
-    for col in sorted(missing):
-        # minimal types
-        coltype = "TEXT"
-        if col in {"score","interest_score","exported_to_rss"}:
-            coltype = "INTEGER"
-        sql = f"ALTER TABLE items ADD COLUMN {col} {coltype};"
-        conn.execute(sql)
-        logging.info(f"DB: added missing column {col}")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS items(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT,                 -- legacy
+        url_canonical TEXT,
+        link TEXT,
+        link_canonical TEXT UNIQUE,
+        source_name TEXT,
+        source_feed TEXT,
+        title TEXT,
+        raw_summary TEXT,
+        published_at TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        processed_at TEXT,
+        score INTEGER,
+        interest_score INTEGER,
+        category TEXT,
+        ai_title TEXT,
+        ai_summary TEXT,
+        description TEXT,
+        ai_package TEXT,
+        fp TEXT,
+        exported_to_rss INTEGER DEFAULT 0,
+        export_batch TEXT
+    );
+    """)
+    # add missing columns defensively
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+    want = {
+        "url","url_canonical","link","link_canonical","source_name","source_feed","title",
+        "raw_summary","published_at","created_at","processed_at","score","interest_score",
+        "category","ai_title","ai_summary","description","ai_package","fp","exported_to_rss","export_batch"
+    }
+    missing = [c for c in want if c not in cols]
+    for c in missing:
+        conn.execute(f"ALTER TABLE items ADD COLUMN {c} TEXT;")
+        logging.info("DB: added missing column %s", c)
     conn.commit()
 
-# ----------------------- feed fetching ------------------------
+# ------------- OpenAI -------------
+client = OpenAI(timeout=OAI_TIMEOUT_SECS)
 
-def fetch_one(feed: Dict[str,str]) -> Tuple[Dict[str,str], List[Any]]:
-    url = feed.get("url")
-    socket.setdefaulttimeout(FEED_TIMEOUT)
+SYS_PROMPT = (
+    "You are an assistant rewriting RSS snippets strictly from the provided source text, "
+    "for an Australian commercial real estate audience (asset managers, fund managers, developers). "
+    "Do NOT invent facts. If details are missing, keep it high-level or return skip:true.\n"
+    "Tone: sharp, Shaan Puri-esque: punchy, practical, a touch cheeky.\n"
+    "Return ONLY JSON with keys: {skip, title, desc, category}. "
+    "Categories: one of [top, deals, development, finance, policy, areit, retail, industrial, other]."
+)
+
+def ai_rewrite(pkg: Dict) -> Optional[Dict]:
+    prompt = {
+        "role": "user",
+        "content": json.dumps(pkg, ensure_ascii=False)
+    }
+    for attempt in range(OAI_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role":"system","content":SYS_PROMPT},
+                    prompt
+                ],
+                temperature=0.4,
+                max_tokens=280,
+                response_format={"type": "json_object"}
+            )
+            text = resp.choices[0].message.content.strip()
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+            return None
+        except Exception as e:
+            if attempt < OAI_MAX_RETRIES - 1:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            logging.warning("AI error (final): %s", e)
+            return None
+
+# ------------- Fetch & Process -------------
+def fetch_feed(feed) -> List[Item]:
+    name, url = feed["name"], feed["url"]
     try:
-        parsed = feedparser.parse(url)
-        return feed, (parsed.entries or [])
+        d = feedparser.parse(url)
+        items: List[Item] = []
+        cutoff = now_utc() - timedelta(hours=SCAN_WINDOW_HRS)
+        for e in d.entries:
+            link = e.get("link") or e.get("id") or ""
+            if not link:
+                continue
+            pub = parse_rfc2822(e.get("published_parsed")) or parse_rfc2822(e.get("updated_parsed"))
+            if pub and pub < cutoff:
+                continue
+            title = (e.get("title") or "").strip()
+            summary = (e.get("summary") or e.get("description") or "").strip()
+            can = canonicalise_url(link)
+            items.append(Item(
+                link=link,
+                link_canonical=can,
+                source_name=name,
+                source_feed=url,
+                title=title,
+                raw_summary=summary,
+                published_at=to_iso(pub) if pub else None,
+                score=score_item(title, name),
+            ))
+        return items
     except Exception as e:
-        logging.error(f"Fetch error {feed.get('name','?')}: {e}")
-        return feed, []
+        logging.error("Fetch error %s: %s", name, e)
+        return []
 
-def upsert_item(conn: sqlite3.Connection, row: Dict[str, Any]):
-    conn.execute(
-        """
-        INSERT INTO items
-          (url,url_canonical,fp,source_name,source_feed,title,description,ai_title,ai_summary,category,score,interest_score,published_at)
-        VALUES
-          (:url,:url_canonical,:fp,:source_name,:source_feed,:title,:description,:ai_title,:ai_summary,:category,:score,:interest_score,:published_at)
-        ON CONFLICT(url) DO UPDATE SET
-          url_canonical=excluded.url_canonical,
-          fp=excluded.fp,
-          source_name=excluded.source_name,
-          source_feed=excluded.source_feed,
-          title=COALESCE(items.title, excluded.title),
-          description=CASE WHEN (items.description IS NULL OR items.description='') THEN excluded.description ELSE items.description END,
-          ai_title=CASE WHEN (items.ai_title IS NULL OR items.ai_title='') THEN excluded.ai_title ELSE items.ai_title END,
-          ai_summary=CASE WHEN (items.ai_summary IS NULL OR items.ai_summary='') THEN excluded.ai_summary ELSE items.ai_summary END,
-          category=CASE WHEN (items.category IS NULL OR items.category='') THEN excluded.category ELSE items.category END,
-          score=MAX(items.score, excluded.score),
-          interest_score=MAX(items.interest_score, excluded.interest_score),
-          published_at=COALESCE(items.published_at, excluded.published_at);
-        """,
-        row
-    )
+def fetch_all(feeds: List[Dict]) -> List[Item]:
+    t0 = time.time()
+    out: List[Item] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for items in pool.map(fetch_feed, feeds):
+            out.extend(items)
+    logging.info("Fetched recent items from %d feeds (items=%d) in %.1fs",
+                 len(feeds), len(out), time.time() - t0)
+    return out
 
-def process_feed_entries(conn: sqlite3.Connection, feed_meta: Dict[str,str], entries: List[Any]) -> Tuple[int,int,int]:
-    new, kept, ai_calls = 0, 0, 0
-    src_name = feed_meta.get("name") or urlparse(feed_meta.get("url","")).netloc
-    src_feed = feed_meta.get("url") or ""
+def process_items(conn: sqlite3.Connection, items: List[Item]):
+    t_ai = time.time()
+    kept_for_ai, saved = 0, 0
+    ai_used = 0
+    calls_in_window = 0
+    window_started = time.time()
 
-    for e in entries:
-        link = clean_text(getattr(e, "link", "") or "")
-        if not link:
+    for it in items:
+        fp = fingerprint(it.link_canonical or it.link)
+        # initial insert
+        conn.execute("""
+            INSERT OR IGNORE INTO items(link, link_canonical, url, url_canonical,
+                source_name, source_feed, title, raw_summary, published_at,
+                created_at, score, interest_score, fp, exported_to_rss)
+            VALUES(?,?,?,?,?,?,?,?,?, datetime('now'), ?, ?, ?, 0)
+        """, (it.link, it.link_canonical, it.link, it.link_canonical,
+              it.source_name, it.source_feed, it.title, it.raw_summary, it.published_at,
+              it.score, it.score, fp))
+        conn.commit()
+
+        # fetch row
+        row = conn.execute("SELECT * FROM items WHERE link_canonical=?", (it.link_canonical,)).fetchone()
+        if not row:
             continue
-        url_canon = canonicalise_url(link)
-        body = get_entry_body(e)
-        title = clean_text(getattr(e, "title", "") or "")
-        published_at = get_entry_published(e)
 
-        # Decide if we even bother the model
-        base_cat = "property" if "realcommercial" in link or "realestate.com.au" in link else "other"
-        base_score = score_item(src_name, title, body, base_cat)
+        already_done = bool(row["ai_summary"])
+        eligible = (
+            it.score >= MIN_SCORE_FOR_AI and
+            looks_like_cre(it.title, it.raw_summary, it.source_name)
+        )
 
-        if base_score >= MIN_SCORE_FOR_AI:
-            ai_title, ai_summary, cat = ai_rewrite_and_classify(title, body)
-            ai_calls += 1
-        else:
-            ai_title, ai_summary, cat = title, " ".join(body.split()[:60]), base_cat
+        if already_done or not eligible or ai_used >= MAX_AI_ITEMS:
+            continue
 
-        score = score_item(src_name, ai_title or title, ai_summary or body, cat)
-        row = {
-            "url": link,
-            "url_canonical": url_canon,
-            "fp": fp_for_url(url_canon),
-            "source_name": src_name,
-            "source_feed": src_feed,
-            "title": title,
-            "description": body,
-            "ai_title": ai_title,
-            "ai_summary": ai_summary,
-            "category": cat,
-            "score": score,
-            "interest_score": score,  # alias for now
-            "published_at": published_at,
+        # simple RPM throttle
+        calls_in_window += 1
+        elapsed = time.time() - window_started
+        if calls_in_window >= OAI_RPM:
+            sleep_for = max(0.0, 60.0 - elapsed)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            window_started = time.time()
+            calls_in_window = 0
+
+        # AI call
+        pkg = {
+            "source_name": it.source_name,
+            "source_title": it.title,
+            "source_summary": it.raw_summary,
+            "constraints": {
+                "no_hallucinations": True,
+                "aussie_english": True,
+                "max_words": 140
+            }
         }
-        upsert_item(conn, row)
-        kept += 1
+        res = ai_rewrite(pkg)
+        ai_used += 1
+        if not res or res.get("skip") is True:
+            continue
 
-    conn.commit()
-    return new, kept, ai_calls
+        ai_title = (res.get("title") or "").strip()
+        ai_desc  = (res.get("desc") or "").strip()
+        cat      = (res.get("category") or "other").strip().lower()
 
-# ----------------------------- main ---------------------------
+        conn.execute("""
+            UPDATE items SET
+              processed_at = datetime('now'),
+              ai_title = ?,
+              ai_summary = ?,
+              description = ?,
+              category = ?,
+              ai_package = ?,
+              interest_score = COALESCE(interest_score, score)
+            WHERE id = ?
+        """, (ai_title, ai_desc, ai_desc, cat, json.dumps(res, ensure_ascii=False), row["id"]))
+        conn.commit()
+        kept_for_ai += 1
+
+    logging.info("TIMING: ai phase %.1fs | ai_calls=%d", time.time() - t_ai, ai_used)
+    logging.info("SUMMARY: scanned=%d new/updated=%d kept_for_ai=%d",
+                 len(items), saved, kept_for_ai)
 
 def main():
-    conn = sqlite3.connect(DB_PATH)
-    ensure_schema(conn)
-
-    logging.info(f"Loaded {len(RSS_FEEDS)} feeds | MAX_WORKERS={MAX_WORKERS} FEED_TIMEOUT={FEED_TIMEOUT}s OAI_RPM={OAI_RPM} MIN_SCORE_FOR_AI={MIN_SCORE_FOR_AI}")
-
-    total_items = 0
-    total_kept = 0
-    total_ai = 0
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(fetch_one, feed) for feed in RSS_FEEDS]
-        results = [f.result() for f in futures]
-
-    for feed_meta, entries in results:
-        total_items += len(entries)
-        _, kept, ai_calls = process_feed_entries(conn, feed_meta, entries)
-        total_kept += kept
-        total_ai += ai_calls
-
-    logging.info(f"SUMMARY: scanned={total_items} saved/updated={total_kept} ai_calls={total_ai}")
+    conn = connect_db(os.getenv("RSS_DB_PATH","rss_items.db"))
+    t0 = time.time()
+    items = fetch_all(RSS_FEEDS)
+    logging.info("TIMING: fetch phase %.1fs", time.time() - t0)
+    process_items(conn, items)
+    logging.info("TIMING: total %.1fs", time.time() - t0)
 
 if __name__ == "__main__":
     main()
