@@ -2,12 +2,13 @@
 """
 RSS Feed Analyzer for A-REIT CEO/COO - Executive Intelligence Platform
 ULTRA-ENGAGING VERSION - Dynamic AI content with hallucination prevention
+Updated for OpenAI API v1.0+
 """
 
 import feedparser
 import sqlite3
 import smtplib
-import openai
+from openai import OpenAI  # New import style
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -132,8 +133,8 @@ class RSSAnalyzer:
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
         
-        # Initialize OpenAI
-        openai.api_key = self.config['openai_api_key']
+        # Initialize OpenAI client (new style)
+        self.client = OpenAI(api_key=self.config['openai_api_key'])
         
         # Initialize database
         self.init_database()
@@ -322,7 +323,8 @@ Items to analyze:
                 prompt += f"\nItem {idx}:\nTitle: {item.title}\nDescription: {desc}\n"
             
             try:
-                response = openai.ChatCompletion.create(
+                # Use new OpenAI API syntax
+                response = self.client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
                         {"role": "system", "content": "You are a commercial property analyst. Be accurate, specific, and never make up facts."},
@@ -390,6 +392,196 @@ Items to analyze:
         
         return analyzed_items
 
+    def generate_quick_insight(self, title: str, description: str) -> str:
+        """Generate a quick insight if AI summary is missing"""
+        # Use cached response if available
+        cache_key = hashlib.md5(f"{title}:{description[:100]}".encode()).hexdigest()
+        if cache_key in self.ai_cache:
+            return self.ai_cache[cache_key]
+        
+        try:
+            prompt = f"""In ONE sentence, explain why this matters to commercial property investors:
+Title: {title}
+Be specific and actionable. No fluff."""
+
+            # Use new OpenAI API syntax
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.3
+            )
+            
+            insight = response.choices[0].message.content.strip()
+            self.ai_cache[cache_key] = insight
+            return insight
+            
+        except:
+            return "This development could impact property market dynamics and investment strategies."
+
+    def generate_ai_market_summary(self, top_items: List[Tuple]) -> str:
+        """Generate market summary using AI"""
+        if not top_items:
+            return "Markets are quiet today."
+        
+        headlines = "\n".join([f"- {item[0]}" for item in top_items[:5]])
+        
+        try:
+            prompt = f"""Based on these top property news headlines, write a 2-sentence market summary:
+
+{headlines}
+
+Focus on the overall market direction and key theme. Be specific but concise."""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.5
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except:
+            return "Property markets are showing mixed signals with several developments worth monitoring."
+
+    def generate_ai_greeting(self, critical_items: List[Tuple], market_summary: str) -> str:
+        """Generate personalized greeting using AI"""
+        
+        try:
+            context = "critical alerts today" if critical_items else "steady market conditions"
+            
+            prompt = f"""Write a 2-3 sentence engaging opening for a property market briefing email.
+
+Context: {context}
+Market summary: {market_summary}
+
+Make it conversational, slightly witty, and action-oriented. Like you're talking to a smart friend who runs a REIT.
+Start with something like "Morning champion" or "Hey there" - keep it fresh."""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except:
+            if critical_items:
+                return "Good morning! Buckle up - we've got some critical developments that need your attention today. Let's dive into what's moving the market."
+            else:
+                return "Morning champion! Markets are steady but there are opportunities hiding in today's news. Here's what you need to know."
+
+    def generate_ai_big_story(self, critical_items: List[Tuple]) -> Optional[str]:
+        """Generate the big story narrative if there's critical news"""
+        if not critical_items:
+            return None
+        
+        top_story = critical_items[0]
+        
+        try:
+            prompt = f"""Write a 3-4 sentence narrative about why this is THE story to watch today:
+
+Title: {top_story[0]}
+Context: {top_story[4] if top_story[4] else top_story[2][:200]}
+
+Make it compelling and specific about the commercial property impact. Use active voice and strong verbs."""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.5
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except:
+            return None
+
+    def generate_ai_subject_line(self, critical_items: List[Tuple], market_summary: str) -> str:
+        """Generate engaging subject line using AI"""
+        
+        try:
+            context = critical_items[0][0] if critical_items else market_summary[:100]
+            
+            prompt = f"""Write a compelling email subject line for a property market briefing.
+
+Top story: {context}
+
+Make it urgent but not clickbait. Max 60 characters. Use an emoji."""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=30,
+                temperature=0.8
+            )
+            
+            subject = response.choices[0].message.content.strip()
+            # Ensure it's not too long
+            if len(subject) > 70:
+                subject = subject[:67] + "..."
+            return subject
+            
+        except:
+            fallbacks = [
+                "🔥 Property Alert: Big Moves in Today's Market",
+                "📊 Your Daily Edge: Critical Property Intel Inside",
+                "🎯 Market Shift: What You Need to Know Today",
+                "⚡ Breaking: Key Developments in Commercial Property"
+            ]
+            return random.choice(fallbacks)
+
+    def generate_ai_action_recommendation(self, critical_items: List[Tuple], market_summary: str) -> str:
+        """Generate specific action recommendations"""
+        
+        try:
+            context = "Critical items: " + ", ".join([item[0][:50] for item in critical_items[:3]]) if critical_items else "No critical items"
+            
+            prompt = f"""Based on today's property market developments, write 2-3 specific action items for a REIT CEO.
+
+{context}
+Market: {market_summary}
+
+Be specific and actionable. Format as bullet points. Focus on what they should DO today."""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.4
+            )
+            
+            return response.choices[0].message.content.strip().replace('•', '→').replace('- ', '→ ')
+            
+        except:
+            return """→ Review your portfolio exposure to interest rate changes
+→ Schedule team discussion on market positioning
+→ Monitor tenant stability in retail properties"""
+
+    def calculate_market_temp(self, items: List[Tuple]) -> int:
+        """Calculate market temperature (0-100)"""
+        if not items:
+            return 50
+        
+        high_scores = len([item for item in items if item[3] >= 7])
+        total = len(items)
+        
+        # Temperature based on proportion of high-impact news
+        temp = 50 + (high_scores / max(total, 1)) * 50
+        
+        # Adjust based on sentiment
+        sentiments = [item[8] for item in items[:10] if len(item) > 8 and item[8]]
+        if sentiments:
+            bullish = sentiments.count('Bullish')
+            bearish = sentiments.count('Bearish')
+            temp += (bullish - bearish) * 5
+        
+        return min(100, max(0, int(temp)))
+
     def generate_dynamic_email_content(self, items: List[Tuple]) -> str:
         """Generate ultra-engaging HTML email with dynamic AI content"""
         
@@ -420,7 +612,7 @@ Items to analyze:
         
         current_date = datetime.now().strftime('%B %d, %Y')
         
-        # Build HTML email
+        # Build HTML email (rest of the HTML generation code remains the same)
         html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -805,195 +997,6 @@ Items to analyze:
 """
         return html
 
-    def generate_quick_insight(self, title: str, description: str) -> str:
-        """Generate a quick insight if AI summary is missing"""
-        # Use cached response if available
-        cache_key = hashlib.md5(f"{title}:{description[:100]}".encode()).hexdigest()
-        if cache_key in self.ai_cache:
-            return self.ai_cache[cache_key]
-        
-        try:
-            prompt = f"""In ONE sentence, explain why this matters to commercial property investors:
-Title: {title}
-Be specific and actionable. No fluff."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50,
-                temperature=0.3
-            )
-            
-            insight = response.choices[0].message.content.strip()
-            self.ai_cache[cache_key] = insight
-            return insight
-            
-        except:
-            return "This development could impact property market dynamics and investment strategies."
-
-    def generate_ai_market_summary(self, top_items: List[Tuple]) -> str:
-        """Generate market summary using AI"""
-        if not top_items:
-            return "Markets are quiet today."
-        
-        headlines = "\n".join([f"- {item[0]}" for item in top_items[:5]])
-        
-        try:
-            prompt = f"""Based on these top property news headlines, write a 2-sentence market summary:
-
-{headlines}
-
-Focus on the overall market direction and key theme. Be specific but concise."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.5
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except:
-            return "Property markets are showing mixed signals with several developments worth monitoring."
-
-    def generate_ai_greeting(self, critical_items: List[Tuple], market_summary: str) -> str:
-        """Generate personalized greeting using AI"""
-        
-        try:
-            context = "critical alerts today" if critical_items else "steady market conditions"
-            
-            prompt = f"""Write a 2-3 sentence engaging opening for a property market briefing email.
-
-Context: {context}
-Market summary: {market_summary}
-
-Make it conversational, slightly witty, and action-oriented. Like you're talking to a smart friend who runs a REIT.
-Start with something like "Morning champion" or "Hey there" - keep it fresh."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.7
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except:
-            if critical_items:
-                return "Good morning! Buckle up - we've got some critical developments that need your attention today. Let's dive into what's moving the market."
-            else:
-                return "Morning champion! Markets are steady but there are opportunities hiding in today's news. Here's what you need to know."
-
-    def generate_ai_big_story(self, critical_items: List[Tuple]) -> Optional[str]:
-        """Generate the big story narrative if there's critical news"""
-        if not critical_items:
-            return None
-        
-        top_story = critical_items[0]
-        
-        try:
-            prompt = f"""Write a 3-4 sentence narrative about why this is THE story to watch today:
-
-Title: {top_story[0]}
-Context: {top_story[4] if top_story[4] else top_story[2][:200]}
-
-Make it compelling and specific about the commercial property impact. Use active voice and strong verbs."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.5
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except:
-            return None
-
-    def generate_ai_subject_line(self, critical_items: List[Tuple], market_summary: str) -> str:
-        """Generate engaging subject line using AI"""
-        
-        try:
-            context = critical_items[0][0] if critical_items else market_summary[:100]
-            
-            prompt = f"""Write a compelling email subject line for a property market briefing.
-
-Top story: {context}
-
-Make it urgent but not clickbait. Max 60 characters. Use an emoji."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=30,
-                temperature=0.8
-            )
-            
-            subject = response.choices[0].message.content.strip()
-            # Ensure it's not too long
-            if len(subject) > 70:
-                subject = subject[:67] + "..."
-            return subject
-            
-        except:
-            fallbacks = [
-                "🔥 Property Alert: Big Moves in Today's Market",
-                "📊 Your Daily Edge: Critical Property Intel Inside",
-                "🎯 Market Shift: What You Need to Know Today",
-                "⚡ Breaking: Key Developments in Commercial Property"
-            ]
-            return random.choice(fallbacks)
-
-    def generate_ai_action_recommendation(self, critical_items: List[Tuple], market_summary: str) -> str:
-        """Generate specific action recommendations"""
-        
-        try:
-            context = "Critical items: " + ", ".join([item[0][:50] for item in critical_items[:3]]) if critical_items else "No critical items"
-            
-            prompt = f"""Based on today's property market developments, write 2-3 specific action items for a REIT CEO.
-
-{context}
-Market: {market_summary}
-
-Be specific and actionable. Format as bullet points. Focus on what they should DO today."""
-
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.4
-            )
-            
-            return response.choices[0].message.content.strip().replace('•', '→').replace('- ', '→ ')
-            
-        except:
-            return """→ Review your portfolio exposure to interest rate changes
-→ Schedule team discussion on market positioning
-→ Monitor tenant stability in retail properties"""
-
-    def calculate_market_temp(self, items: List[Tuple]) -> int:
-        """Calculate market temperature (0-100)"""
-        if not items:
-            return 50
-        
-        high_scores = len([item for item in items if item[3] >= 7])
-        total = len(items)
-        
-        # Temperature based on proportion of high-impact news
-        temp = 50 + (high_scores / max(total, 1)) * 50
-        
-        # Adjust based on sentiment
-        sentiments = [item[8] for item in items[:10] if len(item) > 8 and item[8]]
-        if sentiments:
-            bullish = sentiments.count('Bullish')
-            bearish = sentiments.count('Bearish')
-            temp += (bullish - bearish) * 5
-        
-        return min(100, max(0, int(temp)))
-
     def process_daily_intelligence(self):
         """Main processing for daily 6am email"""
         logging.info("=" * 60)
@@ -1098,6 +1101,33 @@ Be specific and actionable. Format as bullet points. Focus on what they should D
         except Exception as e:
             logging.error(f"Failed to send email: {e}")
 
+    def cleanup_old_items(self, days: int = 7):
+        """Remove items older than specified days"""
+        try:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            
+            # Count items to be deleted
+            cursor = self.conn.execute(
+                'SELECT COUNT(*) FROM items WHERE processed_at < ?', 
+                (cutoff_date,)
+            )
+            count = cursor.fetchone()[0]
+            
+            if count > 0:
+                # Delete old items
+                self.conn.execute(
+                    'DELETE FROM items WHERE processed_at < ?', 
+                    (cutoff_date,)
+                )
+                self.conn.commit()
+                logging.info(f"Cleaned up {count} items older than {days} days")
+            else:
+                logging.info(f"No items older than {days} days found")
+                
+        except Exception as e:
+            logging.error(f"Cleanup error: {e}")
+            raise
+
 
 def main():
     """Main function"""
@@ -1114,9 +1144,15 @@ def main():
             elif command == 'email':
                 logging.info("Sending daily email only...")
                 analyzer.send_daily_intelligence_email()
+            
+            elif command == 'cleanup':
+                days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+                logging.info(f"Cleaning up items older than {days} days...")
+                analyzer.cleanup_old_items(days)
+                logging.info("Cleanup completed!")
                 
             else:
-                print("Usage: python rss_analyzer.py [process|email]")
+                print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
                 sys.exit(1)
         else:
             # Schedule for 6am daily
