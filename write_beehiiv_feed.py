@@ -26,38 +26,69 @@ def cdata(s: str) -> str:
 
 def get_newsletter_metadata(conn: sqlite3.Connection) -> Tuple[str, str]:
     """Get the latest headline and subhead from newsletter_metadata"""
-    cur = conn.execute("""
-        SELECT headline, subhead FROM newsletter_metadata 
-        ORDER BY created_at DESC 
-        LIMIT 1
-    """)
-    result = cur.fetchone()
-    if result:
-        return result[0] or "Morning Property Brief", result[1] or "Latest updates from Australian commercial property"
+    try:
+        cur = conn.execute("""
+            SELECT headline, subhead FROM newsletter_metadata 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """)
+        result = cur.fetchone()
+        if result:
+            return result[0] or "Morning Property Brief", result[1] or "Latest updates from Australian commercial property"
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet
+        pass
     return "Morning Property Brief", "Latest updates from Australian commercial property"
 
 def fetch(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     since = datetime.now(tz=TZ) - timedelta(hours=SCAN_WINDOW_HRS)
-    cur = conn.execute("""
-        SELECT source_name, link, link_canonical, ai_title, ai_desc, ai_tags, published_at
-        FROM items
-        WHERE relevant=1 AND ai_desc IS NOT NULL AND length(ai_desc) > 40
-    """)
-    rows = []
-    for r in cur.fetchall():
+    
+    try:
+        # Try with AI columns first
+        cur = conn.execute("""
+            SELECT source_name, link, link_canonical, ai_title, ai_desc, ai_tags, published_at
+            FROM items
+            WHERE relevant=1 AND ai_desc IS NOT NULL AND length(ai_desc) > 40
+        """)
+        rows = cur.fetchall()
+        use_ai_columns = True
+    except sqlite3.OperationalError:
+        # Fall back to basic columns
+        cur = conn.execute("""
+            SELECT source_name, link, link_canonical, title, summary, '', published_at
+            FROM items
+            WHERE length(summary) > 40
+        """)
+        rows = cur.fetchall()
+        use_ai_columns = False
+        logging.info("Using basic columns (AI columns not available yet)")
+    
+    items = []
+    for r in rows:
         try:
             pub = datetime.fromisoformat(r[6])
         except Exception:
             pub = datetime.now(tz=TZ)
         if pub < since:
             continue
-        rows.append({
+        
+        # Handle both AI and basic column formats
+        if use_ai_columns:
+            title = r[3] or r[0]  # ai_title or fallback
+            desc = r[4] or r[1]   # ai_desc or fallback
+            tags = (r[5] or "").split(",") if r[5] else []
+        else:
+            title = r[3] or ""    # basic title
+            desc = r[4] or ""     # basic summary
+            tags = []
+            
+        items.append({
             "source": r[0],
             "link": r[1] or "",
             "canon": r[2] or r[1] or "",
-            "title": r[3] or "",
-            "desc": r[4] or "",
-            "tags": (r[5] or "").split(",") if r[5] else [],
+            "title": title,
+            "desc": desc,
+            "tags": tags,
             "pub": pub,
         })
     
@@ -70,8 +101,8 @@ def fetch(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
                 bump += 1
         return bump
     
-    rows.sort(key=lambda x: (x["pub"], score_title(x["title"])), reverse=True)
-    return rows
+    items.sort(key=lambda x: (x["pub"], score_title(x["title"])), reverse=True)
+    return items
 
 def create_newsletter_summary(items: List[Dict[str, Any]], headline: str, subhead: str) -> str:
     """Create a newsletter summary item with headline and subhead"""
