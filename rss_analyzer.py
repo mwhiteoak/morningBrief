@@ -1,343 +1,309 @@
 #!/usr/bin/env python3
 """
-Morning Briefing — AU CRE Intelligence (Beehiiv-ready)
+Morning Briefing — AU CRE Intelligence (Beehiiv-ready, multi-feed)
 - Fetches feeds (incremental, parallel)
-- Filters & scores with AU/role weighting
-- Summarises with OpenAI (throttled, cached, no fallbacks)
+- Filters & scores for AU property pros (CRE-first)
+- Rewrites in a Shaan Puri-ish voice *without* inventing facts (Aussie English)
+- Classifies into sections for multi-RSS output
 - Stores everything in sqlite: rss_items.db
 """
 
-import feedparser, sqlite3, os, re, json, time, socket, logging, concurrent.futures
+import os, re, json, time, sqlite3, logging, socket, concurrent.futures
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-from dotenv import load_dotenv
-from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-# ---- OpenAI SDK >= 1.0 interface ----
+import feedparser
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from feeds import RSS_FEEDS
+
 load_dotenv()
 
 # ---------- Tunables via env ----------
 LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
-OPENAI_MODEL     = os.getenv('OPENAI_MODEL', 'gpt-4o')
-NEWSLETTER_NAME  = os.getenv('NEWSLETTER_NAME', 'Morning Briefing')
-OAI_RPM          = int(os.getenv('OAI_RPM', '25'))            # requests/min cap
-OAI_MAX_RETRIES  = int(os.getenv('OAI_MAX_RETRIES', '4'))
-MAX_WORKERS      = int(os.getenv("MAX_WORKERS", "6"))         # feed fetch concurrency
-FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))       # per-feed seconds
-MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "5"))    # skip AI below this
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
+NEWSLETTER_NAME  = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
+OAI_RPM          = int(os.getenv("OAI_RPM", "25"))               # requests/min cap
+OAI_MAX_RETRIES  = int(os.getenv("OAI_MAX_RETRIES", "4"))
+MAX_WORKERS      = int(os.getenv("MAX_WORKERS", "8"))            # feed fetch concurrency
+FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))          # per-feed seconds
+MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "5"))       # below this: skip AI
+TZ_REGION        = os.getenv("TZ_REGION", "Australia/Brisbane")
+SCAN_WINDOW_HRS  = int(os.getenv("SCAN_WINDOW_HRS", "36"))       # look-back
 # --------------------------------------
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler('rss_analyzer.log', encoding='utf-8'),
-              logging.StreamHandler()]
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# AU relevance
-AU_TERMS = [
-    'australia','australian','a-reit','asx','rba','abs','treasury','brisbane','sydney','melbourne','perth','adelaide',
-    'queensland','new south wales','victoria','western australia','south australia','tasmania','canberra',
-    'lease','leasing','vacancy','wale','nabers','cap rate','valuation','capital raising','debt refinance','development approval',
-    'da approval','planning permit','zoning','logistics','industrial','retail','office','shopping centre','neighbourhood centre'
-]
-DOWNWEIGHT_GLOBAL_NOISE = ['u.s.','united states','europe','uk','london','new york','nasdaq','s&p 500','dow']
-ROLE_SIGNALS = {
-    'asset_manager': ['opex','capex','tenant retention','leasing spread','arrears','waivers','incentives','nla','occupancy','nabers','opex ratio'],
-    'fund_manager':  ['distribution','yield','irr','nav','cap rate','valuation','gearing','lvr','debt','refinance','covenant','liquidity','dpu'],
-    'acquisitions':  ['off-market','acquisition','disposal','buyout','merger','takeover','sale','price','book value','pipeline','heads of agreement']
-}
-SENSITIVE = [
-    'manslaughter','murder','child abuse','dies','died','death','killed','sexual assault','rape','domestic violence','suicide',
-    'homicide','overdose','fatal','shooting','stabbing','assault','kidnapping','trafficking','abuse','violence','crash victim',
-    'car accident','plane crash','drowning','fire death','explosion death'
-]
+# ---- DB helpers --------------------------------------------------------------
+DB_PATH = os.getenv("RSS_DB_PATH", "rss_items.db")
 
-@dataclass
-class FeedItem:
-    title: str
-    link: str
-    description: str
-    published: datetime
-    source_feed: str
-    source_name: str
-    interest_score: Optional[int] = None
-    ai_summary: Optional[str] = None
-    category: Optional[str] = None
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def canonicalize_link(url: str) -> str:
-    """Strip tracking params & fragments to create stable GUIDs & fingerprints."""
+def ensure_schema(conn: sqlite3.Connection):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS items(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT UNIQUE,
+      url_canonical TEXT,
+      source TEXT,
+      title TEXT,
+      published_at TEXT,
+      raw_summary TEXT,
+      score INTEGER,
+      category_main TEXT,
+      ai_title TEXT,
+      ai_desc_html TEXT,
+      ai_tags TEXT,                -- JSON list
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    # Safe schema evolutions (no-op if columns already exist)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+    for col, ddl in [
+        ("category_main", "ALTER TABLE items ADD COLUMN category_main TEXT"),
+        ("ai_title",      "ALTER TABLE items ADD COLUMN ai_title TEXT"),
+        ("ai_desc_html",  "ALTER TABLE items ADD COLUMN ai_desc_html TEXT"),
+        ("ai_tags",       "ALTER TABLE items ADD COLUMN ai_tags TEXT"),
+    ]:
+        if col not in cols:
+            try: conn.execute(ddl)
+            except sqlite3.OperationalError: pass
+    conn.commit()
+
+# ---- Utilities ---------------------------------------------------------------
+def now_au() -> datetime:
+    # naive but effective for Actions; we only need local-ish wall time
+    return datetime.utcnow() + timedelta(hours=10)  # AEST (+10); set TZ_REGION in workflows if needed
+
+def canonicalise_url(u: str) -> str:
     try:
-        u = urlparse(url)
-        keep = set(['id','p','article','story'])
-        q = [(k,v) for k,v in parse_qsl(u.query, keep_blank_values=False) if k.lower() in keep]
-        clean = u._replace(query=urlencode(q), fragment='')
-        return urlunparse(clean)
+        p = urlparse(u)
+        q = [(k,v) for (k,v) in parse_qsl(p.query) if k.lower() not in {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"}]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
     except Exception:
-        return url
+        return u
 
-def fingerprint(title: str, link: str, source: str) -> str:
-    base = canonicalize_link(link).lower().strip()
-    tnorm = re.sub(r'\s+', ' ', (title or '').lower()).strip()
-    return f"{source.lower()}::{tnorm}::{base}"
+PUBLISHER_TIER = {
+    # Tiered preference (higher is better surfacing)
+    "AFR": 5, "Australian Financial Review Property": 5, "Real Commercial": 5, "The Urban Developer": 4,
+    "Domain Business": 4, "realestate.com.au News": 4, "PCA News": 4, "Business News - Property": 4,
+    "The Australian - Business": 3, "The Age - Business": 3, "The Age Federal Politics": 3, "ABC News": 3,
+    "Small Caps": 2, "MIT Technology Review": 2, "AusFintech": 2, "Cointelegraph": 1, "WSJ - Markets": 1, "WSJ - World News": 1,
+}
 
-class OpenAIThrottle:
-    def __init__(self, rpm: int):
-        self.rpm = max(1, rpm)
-        self.window = []
-    def wait(self):
-        now = time.time()
-        self.window = [t for t in self.window if now - t < 60]
-        if len(self.window) >= self.rpm:
-            sleep_for = 60 - (now - self.window[0]) + 0.05
-            time.sleep(max(0.05, sleep_for))
-        self.window.append(time.time())
+CRE_KEYWORDS = [
+    "property","real estate","commercial","office","industrial","retail","logistics",
+    "warehouse","shopping centre","shopping center","mall","leasing","vacancy","cap rate",
+    "yield","transaction","acquisition","divestment","REIT","A-REIT","development","DA","planning",
+    "construction","build-to-rent","BTR","student accommodation","self-storage","hotel","hospitality",
+    "zoning","infrastructure","tenancy","pre-commitment","valuation","debt","lenders","syndicate","capital",
+    "fund","equity","acquirer","merger","JV","residential supply","housing","auction clearance"
+]
 
-class RSSAnalyzer:
-    def __init__(self):
-        self.conn = sqlite3.connect('rss_items.db', check_same_thread=False)
-        self.ensure_schema()
-        self.rss_feeds = RSS_FEEDS
-        self.oai = OpenAIThrottle(OAI_RPM)
-        self.metrics = {
-            'fetched':0, 'deduped_out':0, 'sensitive_out':0,
-            'kept_new':0, 'cache_hits':0, 'ai_calls':0, 'ai_success':0, 'ai_fail':0,
-            'skipped_low_score':0
-        }
-        logging.info(f"Loaded {len(self.rss_feeds)} feeds | MAX_WORKERS={MAX_WORKERS} FEED_TIMEOUT={FEED_TIMEOUT}s OAI_RPM={OAI_RPM} MIN_SCORE_FOR_AI={MIN_SCORE_FOR_AI}")
+CATEGORY_MAP = {
+    "deals_capital": ["deal","transaction","acquisition","divestment","sale","equity","debt","raise","JV","syndicate","fund","capital","merger"],
+    "development_planning": ["development","DA","planning","approval","construction","rezoning","masterplan"],
+    "leasing": ["lease","leasing","pre-commitment","tenant","tenancy","occupancy","rent"],
+    "macro": ["rates","inflation","bond","employment","GDP","CPI","RBA","economy","AUD"],
+    "reits": ["REIT","A-REIT","distribution","NTA","FFO","earnings","guidance","vape? nope"],
+    "retail": ["retail","shopping","mall","centre","center","foot traffic"],
+    "industrial": ["industrial","logistics","warehouse","sheds"],
+    "office": ["office","CBD","fringe","workspace","fitted","coworking"],
+    "residential": ["residential","housing","apartments","BTR","house","units"],
+    "proptech_finance": ["proptech","fintech","mortgage","broker","lender","platform","token","AI","data"],
+}
 
-    def ensure_schema(self):
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                link TEXT NOT NULL,
-                link_canonical TEXT,
-                fp TEXT UNIQUE,
-                description TEXT,
-                published DATETIME,
-                source_feed TEXT,
-                source_name TEXT,
-                interest_score INTEGER,
-                ai_summary TEXT,
-                category TEXT,
-                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ai_package TEXT,
-                exported_to_rss INTEGER DEFAULT 0,
-                export_batch TEXT
+def score_item(title: str, summary: str, source: str) -> int:
+    txt = f"{title} {summary}".lower()
+    base = 0
+    # CRE signal
+    for kw in CRE_KEYWORDS:
+        if kw in txt: base += 2
+    # Publisher weight
+    base += PUBLISHER_TIER.get(source, 1)
+    # Obvious de-prioritisers
+    if "podcast" in txt: base -= 2
+    if "newsletter" in txt and "subscribe" in txt: base -= 2
+    return max(0, base)
+
+def classify_guess(title: str, summary: str) -> str:
+    t = f"{title} {summary}".lower()
+    best, hit = "macro", 0
+    for cat, kws in CATEGORY_MAP.items():
+        sc = sum(k in t for k in kws)
+        if sc > hit:
+            hit, best = sc, cat
+    return best
+
+# ---- OpenAI summariser (no new facts; Aussie EN) -----------------------------
+SYS_PROMPT = """You are a sharp finance-desk editor for an AUSTRALIAN commercial real estate (CRE) briefing.
+
+GOALS:
+- Rewrite ONLY what’s in the provided source text (title + snippet). Do NOT add new facts, numbers or claims.
+- Keep Aussie English spellings.
+- Voice: energetic, Shaan Puri-ish (punchy, a zinger or two), but strictly faithful to source.
+- Audience: property professionals (lenders, fund managers, asset managers, developers).
+- If the source is too thin to be useful for CRE readers, mark "exclude": true.
+
+OUTPUT JSON with fields:
+{
+ "ai_title": "spicy but faithful headline (<= 12 words)",
+ "ai_desc_html": "<p>2–4 tight sentences. No invented facts. One fun line OK.</p>",
+ "category_main": "one of [deals_capital, development_planning, leasing, macro, reits, retail, industrial, office, residential, proptech_finance]",
+ "tags": ["a few", "lower_snake_case"],
+ "exclude": false
+}
+Rules:
+- No swearing or crude language.
+- If the original text has no CRE relevance or is too vague, set exclude = true and ai_desc_html = "Insufficient data..."
+"""
+
+def ai_rewrite(title: str, summary: str, source: str, url: str) -> Optional[Dict]:
+    user = f"""SOURCE:
+title: {title}
+snippet: {summary}
+publisher: {source}
+url: {url}
+"""
+    for i in range(OAI_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.4,
+                messages=[
+                    {"role":"system","content":SYS_PROMPT},
+                    {"role":"user","content":user}
+                ]
             )
-        ''')
-        try: self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_fp ON items(fp)")
-        except sqlite3.OperationalError: pass
-        self.conn.commit()
-
-    # --- DB checks ---
-    def item_exists_fp(self, fp: str) -> bool:
-        return self.conn.execute('SELECT 1 FROM items WHERE fp = ?', (fp,)).fetchone() is not None
-
-    def save_item(self, item: FeedItem, ai_package: Optional[dict] = None):
-        link_can = canonicalize_link(item.link)
-        fpv = fingerprint(item.title, link_can, item.source_name)
-        self.conn.execute('''
-            INSERT OR IGNORE INTO items
-            (title,link,link_canonical,fp,description,published,source_feed,source_name,
-             interest_score,ai_summary,category,ai_package)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        ''', (
-            item.title, item.link, link_can, fpv, item.description, item.published, item.source_feed, item.source_name,
-            item.interest_score, item.ai_summary, item.category,
-            json.dumps(ai_package, ensure_ascii=False) if ai_package else None
-        ))
-        self.conn.commit()
-
-    # --- relevance & scoring ---
-    def property_relevance_boost(self, text: str) -> int:
-        t = text.lower()
-        score = 0
-        for kw in AU_TERMS:
-            if kw in t: score += 2
-        for kw in ROLE_SIGNALS['asset_manager'] + ROLE_SIGNALS['fund_manager'] + ROLE_SIGNALS['acquisitions']:
-            if kw in t: score += 1
-        for kw in DOWNWEIGHT_GLOBAL_NOISE:
-            if kw in t and 'australia' not in t: score -= 2
-        return score
-
-    def auto_score(self, item: FeedItem):
-        combined = (item.title + " " + (item.description or "")).lower()
-        if any(k in combined for k in SENSITIVE):
-            item.interest_score = 1; item.category = 'Filtered'; item.ai_summary = f"Filtered: {item.title}"
-            return
-        score = 4 + max(-3, min(6, self.property_relevance_boost(combined)))
-        item.interest_score = max(1, min(10, score))
-        item.category = 'AU CRE' if score >= 5 else 'General'
-
-    # --- OpenAI summariser (throttled, cached, retries) ---
-    def _safe_json_extract(self, txt: str) -> Optional[dict]:
-        try:
-            s = txt.find('{'); e = txt.rfind('}')
-            if s != -1 and e != -1 and e > s:
-                return json.loads(txt[s:e+1])
-        except Exception:
-            pass
-        return None
-
-    def summarise_for_beehiiv(self, item: FeedItem) -> Optional[dict]:
-        # cached?
-        row = self.conn.execute(
-            "SELECT ai_package FROM items WHERE link_canonical = ? OR link = ?",
-            (canonicalize_link(item.link), item.link)
-        ).fetchone()
-        if row and row[0]:
-            try:
-                self.metrics['cache_hits'] += 1
-                return json.loads(row[0])
-            except Exception:
-                pass
-
-        title = item.title or ""
-        description = (item.description or item.ai_summary or "")[:1200]
-        source_name = item.source_name or ""
-        link = canonicalize_link(item.link)
-        published_iso = item.published.replace(tzinfo=timezone.utc).isoformat() if isinstance(item.published, datetime) else ""
-
-        prompt = f"""
-You are an Australian commercial property analyst writing for asset managers, fund managers, and acquisitions teams.
-Use AU English. Be concise, finance-desk sharp, with occasional light zingers. No hype.
-
-You will receive: {title}, {description}, {source_name}, {link}, {published_iso}.
-Only summarise what’s present in the inputs. If information is missing, say "insufficient data". Do not fabricate anything.
-
-Required OUTPUT: valid JSON only with fields: hed, dek, summary_120w, bullets (3-5), why_it_matters{{asset_manager,fund_manager,acquisitions}},
-sector_tags, geo_tags, risk_flags, confidence, suggested_subject, social{{twitter,linkedin}}, image_hint, newsletter_block_html.
-
-Rules: AU CRE context (RBA/ABS, cap-rate, leasing/vacancy, WALE, DA/permit, industrial/logistics, shopping centres). Downweight global noise.
-No crime/fatality coverage. If unsure, mark "insufficient data".
-
-INPUT:
-title: "{title}"
-description: "{description}"
-source_name: "{source_name}"
-link: "{link}"
-published_iso: "{published_iso}"
-""".strip()
-
-        for attempt in range(OAI_MAX_RETRIES):
-            try:
-                self.oai.wait()
-                self.metrics['ai_calls'] += 1
-                resp = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[{"role":"user","content":prompt}],
-                    max_tokens=800,
-                    temperature=0.2,
-                )
-                content = (resp.choices[0].message.content or "").strip()
-                data = self._safe_json_extract(content)
-                if data and isinstance(data, dict):
-                    self.metrics['ai_success'] += 1
-                    return data
-                logging.warning("JSON extract failed; retrying…")
-            except Exception as e:
-                logging.warning(f"OAI error (try {attempt+1}/{OAI_MAX_RETRIES}): {e}")
-                time.sleep(1.0 + attempt * 0.7)
-
-        self.metrics['ai_fail'] += 1
-        return None  # No fallback
-
-    # --- fetching ---
-    def fetch_feed_items_recent_only(self, feed_config: Dict, cutoff_time: datetime, max_items: int = 20) -> List[FeedItem]:
-        feed_url, feed_name = feed_config['url'], feed_config['name']
-        try:
-            old_t = socket.getdefaulttimeout(); socket.setdefaulttimeout(FEED_TIMEOUT)
-            try: feed = feedparser.parse(feed_url)
-            finally: socket.setdefaulttimeout(old_t)
-            items, too_old, now = [], 0, datetime.now()
-            for e in feed.entries:
-                if not hasattr(e, 'title') or not hasattr(e, 'link'): continue
-                published = now
-                if getattr(e, 'published_parsed', None): published = datetime(*e.published_parsed[:6])
-                elif getattr(e, 'updated_parsed', None): published = datetime(*e.updated_parsed[:6])
-                if published < cutoff_time:
-                    too_old += 1
-                    if too_old >= 3: break
-                    continue
-                desc = getattr(e, 'description', '') or getattr(e, 'summary', '') or ''
-                items.append(FeedItem(
-                    title=e.title, link=e.link, description=desc, published=published,
-                    source_feed=feed_url, source_name=feed_name
-                ))
-                if len(items) >= max_items: break
-            return sorted(items, key=lambda x: x.published, reverse=True)
+            txt = resp.choices[0].message.content.strip()
+            data = json.loads(txt)
+            return data
         except Exception as e:
-            logging.error(f"Fetch error {feed_name}: {e}")
-            return []
+            logging.warning("AI error (%s/%s): %s", i+1, OAI_MAX_RETRIES, e)
+            time.sleep(1.5*(i+1))
+    return None
 
-    def fetch_all_parallel(self, cutoff_time: datetime) -> List[FeedItem]:
-        start = time.time()
-        all_items = []
-        def runner(cfg): return self.fetch_feed_items_recent_only(cfg, cutoff_time, 15)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            for items in ex.map(runner, self.rss_feeds):
-                all_items.extend(items)
-        dur = time.time() - start
-        logging.info(f"Fetched recent items from {len(self.rss_feeds)} feeds in {dur:.1f}s (items={len(all_items)})")
-        return all_items
+# ---- Fetch & process ---------------------------------------------------------
+def fetch_feed(feed: Dict) -> List[Dict]:
+    url = feed["url"]
+    name = feed["name"]
+    out = []
+    try:
+        socket.setdefaulttimeout(FEED_TIMEOUT)
+        fp = feedparser.parse(url)
+        for e in fp.entries:
+            link = canonicalise_url(e.get("link") or e.get("id") or "")
+            if not link: continue
+            title = (e.get("title") or "").strip()
+            if not title: continue
+            # prefer summary/description
+            summary = (e.get("summary") or e.get("description") or "").strip()
+            # published
+            pub = None
+            for k in ("published_parsed","updated_parsed"):
+                if e.get(k):
+                    pub = datetime(*e.get(k)[:6])
+                    break
+            if not pub:
+                pub = now_au()
+            out.append({
+                "source": name,
+                "url": link,
+                "title": title,
+                "summary": summary,
+                "published_at": pub.isoformat()
+            })
+    except Exception as ex:
+        logging.error("Fetch error %s: %s", name, ex)
+    return out
 
-    # --- main ---
-    def process_once(self) -> dict:
-        t0 = time.time()
-        cutoff = datetime.now() - timedelta(hours=6)
-        raw = self.fetch_all_parallel(cutoff)
-        self.metrics['fetched'] = len(raw)
-        if not raw:
-            logging.info("No recent items from any feed")
-            return {'scanned':0,'new':0,'saved':0}
-
-        new_items = []
-        for it in raw:
-            fpv = fingerprint(it.title, canonicalize_link(it.link), it.source_name)
-            if self.item_exists_fp(fpv):
-                self.metrics['deduped_out'] += 1
+def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,int]:
+    new, saved = 0, 0
+    kept = 0
+    with conn:
+        for it in items:
+            url = it["url"]
+            title = it["title"]
+            summary = it["summary"]
+            source = it["source"]
+            pub = it["published_at"]
+            score = score_item(title, summary, source)
+            if score < MIN_SCORE_FOR_AI:
+                conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score)
+                                VALUES(?,?,?,?,?,?,?)""",
+                             (url, canonicalise_url(url), source, title, pub, summary, score))
                 continue
-            combined = (it.title + " " + (it.description or "")).lower()
-            if any(k in combined for k in SENSITIVE):
-                self.metrics['sensitive_out'] += 1
+
+            data = ai_rewrite(title, summary, source, url)
+            if not data:
+                logging.info("AI skip (no response): %s", title[:120])
+                conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score)
+                                VALUES(?,?,?,?,?,?,?)""",
+                             (url, canonicalise_url(url), source, title, pub, summary, score))
                 continue
-            self.auto_score(it)
-            new_items.append(it)
 
-        self.metrics['kept_new'] = len(new_items)
+            exclude = bool(data.get("exclude"))
+            cat = data.get("category_main") or classify_guess(title, summary)
+            ai_title = data.get("ai_title") or title
+            ai_desc_html = data.get("ai_desc_html") or ""
+            tags = json.dumps(data.get("tags") or [])
 
-        saved, ai_attempted = 0, 0
-        for it in new_items:
-            if it.interest_score < MIN_SCORE_FOR_AI:
-                self.metrics['skipped_low_score'] += 1
-                pkg = None
+            if exclude:
+                # still record but without AI body
+                conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score,category_main)
+                                VALUES(?,?,?,?,?,?,?,?)""",
+                             (url, canonicalise_url(url), source, title, pub, summary, score, cat))
             else:
-                ai_attempted += 1
-                pkg = self.summarise_for_beehiiv(it)  # throttled + cached + retries
-            self.save_item(it, ai_package=pkg)
+                kept += 1
+                conn.execute("""
+                    INSERT OR REPLACE INTO items
+                    (url,url_canonical,source,title,published_at,raw_summary,score,category_main,ai_title,ai_desc_html,ai_tags)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """, (url, canonicalise_url(url), source, title, pub, summary, score, cat, ai_title, ai_desc_html, tags))
+            new += 1
             saved += 1
-
-        dur = time.time() - t0
-        logging.info(
-            "SUMMARY: fetched=%d deduped=%d sensitive=%d kept=%d | "
-            "ai_attempted=%d cache_hits=%d ai_calls=%d ai_ok=%d ai_fail=%d skipped_low=%d | duration=%.1fs",
-            self.metrics['fetched'], self.metrics['deduped_out'], self.metrics['sensitive_out'], self.metrics['kept_new'],
-            ai_attempted, self.metrics['cache_hits'], self.metrics['ai_calls'], self.metrics['ai_success'], self.metrics['ai_fail'], self.metrics['skipped_low_score'],
-            dur
-        )
-        return {'scanned':len(raw),'new':len(new_items),'saved':saved}
+    return new, saved, kept
 
 def main():
-    stats = RSSAnalyzer().process_once()
-    logging.info(f"Process: {stats}")
+    conn = db()
+    ensure_schema(conn)
+    start = time.time()
+
+    # fetch window
+    since = now_au() - timedelta(hours=SCAN_WINDOW_HRS)
+
+    logging.info("Loaded %d feeds | MAX_WORKERS=%s FEED_TIMEOUT=%ss OAI_RPM=%s MIN_SCORE_FOR_AI=%s",
+                 len(RSS_FEEDS), MAX_WORKERS, FEED_TIMEOUT, OAI_RPM, MIN_SCORE_FOR_AI)
+
+    items = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(fetch_feed, f) for f in RSS_FEEDS]
+        for fut in concurrent.futures.as_completed(futures):
+            items.extend(fut.result())
+
+    # restrict by time window
+    cut = []
+    for it in items:
+        try:
+            if datetime.fromisoformat(it["published_at"]) >= since:
+                cut.append(it)
+        except Exception:
+            cut.append(it)
+
+    logging.info("Fetched recent items from %d feeds (items=%d)", len(RSS_FEEDS), len(cut))
+    new, saved, kept = process_items(conn, cut)
+    logging.info("Process: {'scanned': %d, 'new': %d, 'saved': %d, 'kept_for_ai': %d}", len(cut), new, saved, kept)
+    logging.info("Done in %.1fs", time.time() - start)
 
 if __name__ == "__main__":
     main()
