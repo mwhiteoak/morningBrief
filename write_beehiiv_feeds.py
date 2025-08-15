@@ -1,298 +1,298 @@
 #!/usr/bin/env python3
-"""
-Write multiple Beehiiv-ready RSS feeds from sqlite DB (schema-agnostic).
+# write_beehiiv_feeds.py — multi-bucket Beehiiv RSS generator (XML-safe)
 
-- Drops items with no usable content (or "Insufficient data").
-- Handles schema differences (published vs published_at, link vs url, etc).
-- Normalises all datetimes to a local fixed offset to avoid naive/aware errors.
-- Buckets: top, property, finance, reits, policy.
-- Sorts by interest/score desc, then recency.
-- Respects env knobs (see below).
-"""
-
-import os, sqlite3, json, re
-from pathlib import Path
+import os, sqlite3, logging, re, html
 from datetime import datetime, timedelta, timezone
-from email.utils import format_datetime
+from zoneinfo import ZoneInfo
 
-# ----------------- config via env -----------------
+# ------------ config via env ------------
 DB_PATH            = os.getenv("RSS_DB_PATH", "rss_items.db")
-# Where to write: repo root by default so GitHub Pages/Jekyll can serve it
-OUT_DIR            = Path(os.getenv("OUT_DIR", "."))
-OUT_PREFIX         = os.getenv("OUT_PREFIX", "beehiiv")  # filenames start with this
+OUT_PREFIX         = os.getenv("OUT_PREFIX", "beehiiv")          # beehiiv_*.xml
 NEWSLETTER_NAME    = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
-BASE_URL           = os.getenv("BASE_URL", "https://mwhiteoak.github.io/morningBrief")
-
-# Scan window (hours) for items to include
-WINDOW_HOURS       = int(os.getenv("SCAN_WINDOW_HRS", os.getenv("WINDOW_HOURS", "36")))
-
-# Cap per feed (Beehiiv ingests fine with 50–100; adjust as you like)
+BASE_URL           = os.getenv("BASE_URL", "https://example.com")
+SCAN_WINDOW_HRS    = int(os.getenv("SCAN_WINDOW_HRS", "36"))
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "80"))
+TZ_REGION          = os.getenv("TZ_REGION", "Australia/Brisbane")
+# ---------------------------------------
 
-# Fixed local offset in minutes (default AEST +10:00). Keep simple: no tz DB needed.
-TZ_OFFSET_MIN      = int(os.getenv("TZ_OFFSET_MIN", "600"))
-LOCAL_TZ           = timezone(timedelta(minutes=TZ_OFFSET_MIN))
-# -------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ----------------- tiny helpers ------------------
-def now_local() -> datetime:
-    """Timezone-aware 'now' in LOCAL_TZ."""
-    return datetime.now(LOCAL_TZ)
+# Buckets you want to publish
+BUCKETS = {
+    "top":     {"title": f"{NEWSLETTER_NAME} · Top",     "filename": f"{OUT_PREFIX}_top.xml"},
+    "property":{"title": f"{NEWSLETTER_NAME} · Property","filename": f"{OUT_PREFIX}_property.xml"},
+    "finance": {"title": f"{NEWSLETTER_NAME} · Finance", "filename": f"{OUT_PREFIX}_finance.xml"},
+    "reits":   {"title": f"{NEWSLETTER_NAME} · A-REITs", "filename": f"{OUT_PREFIX}_reits.xml"},
+    "policy":  {"title": f"{NEWSLETTER_NAME} · Policy",  "filename": f"{OUT_PREFIX}_policy.xml"},
+}
 
-def rfc822(dt: datetime) -> str:
-    """Format datetime for <pubDate> etc."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=LOCAL_TZ)
-    return format_datetime(dt.astimezone(LOCAL_TZ))
+SAFE_PLACEHOLDER_RE = re.compile(r"^\s*(insufficient data|no summary|n/a)\b", re.I)
 
-def html_cdata(s: str) -> str:
-    return f"<![CDATA[ {s} ]]>"
-
-def safe_html(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def parse_dt(v) -> datetime | None:
-    """Best-effort parse from DB string/iso; return tz-aware in LOCAL_TZ."""
-    if not v:
-        return None
-    s = str(v).strip()
-    # Fast paths
+# ---------- helpers ----------
+def zone():
     try:
-        # ISO 8601: add UTC if bare "Z"
-        s2 = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s2)
+        return ZoneInfo(TZ_REGION)
     except Exception:
-        return None
+        return timezone.utc
 
-    # Make tz-aware
+def now_local():
+    return datetime.now(zone())
+
+def to_rfc822(dt: datetime) -> str:
     if dt.tzinfo is None:
-        # Assume local when stored without tz (most pipelines do)
-        dt = dt.replace(tzinfo=LOCAL_TZ)
-    return dt.astimezone(LOCAL_TZ)
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
 
-def get_columns(conn) -> set[str]:
-    cur = conn.execute("PRAGMA table_info(items)")
-    return {row[1] for row in cur.fetchall()}
-
-def pick(cols: set[str], *names: str) -> str | None:
-    for n in names:
-        if n in cols:
-            return n
-    return None
-# -------------------------------------------------
-
-def row_to_item(row: dict, cols: set[str],
-                pub_col: str | None,
-                link_col: str | None,
-                title_col: str | None,
-                desc_cols: list[str],
-                src_cols: list[str],
-                cat_cols: list[str],
-                score_cols: list[str]):
-    """Map a DB row to a normalised item dict or None (if contentless)."""
-    link = (row.get(link_col) or row.get("link") or row.get("url") or "").strip()
-    title = (row.get(title_col) or row.get("title") or "").strip()
-
-    # Choose first non-empty description-like field
-    desc = ""
-    for c in desc_cols:
-        v = row.get(c)
-        if v and v.strip():
-            desc = v.strip()
-            break
-    if not desc:
-        desc = (row.get("ai_summary") or "").strip()
-
-    # Drop contentless
-    if not desc or desc.lower().startswith("insufficient data"):
+def parse_dt(s: str | None) -> datetime | None:
+    if not s:
         return None
-
-    # Published date (fall back, then force tz-aware LOCAL_TZ)
-    pub_dt = None
-    if pub_col:
-        pub_dt = parse_dt(row.get(pub_col))
-    if not pub_dt:
-        pub_dt = parse_dt(row.get("processed_at")) or now_local()
-
-    # Source, category
-    source = ""
-    for c in src_cols:
-        v = row.get(c)
-        if v and v.strip():
-            source = v.strip(); break
-
-    category = ""
-    for c in cat_cols:
-        v = row.get(c)
-        if v and v.strip():
-            category = v.strip(); break
-
-    # Interest / score
-    score = 0.0
-    for c in score_cols:
-        v = row.get(c)
+    s = s.strip()
+    # Common cases: ISO8601 (with or without tz), RFC822-ish
+    try:
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(zone())
+    except Exception:
+        pass
+    for fmt in (
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+    ):
         try:
-            if v is not None:
-                score = float(v)
-                break
+            d = datetime.strptime(s, fmt)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d.astimezone(zone())
         except Exception:
-            pass
+            continue
+    return None
 
-    # Optional AI package
-    pkg = {}
-    if "ai_package" in cols and row.get("ai_package"):
-        try:
-            pkg = json.loads(row["ai_package"])
-        except Exception:
-            pkg = {}
+CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
-    # Canonical link & GUID
-    link_canon = (row.get("link_canonical") or row.get("url_canonical") or "").strip()
-    guid = link_canon or link or (row.get("id") and f"id:{row['id']}") or ""
+def scrub(s: str) -> str:
+    # Remove control chars that XML 1.0 disallows
+    return CTRL_RE.sub("", s)
 
-    # Ensure HTML in both <description> and <content:encoded>
-    html = safe_html(desc)
-    if not html.lower().startswith("<"):
-        html = f"<p>{html}</p>"
+def xml_text(s: str) -> str:
+    # Escape &, <, >, " in text nodes
+    return html.escape(scrub(s), quote=True)
+
+def cdata(html_str: str) -> str:
+    if html_str is None:
+        html_str = ""
+    # Escape accidental CDATA close
+    safe = scrub(html_str).replace("]]>", "]]]]><![CDATA[>")
+    return f"<![CDATA[ {safe} ]]>"
+
+def dict_factory(cursor, row):
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
+# --------- DB read ----------
+def fetch_recent_items(conn):
+    conn.row_factory = dict_factory
+    # Pull a reasonably large recent slice; filter in Python for date window/content
+    cur = conn.execute("""
+        SELECT * FROM items
+        ORDER BY COALESCE(processed_at, published_at, created_at) DESC
+        LIMIT 2000
+    """)
+    return cur.fetchall()
+
+def unify_item(row):
+    # Tolerate old/new schemas
+    link = row.get("link") or row.get("url") or row.get("link_canonical") or row.get("url_canonical")
+    guid = row.get("fp") or (row.get("link_canonical") or row.get("url_canonical") or link)
+    title = row.get("title") or ""
+    source = row.get("source_name") or row.get("source") or row.get("source_feed") or ""
+    cat   = (row.get("category") or row.get("categories") or "").strip()
+    ai    = (row.get("ai_summary") or "").strip()
+    desc  = (row.get("description") or "").strip()
+    interest = row.get("interest_score") or 0
+
+    # published date
+    pd = parse_dt(row.get("published_at") or row.get("published") or row.get("created_at") or row.get("processed_at"))
+
+    # choose body (skip placeholders)
+    body = ai or desc
+    if body and SAFE_PLACEHOLDER_RE.search(body):
+        body = ""
 
     return {
-        "title": title or (pkg.get("title") or "(untitled)"),
-        "link": link or link_canon,
-        "guid": guid,
-        "pub_dt": pub_dt.astimezone(LOCAL_TZ),
-        "description_html": html,
+        "link": link or "",
+        "guid": guid or (link or ""),
+        "title": title,
         "source": source,
-        "category": category or pkg.get("category") or "General",
-        "score": score,
-        "raw": row,
+        "category": cat.lower(),
+        "interest": int(interest) if isinstance(interest, (int, float, str)) and str(interest).isdigit() else 0,
+        "pub_dt": pd,
+        "body_html": body,
+        "title_lc": (title or "").lower(),
+        "ai_lc": (ai or "").lower(),
     }
 
-def bucket_for(item: dict) -> str:
-    s = (item["source"] or "").lower()
-    c = (item["category"] or "").lower()
-    t = (item["title"] or "").lower()
+# --------- bucketing ----------
+def bucket_for(it):
+    lc_title = it["title_lc"]
+    lc_cat   = it["category"]
+    lc_ai    = it["ai_lc"]
+    src      = (it["source"] or "").lower()
 
-    # Property-first bias (target audience)
-    if any(k in s for k in ["real commercial", "realestate.com.au", "urban developer", "domain", "pca", "commercial real estate"]) \
-       or any(k in c for k in ["property", "real estate", "residential", "commercial", "development", "leasing"]):
-        return "property"
-    if "reit" in t or "a-reit" in t or "reit" in c:
+    is_property = any([
+        "property" in lc_cat or "real estate" in lc_cat,
+        "realcommercial" in src or "real commercial" in src,
+        "realestate.com.au" in src or "domain" in src or "urban developer" in src,
+        "pca" in src or "commercial real estate" in src,
+        "development" in lc_ai or "leasing" in lc_ai or "vacancy" in lc_ai or "cap rate" in lc_ai,
+    ])
+
+    is_reit = any([
+        "reit" in lc_cat or "a-reit" in lc_cat or "a-reit" in lc_cat,
+        "reit" in lc_title or "a-reit" in lc_title or "a-reit" in lc_title,
+        "trust" in lc_title and "property" in lc_title,
+    ])
+
+    is_finance = any([
+        "finance" in lc_cat or "bank" in lc_cat or "markets" in lc_cat or "asx" in lc_cat,
+        "rba" in lc_ai or "bond" in lc_ai or "yields" in lc_ai or "equity" in lc_ai,
+        "afr - fintech" in src or "ausfintech" in src or "motley fool" in src,
+    ])
+
+    is_policy = any([
+        "policy" in lc_cat or "regulat" in lc_cat or "planning" in lc_cat,
+        "rba media releases" in src or "sec" in src or "abc news" in src,
+        "minister" in lc_ai or "rezoning" in lc_ai or "stamp duty" in lc_ai,
+    ])
+
+    if is_reit:
         return "reits"
-    if any(k in s for k in ["afr", "the australian", "wsj", "abc", "rba"]) \
-       or any(k in c for k in ["markets","banking","finance","economy","rates"]):
-        return "finance"
-    if any(k in c for k in ["policy","politics","regulation"]) or "rba" in s:
+    if is_property:
+        return "property"
+    if is_policy:
         return "policy"
+    if is_finance:
+        return "finance"
     return "top"
 
-def write_rss(file_path: Path, channel_title: str, items: list[dict]):
-    nowdt = now_local()
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">\n')
-        f.write("<channel>\n")
-        f.write(f"<title>{channel_title}</title>\n")
-        f.write(f"<link>{BASE_URL}</link>\n")
-        f.write("<description>Daily AU commercial property briefing — assets, funds, deals, development.</description>\n")
-        f.write("<language>en-au</language>\n")
-        f.write(f"<lastBuildDate>{rfc822(nowdt)}</lastBuildDate>\n")
-        f.write("<ttl>60</ttl>\n")
+# --------- XML build ----------
+def build_channel_xml(bucket_key, items):
+    channel_title = BUCKETS[bucket_key]["title"]
+    channel_link  = BASE_URL
+    channel_desc  = "Daily AU commercial property briefing — assets, funds, deals, development."
+    now_dt        = now_local()
 
-        for it in items[:MAX_ITEMS_PER_FEED]:
-            f.write("<item>\n")
-            f.write(f"<title>{it['title']}</title>\n")
-            f.write(f"<link>{it['link']}</link>\n")
-            f.write(f'<guid isPermaLink="false">{it["guid"]}</guid>\n')
-            f.write(f"<pubDate>{rfc822(it['pub_dt'])}</pubDate>\n")
-            f.write("<description>\n")
-            f.write(html_cdata(it["description_html"]) + "\n")
-            f.write("</description>\n")
-            f.write("<content:encoded>\n")
-            f.write(html_cdata(it["description_html"]) + "\n")
-            f.write("</content:encoded>\n")
-            if it["source"]:
-                f.write(f"<category>{it['source']}</category>\n")
-            if it["category"]:
-                f.write(f"<category>{it['category']}</category>\n")
-            f.write("</item>\n")
+    parts = []
+    parts.append('<?xml version="1.0" encoding="UTF-8"?>')
+    parts.append('<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">')
+    parts.append("<channel>")
+    parts.append(f"<title>{xml_text(channel_title)}</title>")
+    parts.append(f"<link>{xml_text(channel_link)}</link>")
+    parts.append(f"<description>{xml_text(channel_desc)}</description>")
+    parts.append("<language>en-au</language>")
+    parts.append(f"<lastBuildDate>{xml_text(to_rfc822(now_dt))}</lastBuildDate>")
+    parts.append("<ttl>60</ttl>")
 
-        f.write("</channel>\n</rss>\n")
+    for it in items:
+        title = it["title"].strip() or (it["source"] or "(untitled)")
+        link  = it["link"] or it["guid"] or ""
+        guid  = it["guid"] or link
+        pub   = to_rfc822(it["pub_dt"]) if it["pub_dt"] else to_rfc822(now_dt)
+        src   = it["source"] or ""
+        cats  = [src]
+        # Add light-weight categories per bucket
+        if bucket_key != "top":
+            cats.append(bucket_key)
 
+        parts.append("<item>")
+        parts.append(f"<title>{xml_text(title)}</title>")
+        parts.append(f"<link>{xml_text(link)}</link>")
+        parts.append(f'<guid isPermaLink="false">{xml_text(guid)}</guid>')
+        parts.append(f"<pubDate>{xml_text(pub)}</pubDate>")
+
+        # Body -> both description and content:encoded
+        body = it["body_html"].strip()
+        parts.append("<description>")
+        parts.append(cdata(body))
+        parts.append("</description>")
+        parts.append("<content:encoded>")
+        parts.append(cdata(body))
+        parts.append("</content:encoded>")
+
+        for c in cats:
+            if c:
+                parts.append(f"<category>{xml_text(c)}</category>")
+
+        parts.append("</item>")
+
+    parts.append("</channel>")
+    parts.append("</rss>")
+    return "\n".join(parts)
+
+# --------- main ---------
 def main():
-    if not Path(DB_PATH).exists():
-        raise SystemExit(f"DB not found: {DB_PATH}")
-
+    cutoff = now_local() - timedelta(hours=SCAN_WINDOW_HRS)
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cols = get_columns(conn)
 
-    # Map schema differences
-    pub_col   = pick(cols, "published", "published_at", "created_at", "processed_at")
-    link_col  = pick(cols, "link", "url")
-    title_col = pick(cols, "title")
-    desc_cols = [c for c in ["description","ai_summary","raw_summary"] if c in cols]
-    src_cols  = [c for c in ["source_name","source","source_feed"] if c in cols]
-    cat_cols  = [c for c in ["category"] if c in cols]
-    score_cols= [c for c in ["interest_score","score"] if c in cols]
-
-    # Load rows & project to items
-    rows = [dict(r) for r in conn.execute("SELECT * FROM items").fetchall()]
-
-    since = (now_local() - timedelta(hours=WINDOW_HOURS)).astimezone(LOCAL_TZ)
-
+    rows = fetch_recent_items(conn)
     items = []
     for r in rows:
-        it = row_to_item(r, cols, pub_col, link_col, title_col, desc_cols, src_cols, cat_cols, score_cols)
-        if not it:
+        it = unify_item(r)
+        # Date-window filter (tolerant of missing/naive tz)
+        if it["pub_dt"] is not None and it["pub_dt"] < cutoff:
             continue
-        # ensure tz-aware comparison
-        pub = it["pub_dt"].astimezone(LOCAL_TZ) if it["pub_dt"] else None
-        if pub and pub < since:
+        # Must have link, title, and body
+        if not it["link"] and not it["guid"]:
             continue
+        if not it["title"].strip():
+            continue
+        if not it["body_html"].strip():
+            continue  # <- SKIP empty body items entirely
+
+        # hard-drop any obvious “insufficient data” bodies
+        if SAFE_PLACEHOLDER_RE.search(it["body_html"]):
+            continue
+
+        it["bucket"] = bucket_for(it)
         items.append(it)
 
-    # De-dupe by guid; rank by score desc, then by recency
-    seen = set()
-    ranked = sorted(
-        items,
-        key=lambda x: (-(x.get("score") or 0.0), x.get("pub_dt") or now_local()),
-    )
-    unique = []
-    for it in ranked:
-        gid = it["guid"] or (it["link"] + "|" + it["title"])
-        if gid in seen:
-            continue
-        seen.add(gid)
-        unique.append(it)
+    # Sort “top” by interest then recency; others by recency
+    by_bucket = {k: [] for k in BUCKETS.keys()}
+    for it in items:
+        by_bucket[it["bucket"]].append(it)
 
-    # Bucket routing
-    buckets = {"top": [], "property": [], "finance": [], "reits": [], "policy": []}
-    for it in unique:
-        b = bucket_for(it)
-        buckets.setdefault(b, []).append(it)
-        if b != "top":
-            buckets["top"].append(it)
+    def recency_key(x):
+        return x["pub_dt"] or now_local()
 
-    # Final sort inside each bucket
-    for k in buckets:
-        buckets[k].sort(key=lambda x: (-(x.get("score") or 0.0), x.get("pub_dt") or now_local()))
+    # Build top: include everything, sort by interest then recency
+    all_for_top = sorted(items, key=lambda x: (x.get("interest", 0), recency_key(x)), reverse=True)
+    by_bucket["top"] = all_for_top
 
-    # Write feeds in repo root (so Pages can serve them)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    write_rss(OUT_DIR / f"{OUT_PREFIX}_top.xml",      f"{NEWSLETTER_NAME} · Top",      buckets["top"])
-    write_rss(OUT_DIR / f"{OUT_PREFIX}_property.xml", f"{NEWSLETTER_NAME} · Property", buckets["property"])
-    write_rss(OUT_DIR / f"{OUT_PREFIX}_finance.xml",  f"{NEWSLETTER_NAME} · Finance",  buckets["finance"])
-    write_rss(OUT_DIR / f"{OUT_PREFIX}_reits.xml",    f"{NEWSLETTER_NAME} · A-REITs",  buckets["reits"])
-    write_rss(OUT_DIR / f"{OUT_PREFIX}_policy.xml",   f"{NEWSLETTER_NAME} · Policy",   buckets["policy"])
+    # Sort the rest newest first
+    for b in ("property", "finance", "reits", "policy"):
+        by_bucket[b] = sorted(by_bucket[b], key=recency_key, reverse=True)
 
-    print(
-        f"Wrote feeds ({OUT_PREFIX}_*.xml): "
-        f"top={len(buckets['top'])} property={len(buckets['property'])} "
-        f"finance={len(buckets['finance'])} reits={len(buckets['reits'])} policy={len(buckets['policy'])} | "
-        f"window={WINDOW_HOURS}h tz_offset={TZ_OFFSET_MIN}min"
-    )
+    # Truncate per-feed
+    for b in by_bucket:
+        if MAX_ITEMS_PER_FEED > 0:
+            by_bucket[b] = by_bucket[b][:MAX_ITEMS_PER_FEED]
+
+    # Write files
+    total_written = 0
+    for b, cfg in BUCKETS.items():
+        out_path = cfg["filename"]
+        data = build_channel_xml(b, by_bucket[b])
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(data)
+        logging.info("Wrote %s (bucket=%s, items=%d)", out_path, b, len(by_bucket[b]))
+        total_written += len(by_bucket[b])
+
+    logging.info("Done. Buckets: %s | Total items written: %d",
+                 {k: len(v) for k,v in by_bucket.items()}, total_written)
 
 if __name__ == "__main__":
     main()
