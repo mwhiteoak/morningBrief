@@ -1,10 +1,16 @@
-name: Build and Update Beehiiv Feed
+name: Build and Update Beehiiv Feed with Smart Retrieval
 
 on:
   schedule:
     # 05:40 Australia/Brisbane daily == 19:40 UTC previous day
     - cron: "40 19 * * *"
   workflow_dispatch:
+    inputs:
+      force_comprehensive:
+        description: 'Force comprehensive fetch (ignore database state)'
+        required: false
+        default: 'false'
+        type: boolean
 
 permissions:
   contents: write
@@ -16,8 +22,8 @@ concurrency:
 jobs:
   build-and-update:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 30
+    
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -29,25 +35,105 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Analyze (AI filter + rewrite)
+      - name: Check database state
+        id: db_check
+        run: |
+          if [[ -f "rss_items.db" ]]; then
+            echo "database_exists=true" >> $GITHUB_OUTPUT
+            # Check if database has content
+            python -c "
+          import sqlite3
+          try:
+              conn = sqlite3.connect('rss_items.db')
+              cur = conn.execute('SELECT COUNT(*) FROM items WHERE relevant = 1')
+              count = cur.fetchone()[0]
+              print(f'Database has {count} relevant items')
+              if count > 0:
+                  print('database_populated=true')
+              else:
+                  print('database_populated=false')
+              conn.close()
+          except:
+              print('database_populated=false')
+          " >> database_check.log
+            cat database_check.log
+            if grep -q "database_populated=true" database_check.log; then
+              echo "database_populated=true" >> $GITHUB_OUTPUT
+            else
+              echo "database_populated=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "database_exists=false" >> $GITHUB_OUTPUT
+            echo "database_populated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Analyze RSS feeds (Smart retrieval + AI processing)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RSS_DB_PATH: rss_items.db
           LOG_LEVEL: INFO
           SCAN_WINDOW_HRS: "24"
           ALWAYS_AI: "1"
-          MIN_SCORE_FOR_AI: "4"       # bump to 5 if still too many items
-          OAI_RPM: "25"
+          MIN_SCORE_FOR_AI: "4"
+          MIN_ITEMS_PER_CATEGORY: "2"
+          OAI_RPM: "30"                    # Slightly higher for headline generation
           OAI_MAX_RETRIES: "4"
           FEED_TIMEOUT: "15"
         run: |
           set -euxo pipefail
+          
+          echo "Database state:"
+          echo "  Exists: ${{ steps.db_check.outputs.database_exists }}"
+          echo "  Populated: ${{ steps.db_check.outputs.database_populated }}"
+          echo "  Force comprehensive: ${{ github.event.inputs.force_comprehensive }}"
+          
+          # Set environment variable for comprehensive fetch if needed
+          if [[ "${{ steps.db_check.outputs.database_populated }}" == "false" ]] || [[ "${{ github.event.inputs.force_comprehensive }}" == "true" ]]; then
+            echo "Will perform comprehensive fetch"
+            export COMPREHENSIVE_FETCH=1
+          else
+            echo "Will perform smart incremental fetch"
+            export COMPREHENSIVE_FETCH=0
+          fi
+          
           python rss_analyzer.py
+          
+          # Log results
+          echo "Processing complete. Database summary:"
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('rss_items.db')
+          
+          # Count total items
+          cur = conn.execute('SELECT COUNT(*) FROM items')
+          total = cur.fetchone()[0]
+          
+          # Count relevant items
+          cur = conn.execute('SELECT COUNT(*) FROM items WHERE relevant = 1')
+          relevant = cur.fetchone()[0]
+          
+          # Count recent relevant items
+          cur = conn.execute('SELECT COUNT(*) FROM items WHERE relevant = 1 AND datetime(published_at) > datetime(\"now\", \"-24 hours\")')
+          recent = cur.fetchone()[0]
+          
+          # Get latest headline/subhead
+          cur = conn.execute('SELECT headline, subhead FROM newsletter_metadata ORDER BY created_at DESC LIMIT 1')
+          meta = cur.fetchone()
+          
+          print(f'Total items: {total}')
+          print(f'Relevant items: {relevant}')
+          print(f'Recent relevant: {recent}')
+          if meta:
+              print(f'Latest headline: {meta[0]}')
+              print(f'Latest subhead: {meta[1]}')
+          
+          conn.close()
+          "
 
-      - name: Write Beehiiv feed
+      - name: Generate Beehiiv feed with AI headlines
         env:
           RSS_DB_PATH: rss_items.db
           OUT_PATH: beehiiv.xml
@@ -57,14 +143,100 @@ jobs:
         run: |
           set -euxo pipefail
           python write_beehiiv_feed.py
-          echo "Items in beehiiv.xml: $(grep -c '<item>' beehiiv.xml || true)"
+          
+          # Validate XML and count items
+          if command -v xmllint >/dev/null; then
+            echo "Validating XML structure..."
+            xmllint --noout beehiiv.xml && echo "✓ XML is well-formed"
+          fi
+          
+          echo "Feed statistics:"
+          echo "Items in beehiiv.xml: $(grep -c '<item>' beehiiv.xml || echo '0')"
+          echo "Categories used: $(grep -o '<category>[^<]*</category>' beehiiv.xml | sort -u | wc -l || echo '0')"
+          
+          # Show headline in logs
+          if grep -q '<title>' beehiiv.xml; then
+            echo "Feed title: $(grep -o '<title>[^<]*</title>' beehiiv.xml | head -1 | sed 's/<[^>]*>//g')"
+          fi
 
-      - name: Commit & push XML
+      - name: Commit and push updates
         run: |
           set -euxo pipefail
-          git config user.name  "github-actions[bot]"
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Add files
           git add beehiiv.xml
-          git commit -m "Update Beehiiv feed" || echo "No changes"
-          git pull --rebase --autostash || true
-          git push
+          
+          # Only commit the database if it's new or significantly changed
+          if [[ "${{ steps.db_check.outputs.database_exists }}" == "false" ]] || [[ "${{ github.event.inputs.force_comprehensive }}" == "true" ]]; then
+            echo "Committing database (new or comprehensive update)"
+            git add rss_items.db
+          fi
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            # Get headline for commit message
+            HEADLINE=$(python -c "
+            import sqlite3
+            try:
+                conn = sqlite3.connect('rss_items.db')
+                cur = conn.execute('SELECT headline FROM newsletter_metadata ORDER BY created_at DESC LIMIT 1')
+                result = cur.fetchone()
+                if result:
+                    print(result[0])
+                else:
+                    print('Morning Property Brief')
+                conn.close()
+            except:
+                print('Morning Property Brief')
+            " 2>/dev/null || echo "Morning Property Brief")
+            
+            # Commit with dynamic message
+            git commit -m "Update: ${HEADLINE}" -m "Auto-generated feed update with AI headlines"
+            
+            # Pull and push with retry logic
+            for i in {1..3}; do
+              if git pull --rebase --autostash origin main; then
+                if git push origin main; then
+                  echo "✓ Successfully pushed updates"
+                  break
+                else
+                  echo "Push failed, attempt $i/3"
+                  sleep $((i * 2))
+                fi
+              else
+                echo "Pull failed, attempt $i/3"
+                sleep $((i * 2))
+              fi
+              
+              if [[ $i -eq 3 ]]; then
+                echo "❌ Failed to push after 3 attempts"
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Output summary
+        if: always()
+        run: |
+          echo "🚀 Workflow Summary:"
+          echo "Database existed: ${{ steps.db_check.outputs.database_exists }}"
+          echo "Database populated: ${{ steps.db_check.outputs.database_populated }}"
+          
+          if [[ -f "beehiiv.xml" ]]; then
+            ITEM_COUNT=$(grep -c '<item>' beehiiv.xml || echo '0')
+            echo "RSS items generated: $ITEM_COUNT"
+            
+            # Extract and display headline
+            FEED_TITLE=$(grep -o '<title>[^<]*</title>' beehiiv.xml | head -1 | sed 's/<[^>]*>//g' || echo 'Unknown')
+            echo "Feed title: $FEED_TITLE"
+          else
+            echo "❌ No RSS file generated"
+          fi
+          
+          echo "Feed URL: https://mwhiteoak.github.io/morningBrief/beehiiv.xml"
