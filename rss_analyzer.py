@@ -3,6 +3,9 @@
 Fetch → AI-filter → AI-rewrite → store in sqlite (rss_items.db)
 Designed for AU commercial property professionals.
 
+Enhanced features:
+- Smart retrieval: populate categories if DB empty, otherwise stop at duplicates
+- AI-generated headline and subhead based on retrieved content
 - Heuristic prefilter trims obvious noise fast
 - AI filter + rewrite only on likely-relevant items
 - Rewrites are grounded strictly on original feed text
@@ -13,6 +16,7 @@ import os, re, json, time, hashlib, sqlite3, logging, feedparser
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from collections import defaultdict
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -32,6 +36,7 @@ MAX_WORKERS      = int(os.getenv("MAX_WORKERS", "6"))
 FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))
 ALWAYS_AI        = os.getenv("ALWAYS_AI", "1") == "1"
 MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "4"))   # heuristic gate
+MIN_ITEMS_PER_CATEGORY = int(os.getenv("MIN_ITEMS_PER_CATEGORY", "2"))  # for initial population
 TZ               = timezone(timedelta(hours=10))             # Australia/Brisbane (no DST)
 
 logging.basicConfig(
@@ -73,6 +78,12 @@ KEYWORDS = [
 STOPWORDS = [
     "celebrity","gossip","movie","music","football","tennis","cricket","NRL","AFL","crime",
     "recipe","fashion","horoscope","royal family","gaming",
+]
+
+# Define main categories for content organization
+MAIN_CATEGORIES = [
+    "a_reit", "macro", "finance", "industrial", "retail", 
+    "office", "res_dev", "policy", "markets", "tech", "alt"
 ]
 
 def norm_url(u: str) -> str:
@@ -130,8 +141,20 @@ CREATE TABLE IF NOT EXISTS items (
   ai_tags TEXT,
   processed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS newsletter_metadata (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_date TEXT,
+  headline TEXT,
+  subhead TEXT,
+  created_at TEXT,
+  item_count INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at);
 CREATE INDEX IF NOT EXISTS idx_items_rel ON items(relevant);
+CREATE INDEX IF NOT EXISTS idx_items_canonical ON items(link_canonical);
+CREATE INDEX IF NOT EXISTS idx_newsletter_date ON newsletter_metadata(run_date);
 """
 
 NEEDED_COLS = set([
@@ -155,6 +178,41 @@ def ensure_schema(conn: sqlite3.Connection):
         logging.info(f"DB: added missing column {c}")
     conn.commit()
 
+def is_database_empty(conn: sqlite3.Connection) -> bool:
+    """Check if database has any relevant items"""
+    cur = conn.execute("SELECT COUNT(*) FROM items WHERE relevant = 1")
+    count = cur.fetchone()[0]
+    return count == 0
+
+def has_sufficient_categories(conn: sqlite3.Connection) -> bool:
+    """Check if we have minimum items per main category"""
+    category_counts = defaultdict(int)
+    
+    cur = conn.execute("""
+        SELECT ai_tags FROM items 
+        WHERE relevant = 1 AND ai_tags IS NOT NULL AND ai_tags != ''
+    """)
+    
+    for row in cur.fetchall():
+        tags = [tag.strip() for tag in (row[0] or "").split(",")]
+        for tag in tags:
+            if tag in MAIN_CATEGORIES:
+                category_counts[tag] += 1
+    
+    # Check if we have at least MIN_ITEMS_PER_CATEGORY for each main category
+    sufficient_categories = sum(1 for count in category_counts.values() 
+                               if count >= MIN_ITEMS_PER_CATEGORY)
+    
+    logging.info(f"Category counts: {dict(category_counts)}")
+    logging.info(f"Categories with sufficient items: {sufficient_categories}/{len(MAIN_CATEGORIES)}")
+    
+    return sufficient_categories >= len(MAIN_CATEGORIES) // 2  # At least half the categories
+
+def item_exists(conn: sqlite3.Connection, canonical_link: str) -> bool:
+    """Check if item already exists in database"""
+    cur = conn.execute("SELECT 1 FROM items WHERE link_canonical = ?", (canonical_link,))
+    return cur.fetchone() is not None
+
 # ---------- OpenAI ----------
 def throttle_sleep(last_ts: List[float]):
     # naive RPM throttle: at most OAI_RPM per minute
@@ -172,6 +230,22 @@ AI_SYSTEM = (
     "Include transactions, leasing, development/DA/planning, A-REIT & capital markets, macro that moves cap rates and feasos, construction costs, major policy/reg changes, and property-adjacent fintech if it impacts CRE. Exclude generic tech, consumer fluff, sports, gossip.\n"
     "Task 2: If relevant and text has enough facts, rewrite in a concise, punchy, Australian-English finance tone (a little Shaan-Puri zing), but STRICTLY based on the original text only. No new facts. No speculation. If insufficient info, mark relevant=false.\n"
     "Output JSON only."
+)
+
+HEADLINE_SYSTEM = (
+    "You are a newsletter editor creating engaging subject lines for Australian commercial property professionals.\n"
+    "Create a compelling, punchy headline that captures the key themes from the provided content.\n"
+    "Style: Professional but engaging, Australian tone, 6-12 words max.\n"
+    "Focus on the most significant news, deals, or market movements.\n"
+    "Output JSON only with 'headline' field."
+)
+
+SUBHEAD_SYSTEM = (
+    "You are a newsletter editor creating subheadings for Australian commercial property professionals.\n"
+    "Create a compelling subhead that summarizes the key themes and gives readers a preview of what's inside.\n"
+    "Style: Professional, informative, Australian tone, 15-25 words.\n"
+    "Should complement the headline and entice readers to continue.\n"
+    "Output JSON only with 'subhead' field."
 )
 
 def ai_classify_and_rewrite(title: str, summary: str, source: str) -> Optional[Dict[str, Any]]:
@@ -240,6 +314,71 @@ def ai_classify_and_rewrite(title: str, summary: str, source: str) -> Optional[D
             time.sleep(min(2**attempt, 8))
     return None
 
+def generate_headline_and_subhead(conn: sqlite3.Connection) -> Tuple[str, str]:
+    """Generate AI headline and subhead based on recent relevant content"""
+    if not client:
+        return "Morning Property Brief", "Latest updates from Australian commercial property"
+    
+    # Get recent relevant items for context
+    cur = conn.execute("""
+        SELECT ai_title, ai_desc, ai_tags, source_name
+        FROM items 
+        WHERE relevant = 1 AND ai_desc IS NOT NULL 
+        ORDER BY published_at DESC 
+        LIMIT 15
+    """)
+    
+    items = cur.fetchall()
+    if not items:
+        return "Morning Property Brief", "Latest updates from Australian commercial property"
+    
+    # Prepare content summary for AI
+    content_summary = []
+    for item in items:
+        title = item[0] or ""
+        desc = item[1] or ""
+        tags = item[2] or ""
+        source = item[3] or ""
+        content_summary.append(f"• {title}: {desc[:100]}... [Tags: {tags}] [Source: {source}]")
+    
+    content_text = "\n".join(content_summary)
+    
+    # Generate headline
+    headline = "Morning Property Brief"  # fallback
+    try:
+        throttle_sleep([0.0])
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": HEADLINE_SYSTEM},
+                {"role": "user", "content": f"Create a headline based on these stories:\n\n{content_text}"}
+            ]
+        )
+        headline_json = json.loads(resp.choices[0].message.content.strip())
+        headline = headline_json.get("headline", "Morning Property Brief")
+    except Exception as e:
+        logging.warning(f"Failed to generate headline: {e}")
+    
+    # Generate subhead
+    subhead = "Latest updates from Australian commercial property"  # fallback
+    try:
+        throttle_sleep([0.0])
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": SUBHEAD_SYSTEM},
+                {"role": "user", "content": f"Create a subhead for headline '{headline}' based on these stories:\n\n{content_text}"}
+            ]
+        )
+        subhead_json = json.loads(resp.choices[0].message.content.strip())
+        subhead = subhead_json.get("subhead", "Latest updates from Australian commercial property")
+    except Exception as e:
+        logging.warning(f"Failed to generate subhead: {e}")
+    
+    return headline, subhead
+
 # ---------- Fetch ----------
 def parse_dt(entry) -> Optional[str]:
     # returns ISO string in Brisbane tz (no DST)
@@ -252,15 +391,34 @@ def parse_dt(entry) -> Optional[str]:
         dt = datetime.now(tz=TZ)
     return dt.isoformat()
 
-def fetch_recent() -> List[Dict[str, Any]]:
-    since = datetime.now(tz=TZ) - timedelta(hours=SCAN_WINDOW_HRS)
+def fetch_with_smart_logic(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """
+    Smart fetch logic:
+    - If DB is empty: fetch until we have sufficient category representation
+    - If DB has content: fetch recent items but stop when we hit existing content
+    """
+    db_empty = is_database_empty(conn)
+    has_sufficient = has_sufficient_categories(conn)
+    
+    if db_empty or not has_sufficient:
+        logging.info("Database empty or insufficient categories - fetching comprehensively")
+        return fetch_comprehensive()
+    else:
+        logging.info("Database populated - fetching recent until duplicates")
+        return fetch_until_duplicates(conn)
+
+def fetch_comprehensive() -> List[Dict[str, Any]]:
+    """Fetch more items to populate categories"""
     items: List[Dict[str,Any]] = []
+    # Look back further when building initial dataset
+    since = datetime.now(tz=TZ) - timedelta(hours=SCAN_WINDOW_HRS * 3)  # 3x window
+    
     for f in RSS_FEEDS:
         name = f.get("name","Feed")
         url  = f.get("url","")
         try:
             fp = feedparser.parse(url)
-            for e in fp.entries[:200]:
+            for e in fp.entries[:500]:  # More entries for initial population
                 link = getattr(e, "link", "") or ""
                 if not link: 
                     continue
@@ -290,7 +448,72 @@ def fetch_recent() -> List[Dict[str, Any]]:
                 })
         except Exception as ex:
             logging.error(f"Fetch error {name}: {ex}")
-    logging.info(f"Fetched recent items (items={len(items)})")
+    
+    logging.info(f"Comprehensive fetch: {len(items)} items")
+    return items
+
+def fetch_until_duplicates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Fetch recent items but stop when we encounter existing content"""
+    since = datetime.now(tz=TZ) - timedelta(hours=SCAN_WINDOW_HRS)
+    items: List[Dict[str,Any]] = []
+    
+    for f in RSS_FEEDS:
+        name = f.get("name","Feed")
+        url  = f.get("url","")
+        try:
+            fp = feedparser.parse(url)
+            feed_items = 0
+            duplicate_count = 0
+            
+            for e in fp.entries[:200]:
+                link = getattr(e, "link", "") or ""
+                if not link: 
+                    continue
+                
+                canonical_link = norm_url(link)
+                
+                # Stop if we hit existing content
+                if item_exists(conn, canonical_link):
+                    duplicate_count += 1
+                    # Stop after 3 consecutive duplicates to avoid missing new items mixed with old
+                    if duplicate_count >= 3:
+                        logging.info(f"Stopping {name} after {duplicate_count} duplicates ({feed_items} new items)")
+                        break
+                    continue
+                else:
+                    duplicate_count = 0  # Reset counter on new item
+                
+                title = (getattr(e, "title", "") or "").strip()
+                summary = (getattr(e, "summary", "") or "")
+                if not summary and getattr(e, "content", None):
+                    try:
+                        summary = e.content[0].value or ""
+                    except Exception:
+                        summary = ""
+                pub_iso = parse_dt(e)
+                try:
+                    pub_dt = datetime.fromisoformat(pub_iso)
+                except Exception:
+                    pub_dt = datetime.now(tz=TZ)
+                if pub_dt < since:
+                    continue
+                
+                items.append({
+                    "source_name": name,
+                    "source_feed": url,
+                    "link": link,
+                    "link_canonical": canonical_link,
+                    "title": title,
+                    "summary": summary.strip(),
+                    "published_at": pub_iso,
+                    "fetched_at": datetime.now(tz=TZ).isoformat(),
+                })
+                feed_items += 1
+                
+        except Exception as ex:
+            logging.error(f"Fetch error {name}: {ex}")
+    
+    logging.info(f"Smart fetch: {len(items)} new items")
     return items
 
 # ---------- Main pipeline ----------
@@ -323,16 +546,27 @@ def update_ai(conn: sqlite3.Connection, link_canonical: str, interest_score: int
         """, (interest_score, datetime.now(tz=TZ).isoformat(), link_canonical))
     conn.commit()
 
+def save_newsletter_metadata(conn: sqlite3.Connection, headline: str, subhead: str, item_count: int):
+    """Save the generated headline and subhead for this run"""
+    today = datetime.now(tz=TZ).date().isoformat()
+    conn.execute("""
+        INSERT OR REPLACE INTO newsletter_metadata
+        (run_date, headline, subhead, created_at, item_count)
+        VALUES (?, ?, ?, ?, ?)
+    """, (today, headline, subhead, datetime.now(tz=TZ).isoformat(), item_count))
+    conn.commit()
+
 def main():
     if not OPENAI_API_KEY:
         logging.warning("OPENAI_API_KEY missing — AI steps will be skipped.")
+    
     conn = sqlite3.connect(RSS_DB_PATH)
     ensure_schema(conn)
 
-    items = fetch_recent()
+    # Smart fetching based on database state
+    items = fetch_with_smart_logic(conn)
     kept = 0
     ai_calls = 0
-    last_call = [0.0]
 
     for it in items:
         upsert(conn, it)
@@ -341,12 +575,18 @@ def main():
         ai_pkg = None
         if ALWAYS_AI and score >= MIN_SCORE_FOR_AI and OPENAI_API_KEY:
             ai_calls += 1
-            # throttle inside call
             ai_pkg = ai_classify_and_rewrite(it["title"], it["summary"], it["source_name"])
 
         update_ai(conn, it["link_canonical"], score, 1 if (ai_pkg and ai_pkg.get("relevant")) else 0, ai_pkg)
         if ai_pkg and ai_pkg.get("relevant"): 
             kept += 1
+
+    # Generate headline and subhead based on all relevant content
+    if OPENAI_API_KEY:
+        headline, subhead = generate_headline_and_subhead(conn)
+        save_newsletter_metadata(conn, headline, subhead, kept)
+        logging.info(f"Generated headline: '{headline}'")
+        logging.info(f"Generated subhead: '{subhead}'")
 
     logging.info(f"SUMMARY: scanned={len(items)} ai_calls={ai_calls} kept={kept} (score>={MIN_SCORE_FOR_AI})")
 
