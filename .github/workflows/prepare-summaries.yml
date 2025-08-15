@@ -1,97 +1,65 @@
-name: Prepare Summaries (05:30 AEST)
+name: prepare-summaries
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '30 19 * * *'   # 05:30 AEST daily (Brisbane = UTC+10)
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-
-concurrency:
-  group: prepare-summaries
-  cancel-in-progress: true
+    # Run daily earlier so publish has fresh DB
+    - cron: "25 20 * * *"  # 05:25 AEST / 06:25 AEDT approximate (GitHub UTC)
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    env:
-      TZ: Australia/Brisbane
-      PYTHONUNBUFFERED: "1"
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Show analyzer version/hash
+      - name: Show head
         run: |
           echo "HEAD of rss_analyzer.py (first 35 lines):"
-          sed -n '1,35p' rss_analyzer.py || echo "rss_analyzer.py missing"
-          echo ""
-          echo "sha256 of rss_analyzer.py:"
-          (sha256sum rss_analyzer.py || shasum -a 256 rss_analyzer.py) 2>/dev/null || true
+          head -n 35 rss_analyzer.py || true
+          echo
+          sha256sum rss_analyzer.py || true
 
-      - name: Setup Python 3.11 (with pip cache)
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch & summarise (throttled)
+      - name: Prepare DB (CRE-first AI rewrites + classify)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NEWSLETTER_NAME: "Morning Briefing"
-          OAI_RPM: "25"            # raise if your account allows (e.g., 60)
-          OAI_MAX_RETRIES: "4"
-          MAX_WORKERS: "8"         # parallel feed fetch
-          FEED_TIMEOUT: "15"       # per-feed seconds
-          MIN_SCORE_FOR_AI: "5"    # skip AI on low-signal items
-          LOG_LEVEL: "INFO"
+          LOG_LEVEL: INFO
+          OAI_RPM: 25
+          OAI_MAX_RETRIES: 4
+          MAX_WORKERS: 8
+          FEED_TIMEOUT: 15
+          MIN_SCORE_FOR_AI: 5
+          RSS_DB_PATH: rss_items.db
+          TZ_REGION: "Australia/Brisbane"
+          SCAN_WINDOW_HRS: 36
         run: |
+          set -euxo pipefail
           python rss_analyzer.py
 
-      - name: Show SUMMARY + last log lines
-        if: always()
-        run: |
-          echo "=== SUMMARY ==="
-          grep -F "SUMMARY:" rss_analyzer.log || echo "No SUMMARY line found."
-          echo ""
-          echo "=== Tail (last 200 lines) ==="
-          tail -n 200 rss_analyzer.log || true
-
-      - name: Persist DB & logs (force-add + rebase-safe push)
-        if: always()
+      - name: Commit DB + logs (skip CI)
         run: |
           set -e
           git config user.name "rss-bot"
-          git config user.email "rss-bot@example.com"
-          # Stage outputs even if .gitignore blocks them
+          git config user.email "rss-bot@users.noreply.github.com"
+          git pull --rebase origin main || true
           git add -f rss_items.db rss_analyzer.log || true
           git commit -m "Prepare: update DB/logs [skip ci]" || echo "Nothing to commit"
+          git push || echo "Nothing to push"
 
-          # Push with up-to-date base; retry a few times if main moved
-          for i in 1 2 3; do
-            if git push; then
-              echo "Push succeeded"; break
-            else
-              echo "Push rejected, rebasing onto origin/main (attempt $i)..."
-              git fetch origin
-              git pull --rebase origin main || true
-            fi
-          done
-
-      - name: Upload artifacts (db + logs)
-        if: always()
+      - name: Upload db/logs artifact
         uses: actions/upload-artifact@v4
         with:
-          name: db-and-logs
+          name: db-and-logs.zip
           path: |
             rss_items.db
             rss_analyzer.log
-          retention-days: 7
