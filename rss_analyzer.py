@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 RSS Feed Analyzer for A-REIT CEO/COO - Executive Intelligence Platform
-ULTRA-ENGAGING VERSION - Dynamic AI content with hallucination prevention
-Updated for OpenAI API v1.0+
+Enhanced version with improved error handling, performance, and AI integration
 """
 
 import feedparser
 import sqlite3
 import smtplib
-from openai import OpenAI  # New import style
+from openai import OpenAI
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -23,11 +22,14 @@ import sys
 import concurrent.futures
 from threading import Lock
 from collections import defaultdict, Counter
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple, Any
 from dotenv import load_dotenv
 import random
 import hashlib
+from functools import lru_cache
+import backoff
+from contextlib import contextmanager
 
 # Import RSS feeds from separate file
 from feeds import RSS_FEEDS
@@ -35,19 +37,44 @@ from feeds import RSS_FEEDS
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('rss_analyzer.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+# Enhanced logging configuration
+def setup_logging():
+    """Setup enhanced logging with rotation"""
+    from logging.handlers import RotatingFileHandler
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    simple_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # File handler with rotation
+    file_handler = RotatingFileHandler(
+        'rss_analyzer.log', 
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(detailed_formatter)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(simple_formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
 
 
 @dataclass
 class FeedItem:
+    """Enhanced FeedItem with validation and defaults"""
     title: str
     link: str
     description: str
@@ -58,1079 +85,600 @@ class FeedItem:
     ai_summary: Optional[str] = None
     category: Optional[str] = None
     sentiment: Optional[str] = None
-    key_metrics: Optional[List[str]] = None
-    geographic_tags: Optional[List[str]] = None
-    sector_tags: Optional[List[str]] = None
+    key_metrics: Optional[List[str]] = field(default_factory=list)
+    geographic_tags: Optional[List[str]] = field(default_factory=list)
+    sector_tags: Optional[List[str]] = field(default_factory=list)
+    
+    def __post_init__(self):
+        """Validate and clean data after initialization"""
+        # Clean HTML from description
+        if self.description:
+            self.description = re.sub('<[^<]+?>', '', self.description)
+            self.description = self.description[:500]  # Limit length
+        
+        # Validate score
+        if self.interest_score is not None:
+            self.interest_score = max(1, min(10, self.interest_score))
+        
+        # Ensure title is not empty
+        if not self.title or self.title.strip() == "":
+            self.title = "Untitled Article"
 
 
-class IncrementalProcessor:
-    """Processes only new items since last run"""
+class DatabaseManager:
+    """Improved database management with connection pooling and transactions"""
     
-    def __init__(self, rss_analyzer):
-        self.analyzer = rss_analyzer
-        self.init_tracking_table()
-    
-    def init_tracking_table(self):
-        """Initialize table to track last processing times"""
-        self.analyzer.conn.execute('''
-            CREATE TABLE IF NOT EXISTS processing_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_type TEXT NOT NULL,
-                last_run_time DATETIME NOT NULL,
-                items_processed INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self.analyzer.conn.commit()
-        logging.info("Processing tracking table initialized")
-    
-    def get_last_run_time(self, run_type: str = 'feed_processing') -> Optional[datetime]:
-        """Get the last time we processed feeds"""
-        cursor = self.analyzer.conn.execute('''
-            SELECT last_run_time FROM processing_runs 
-            WHERE run_type = ? 
-            ORDER BY created_at DESC 
-            LIMIT 1
-        ''', (run_type,))
-        
-        result = cursor.fetchone()
-        if result:
-            try:
-                return datetime.fromisoformat(result[0].replace('Z', '+00:00').replace('+00:00', ''))
-            except:
-                return datetime.fromisoformat(result[0])
-        return None
-    
-    def update_last_run_time(self, run_type: str = 'feed_processing', items_processed: int = 0):
-        """Update the last run time"""
-        now = datetime.now()
-        self.analyzer.conn.execute('''
-            INSERT INTO processing_runs (run_type, last_run_time, items_processed)
-            VALUES (?, ?, ?)
-        ''', (run_type, now, items_processed))
-        self.analyzer.conn.commit()
-        logging.info(f"Updated last run time: {now}, items processed: {items_processed}")
-    
-    def get_incremental_cutoff_time(self) -> datetime:
-        """Get cutoff time for daily email (last 24 hours)"""
-        # For 6am daily email, get last 24 hours of content
-        return datetime.now() - timedelta(hours=24)
-
-
-class RSSAnalyzer:
-    def __init__(self):
-        # Load configuration from environment variables
-        self.config = {
-            'openai_api_key': os.getenv('OPENAI_API_KEY'),
-            'gmail_user': os.getenv('GMAIL_USER'),
-            'gmail_password': os.getenv('GMAIL_APP_PASSWORD'),
-            'recipient_email': os.getenv('RECIPIENT_EMAIL'),
-        }
-        
-        # Validate required environment variables
-        required_vars = ['OPENAI_API_KEY', 'GMAIL_USER', 'GMAIL_APP_PASSWORD', 'RECIPIENT_EMAIL']
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
-        if missing_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-        
-        # Initialize OpenAI client (new style)
-        self.client = OpenAI(api_key=self.config['openai_api_key'])
-        
-        # Initialize database
+    def __init__(self, db_path: str = 'rss_items.db'):
+        self.db_path = db_path
+        self.lock = Lock()
         self.init_database()
-        
-        # Load RSS feeds
-        self.rss_feeds = RSS_FEEDS
-        
-        # Cache for AI responses to prevent repeated calls
-        self.ai_cache = {}
-        
-        logging.info(f"Initialized RSS Analyzer with {len(self.rss_feeds)} feeds")
+    
+    @contextmanager
+    def get_connection(self):
+        """Context manager for database connections"""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
     
     def init_database(self):
-        """Initialize SQLite database"""
-        self.conn = sqlite3.connect('rss_items.db', check_same_thread=False)
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                link TEXT UNIQUE NOT NULL,
-                description TEXT,
-                published DATETIME,
-                source_feed TEXT,
-                source_name TEXT,
-                interest_score INTEGER,
-                ai_summary TEXT,
-                category TEXT,
-                sentiment TEXT,
-                key_metrics TEXT,
-                geographic_tags TEXT,
-                sector_tags TEXT,
-                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                email_sent BOOLEAN DEFAULT FALSE
+        """Initialize database with improved schema"""
+        with self.get_connection() as conn:
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL")
+            
+            # Create main items table with indexes
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    link TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    published DATETIME,
+                    source_feed TEXT,
+                    source_name TEXT,
+                    interest_score INTEGER,
+                    ai_summary TEXT,
+                    category TEXT,
+                    sentiment TEXT,
+                    key_metrics TEXT,
+                    geographic_tags TEXT,
+                    sector_tags TEXT,
+                    processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    email_sent BOOLEAN DEFAULT FALSE,
+                    content_hash TEXT
+                )
+            ''')
+            
+            # Create indexes for better query performance
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_published ON items(published DESC)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_score ON items(interest_score DESC)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_processed ON items(processed_at DESC)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_email_sent ON items(email_sent)')
+            
+            # Processing runs table
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS processing_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_type TEXT NOT NULL,
+                    last_run_time DATETIME NOT NULL,
+                    items_processed INTEGER DEFAULT 0,
+                    items_new INTEGER DEFAULT 0,
+                    errors INTEGER DEFAULT 0,
+                    duration_seconds REAL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Error log table
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS error_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    error_type TEXT,
+                    error_message TEXT,
+                    feed_url TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+            logger.info("Database initialized with enhanced schema")
+
+
+class AIAnalyzer:
+    """Enhanced AI analyzer with better error handling and caching"""
+    
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+        self.cache = {}
+        self.cache_ttl = 3600  # 1 hour
+        
+    @lru_cache(maxsize=128)
+    def _get_cache_key(self, text: str) -> str:
+        """Generate cache key for text"""
+        return hashlib.md5(text.encode()).hexdigest()
+    
+    @backoff.on_exception(
+        backoff.expo,
+        Exception,
+        max_tries=3,
+        max_time=30
+    )
+    def analyze_with_retry(self, prompt: str, model: str = "gpt-4o", max_tokens: int = 500) -> str:
+        """Make API call with exponential backoff retry"""
+        try:
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a commercial property analyst. Be accurate, specific, and never make up facts."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.3,
+                timeout=30
             )
-        ''')
-        self.conn.commit()
-        logging.info("Database initialized successfully")
-    
-    def item_exists(self, link: str) -> bool:
-        """Check if item exists in database"""
-        cursor = self.conn.execute('SELECT 1 FROM items WHERE link = ?', (link,))
-        return cursor.fetchone() is not None
-    
-    def save_item(self, item: FeedItem):
-        """Save item to database"""
-        try:
-            self.conn.execute('''
-                INSERT INTO items (
-                    title, link, description, published, source_feed, source_name,
-                    interest_score, ai_summary, category, sentiment, key_metrics,
-                    geographic_tags, sector_tags
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                item.title, item.link, item.description, item.published,
-                item.source_feed, item.source_name, item.interest_score,
-                item.ai_summary, item.category, item.sentiment,
-                json.dumps(item.key_metrics) if item.key_metrics else None,
-                json.dumps(item.geographic_tags) if item.geographic_tags else None,
-                json.dumps(item.sector_tags) if item.sector_tags else None
-            ))
-            self.conn.commit()
-        except sqlite3.IntegrityError:
-            logging.warning(f"Duplicate item skipped: {item.title[:50]}")
-
-    def fetch_feed_items_recent_only(self, feed_config: Dict, cutoff_time: datetime, max_items: int = 30) -> List[FeedItem]:
-        """Fetch recent RSS feed items"""
-        feed_url = feed_config['url']
-        feed_name = feed_config['name']
-        
-        try:
-            logging.info(f"Fetching from: {feed_name}")
-            
-            # Set timeout
-            old_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(15)
-            
-            try:
-                feed = feedparser.parse(feed_url)
-            finally:
-                socket.setdefaulttimeout(old_timeout)
-            
-            items = []
-            
-            for entry in feed.entries:
-                try:
-                    if not hasattr(entry, 'title') or not hasattr(entry, 'link'):
-                        continue
-                    
-                    # Parse published date
-                    published = datetime.now()
-                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        try:
-                            published = datetime(*entry.published_parsed[:6])
-                        except:
-                            pass
-                    
-                    # Only get items from last 24 hours
-                    if published < cutoff_time:
-                        continue
-                    
-                    description = ""
-                    if hasattr(entry, 'description'):
-                        description = entry.description
-                    elif hasattr(entry, 'summary'):
-                        description = entry.summary
-                    
-                    item = FeedItem(
-                        title=entry.title,
-                        link=entry.link,
-                        description=description,
-                        published=published,
-                        source_feed=feed_url,
-                        source_name=feed_name
-                    )
-                    items.append(item)
-                    
-                    if len(items) >= max_items:
-                        break
-                        
-                except Exception as e:
-                    logging.warning(f"Error processing entry: {e}")
-                    continue
-            
-            items.sort(key=lambda x: x.published, reverse=True)
-            logging.info(f"✓ {feed_name}: {len(items)} items from last 24h")
-            
-            return items
-            
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            logging.error(f"Error fetching {feed_name}: {e}")
-            return []
-
-    def fetch_feeds_parallel_recent(self, cutoff_time: datetime, max_workers: int = 5) -> List[FeedItem]:
-        """Fetch recent items from all feeds in parallel"""
-        all_items = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_feed = {
-                executor.submit(self.fetch_feed_items_recent_only, feed_config, cutoff_time): feed_config 
-                for feed_config in self.rss_feeds
-            }
-            
-            for future in concurrent.futures.as_completed(future_to_feed):
-                try:
-                    items = future.result(timeout=10)
-                    all_items.extend(items)
-                except Exception as e:
-                    logging.warning(f"Feed fetch failed: {e}")
-        
-        logging.info(f"Total items fetched: {len(all_items)}")
-        return all_items
-
-    def ai_score_and_analyze_batch(self, items: List[FeedItem]) -> List[FeedItem]:
-        """Score and analyze items using AI with structured prompts to prevent hallucination"""
+            logger.error(f"AI API error: {e}")
+            raise
+    
+    def batch_analyze_items(self, items: List[FeedItem], batch_size: int = 5) -> List[FeedItem]:
+        """Improved batch analysis with better error handling"""
         if not items:
             return items
         
-        batch_size = 10
         analyzed_items = []
         
         for i in range(0, len(items), batch_size):
             batch = items[i:i + batch_size]
             
-            # Create structured prompt with clear instructions
-            prompt = f"""You are an expert commercial property analyst. Score these news items for a REIT CEO.
-
-STRICT RULES:
-1. Score 1-10 based ONLY on commercial property relevance
-2. Provide a 1-sentence insight that is DIRECTLY related to the headline
-3. DO NOT make up information not in the title/description
-4. Focus on: office, retail, industrial, logistics property impacts
-5. Be specific about WHY it matters to property investors
-
-Format EXACTLY as shown:
-Item X:
-Score: [1-10]
-Impact: [One specific sentence about property market impact]
-Trend: [Bullish/Bearish/Neutral]
-
-Items to analyze:
-"""
+            # Check cache first
+            uncached_items = []
+            for item in batch:
+                cache_key = self._get_cache_key(f"{item.title}:{item.description[:100]}")
+                if cache_key in self.cache:
+                    cached_data = self.cache[cache_key]
+                    if time.time() - cached_data['timestamp'] < self.cache_ttl:
+                        item.interest_score = cached_data['score']
+                        item.ai_summary = cached_data['summary']
+                        item.sentiment = cached_data['sentiment']
+                        item.category = cached_data['category']
+                        analyzed_items.append(item)
+                    else:
+                        uncached_items.append(item)
+                else:
+                    uncached_items.append(item)
             
-            for idx, item in enumerate(batch, 1):
-                # Clean description for prompt
-                desc = re.sub('<[^<]+?>', '', item.description)[:200] if item.description else ""
-                prompt += f"\nItem {idx}:\nTitle: {item.title}\nDescription: {desc}\n"
+            if not uncached_items:
+                continue
+            
+            # Create structured prompt
+            prompt = self._create_analysis_prompt(uncached_items)
             
             try:
-                # Use new OpenAI API syntax
-                response = self.client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "You are a commercial property analyst. Be accurate, specific, and never make up facts."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=500,
-                    temperature=0.3
-                )
+                response = self.analyze_with_retry(prompt)
+                parsed_items = self._parse_analysis_response(response, uncached_items)
                 
-                content = response.choices[0].message.content.strip()
+                # Cache results
+                for item in parsed_items:
+                    cache_key = self._get_cache_key(f"{item.title}:{item.description[:100]}")
+                    self.cache[cache_key] = {
+                        'score': item.interest_score,
+                        'summary': item.ai_summary,
+                        'sentiment': item.sentiment,
+                        'category': item.category,
+                        'timestamp': time.time()
+                    }
                 
-                # Parse structured response
-                for j, item in enumerate(batch):
-                    item_pattern = f"Item {j+1}:"
-                    
-                    # Extract score, impact, and trend
-                    try:
-                        item_section = content.split(item_pattern)[1].split(f"Item {j+2}:")[0] if j+1 < len(batch) else content.split(item_pattern)[1]
-                        
-                        # Extract score
-                        score_match = re.search(r'Score:\s*(\d+)', item_section)
-                        if score_match:
-                            item.interest_score = int(score_match.group(1))
-                        else:
-                            item.interest_score = 5
-                        
-                        # Extract impact
-                        impact_match = re.search(r'Impact:\s*(.+?)(?:Trend:|$)', item_section, re.DOTALL)
-                        if impact_match:
-                            item.ai_summary = impact_match.group(1).strip()
-                        
-                        # Extract trend
-                        trend_match = re.search(r'Trend:\s*(Bullish|Bearish|Neutral)', item_section)
-                        if trend_match:
-                            item.sentiment = trend_match.group(1)
-                        else:
-                            item.sentiment = "Neutral"
-                        
-                        # Set category based on score
-                        if item.interest_score >= 8:
-                            item.category = "Critical"
-                        elif item.interest_score >= 6:
-                            item.category = "Important"
-                        else:
-                            item.category = "Monitor"
-                            
-                    except Exception as e:
-                        logging.warning(f"Failed to parse AI response for item: {e}")
-                        item.interest_score = 5
-                        item.ai_summary = "Property market impact under analysis"
-                        item.sentiment = "Neutral"
-                        item.category = "Monitor"
-                    
-                    analyzed_items.append(item)
+                analyzed_items.extend(parsed_items)
                 
             except Exception as e:
-                logging.error(f"AI batch analysis failed: {e}")
-                # Basic scoring fallback
-                for item in batch:
-                    item.interest_score = 5
+                logger.error(f"Batch analysis failed: {e}")
+                # Fallback to basic scoring
+                for item in uncached_items:
+                    item.interest_score = self._calculate_basic_score(item)
                     item.ai_summary = "Analysis pending"
                     item.sentiment = "Neutral"
                     item.category = "Monitor"
                     analyzed_items.append(item)
         
         return analyzed_items
+    
+    def _create_analysis_prompt(self, items: List[FeedItem]) -> str:
+        """Create structured analysis prompt"""
+        prompt = """You are an expert commercial property analyst. Analyze these news items for a REIT CEO.
 
-    def generate_quick_insight(self, title: str, description: str) -> str:
-        """Generate a quick insight if AI summary is missing"""
-        # Use cached response if available
-        cache_key = hashlib.md5(f"{title}:{description[:100]}".encode()).hexdigest()
-        if cache_key in self.ai_cache:
-            return self.ai_cache[cache_key]
-        
-        try:
-            prompt = f"""In ONE sentence, explain why this matters to commercial property investors:
-Title: {title}
-Be specific and actionable. No fluff."""
+STRICT RULES:
+1. Score 1-10 based on commercial property relevance (10 = critical for REIT strategy)
+2. One-sentence insight directly related to the headline
+3. NO speculation beyond what's in the title/description
+4. Focus on: office, retail, industrial, logistics property impacts
 
-            # Use new OpenAI API syntax
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50,
-                temperature=0.3
-            )
-            
-            insight = response.choices[0].message.content.strip()
-            self.ai_cache[cache_key] = insight
-            return insight
-            
-        except:
-            return "This development could impact property market dynamics and investment strategies."
+Scoring Guide:
+- 9-10: Critical market shifts, major policy changes, significant M&A
+- 7-8: Important trends, notable transactions, market indicators
+- 5-6: Relevant but not urgent, sector updates
+- 3-4: Tangentially related, general economic news
+- 1-2: Minimal relevance to commercial property
 
-    def generate_ai_market_summary(self, top_items: List[Tuple]) -> str:
-        """Generate market summary using AI"""
-        if not top_items:
-            return "Markets are quiet today."
-        
-        headlines = "\n".join([f"- {item[0]}" for item in top_items[:5]])
-        
-        try:
-            prompt = f"""Based on these top property news headlines, write a 2-sentence market summary:
+Format EXACTLY:
+Item X:
+Score: [1-10]
+Impact: [One specific sentence about property market impact]
+Trend: [Bullish/Bearish/Neutral]
+Category: [Critical/Important/Monitor/Low]
 
-{headlines}
-
-Focus on the overall market direction and key theme. Be specific but concise."""
-
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.5
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except:
-            return "Property markets are showing mixed signals with several developments worth monitoring."
-
-    def generate_ai_greeting(self, critical_items: List[Tuple], market_summary: str) -> str:
-        """Generate personalized greeting using AI"""
-        
-        try:
-            context = "critical alerts today" if critical_items else "steady market conditions"
-            
-            prompt = f"""Write a 2-3 sentence engaging opening for a property market briefing email.
-
-Context: {context}
-Market summary: {market_summary}
-
-Make it conversational, slightly witty, and action-oriented. Like you're talking to a smart friend who runs a REIT.
-Start with something like "Morning champion" or "Hey there" - keep it fresh."""
-
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.7
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except:
-            if critical_items:
-                return "Good morning! Buckle up - we've got some critical developments that need your attention today. Let's dive into what's moving the market."
-            else:
-                return "Morning champion! Markets are steady but there are opportunities hiding in today's news. Here's what you need to know."
-
-    def generate_ai_big_story(self, critical_items: List[Tuple]) -> Optional[str]:
-        """Generate the big story narrative if there's critical news"""
-        if not critical_items:
-            return None
-        
-        top_story = critical_items[0]
-        
-        try:
-            prompt = f"""Write a 3-4 sentence narrative about why this is THE story to watch today:
-
-Title: {top_story[0]}
-Context: {top_story[4] if top_story[4] else top_story[2][:200]}
-
-Make it compelling and specific about the commercial property impact. Use active voice and strong verbs."""
-
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.5
-            )
-            
-            return response.choices[0].message.content.strip()
-            
-        except:
-            return None
-
-    def generate_ai_subject_line(self, critical_items: List[Tuple], market_summary: str) -> str:
-        """Generate engaging subject line using AI"""
-        
-        try:
-            context = critical_items[0][0] if critical_items else market_summary[:100]
-            
-            prompt = f"""Write a compelling email subject line for a property market briefing.
-
-Top story: {context}
-
-Make it urgent but not clickbait. Max 60 characters. Use an emoji."""
-
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=30,
-                temperature=0.8
-            )
-            
-            subject = response.choices[0].message.content.strip()
-            # Ensure it's not too long
-            if len(subject) > 70:
-                subject = subject[:67] + "..."
-            return subject
-            
-        except:
-            fallbacks = [
-                "🔥 Property Alert: Big Moves in Today's Market",
-                "📊 Your Daily Edge: Critical Property Intel Inside",
-                "🎯 Market Shift: What You Need to Know Today",
-                "⚡ Breaking: Key Developments in Commercial Property"
-            ]
-            return random.choice(fallbacks)
-
-    def generate_ai_action_recommendation(self, critical_items: List[Tuple], market_summary: str) -> str:
-        """Generate specific action recommendations"""
-        
-        try:
-            context = "Critical items: " + ", ".join([item[0][:50] for item in critical_items[:3]]) if critical_items else "No critical items"
-            
-            prompt = f"""Based on today's property market developments, write 2-3 specific action items for a REIT CEO.
-
-{context}
-Market: {market_summary}
-
-Be specific and actionable. Format as bullet points. Focus on what they should DO today."""
-
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.4
-            )
-            
-            return response.choices[0].message.content.strip().replace('•', '→').replace('- ', '→ ')
-            
-        except:
-            return """→ Review your portfolio exposure to interest rate changes
-→ Schedule team discussion on market positioning
-→ Monitor tenant stability in retail properties"""
-
-    def calculate_market_temp(self, items: List[Tuple]) -> int:
-        """Calculate market temperature (0-100)"""
-        if not items:
-            return 50
-        
-        high_scores = len([item for item in items if item[3] >= 7])
-        total = len(items)
-        
-        # Temperature based on proportion of high-impact news
-        temp = 50 + (high_scores / max(total, 1)) * 50
-        
-        # Adjust based on sentiment
-        sentiments = [item[8] for item in items[:10] if len(item) > 8 and item[8]]
-        if sentiments:
-            bullish = sentiments.count('Bullish')
-            bearish = sentiments.count('Bearish')
-            temp += (bullish - bearish) * 5
-        
-        return min(100, max(0, int(temp)))
-
-    def generate_dynamic_email_content(self, items: List[Tuple]) -> str:
-        """Generate ultra-engaging HTML email with dynamic AI content"""
-        
-        if not items:
-            return None
-        
-        # Sort and categorize
-        sorted_items = sorted(items, key=lambda x: x[3], reverse=True)
-        
-        critical_items = [item for item in sorted_items if item[3] >= 8]
-        important_items = [item for item in sorted_items if 6 <= item[3] < 8]
-        monitor_items = [item for item in sorted_items if 4 <= item[3] < 6]
-        
-        # Get market summary using AI
-        market_summary = self.generate_ai_market_summary(sorted_items[:10])
-        
-        # Get personalized greeting
-        greeting = self.generate_ai_greeting(critical_items, market_summary)
-        
-        # Get the big story if there is one
-        big_story = self.generate_ai_big_story(critical_items) if critical_items else None
-        
-        # Generate subject line
-        subject_line = self.generate_ai_subject_line(critical_items, market_summary)
-        
-        # Store subject for email sending
-        self.email_subject = subject_line
-        
-        current_date = datetime.now().strftime('%B %d, %Y')
-        
-        # Build HTML email (rest of the HTML generation code remains the same)
-        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #1a1a1a;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-        }}
-        
-        .container {{
-            max-width: 650px;
-            margin: 0 auto;
-            background: #ffffff;
-            border-radius: 20px;
-            overflow: hidden;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-        }}
-        
-        .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 40px 30px;
-            text-align: center;
-        }}
-        
-        .header h1 {{
-            font-size: 32px;
-            font-weight: 800;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-        }}
-        
-        .header .date {{
-            font-size: 14px;
-            opacity: 0.9;
-            font-weight: 500;
-        }}
-        
-        .greeting {{
-            padding: 30px;
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            font-size: 18px;
-            line-height: 1.8;
-            color: #2c3e50;
-            border-bottom: 3px solid #667eea;
-        }}
-        
-        .market-pulse {{
-            padding: 30px;
-            background: #fff;
-            border-bottom: 1px solid #e0e0e0;
-        }}
-        
-        .pulse-grid {{
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            margin-top: 20px;
-        }}
-        
-        .pulse-card {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 20px;
-            border-radius: 15px;
-            text-align: center;
-            transform: scale(1);
-            transition: transform 0.3s;
-        }}
-        
-        .pulse-card:hover {{
-            transform: scale(1.05);
-        }}
-        
-        .pulse-number {{
-            font-size: 36px;
-            font-weight: 800;
-            margin-bottom: 5px;
-        }}
-        
-        .pulse-label {{
-            font-size: 12px;
-            opacity: 0.95;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }}
-        
-        .big-story {{
-            padding: 30px;
-            background: #fff3cd;
-            border-left: 5px solid #ffc107;
-            margin: 20px;
-            border-radius: 10px;
-        }}
-        
-        .big-story h2 {{
-            color: #856404;
-            margin-bottom: 15px;
-            font-size: 24px;
-        }}
-        
-        .section {{
-            padding: 30px;
-            background: white;
-        }}
-        
-        .section-header {{
-            font-size: 22px;
-            font-weight: 700;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 3px solid #667eea;
-            color: #2c3e50;
-        }}
-        
-        .news-item {{
-            background: #f8f9fa;
-            padding: 20px;
-            margin-bottom: 20px;
-            border-radius: 12px;
-            border-left: 4px solid #667eea;
-            transition: all 0.3s;
-        }}
-        
-        .news-item:hover {{
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.2);
-            transform: translateX(5px);
-        }}
-        
-        .news-item.critical {{
-            border-left-color: #dc3545;
-            background: #fff5f5;
-        }}
-        
-        .news-item.important {{
-            border-left-color: #ffc107;
-            background: #fffbf0;
-        }}
-        
-        .news-title {{
-            font-size: 18px;
-            font-weight: 600;
-            color: #2c3e50;
-            margin-bottom: 10px;
-            line-height: 1.4;
-        }}
-        
-        .news-insight {{
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 12px 0;
-            font-size: 15px;
-            color: #495057;
-            border: 1px solid #e0e0e0;
-            position: relative;
-            padding-left: 35px;
-        }}
-        
-        .news-insight:before {{
-            content: "💡";
-            position: absolute;
-            left: 10px;
-            top: 15px;
-            font-size: 18px;
-        }}
-        
-        .news-meta {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-top: 12px;
-            padding-top: 12px;
-            border-top: 1px solid #e0e0e0;
-        }}
-        
-        .source {{
-            font-size: 13px;
-            color: #6c757d;
-        }}
-        
-        .read-more {{
-            display: inline-block;
-            padding: 8px 16px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            text-decoration: none;
-            border-radius: 20px;
-            font-size: 13px;
-            font-weight: 600;
-            transition: all 0.3s;
-        }}
-        
-        .read-more:hover {{
-            transform: scale(1.05);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
-        }}
-        
-        .score-badge {{
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 15px;
-            font-size: 12px;
-            font-weight: 700;
-            margin-left: 10px;
-        }}
-        
-        .score-critical {{ background: #dc3545; color: white; }}
-        .score-important {{ background: #ffc107; color: #000; }}
-        .score-monitor {{ background: #28a745; color: white; }}
-        
-        .bottom-line {{
-            padding: 30px;
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            color: white;
-            text-align: center;
-        }}
-        
-        .bottom-line h3 {{
-            font-size: 24px;
-            margin-bottom: 15px;
-        }}
-        
-        .action-items {{
-            background: rgba(255, 255, 255, 0.2);
-            padding: 20px;
-            border-radius: 10px;
-            margin-top: 20px;
-            backdrop-filter: blur(10px);
-        }}
-        
-        .footer {{
-            padding: 30px;
-            background: #f8f9fa;
-            text-align: center;
-            color: #6c757d;
-            font-size: 14px;
-        }}
-        
-        .footer a {{
-            color: #667eea;
-            text-decoration: none;
-            font-weight: 600;
-        }}
-        
-        @media (max-width: 600px) {{
-            .pulse-grid {{ grid-template-columns: 1fr; }}
-            .header h1 {{ font-size: 24px; }}
-            .greeting {{ font-size: 16px; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🏢 Property Intelligence Daily</h1>
-            <div class="date">{current_date} Edition</div>
-        </div>
-        
-        <div class="greeting">
-            {greeting}
-        </div>
-        
-        <div class="market-pulse">
-            <h2 style="margin: 0; color: #2c3e50;">📊 Market Pulse</h2>
-            <div class="pulse-grid">
-                <div class="pulse-card">
-                    <div class="pulse-number">{len(sorted_items)}</div>
-                    <div class="pulse-label">Stories Analyzed</div>
-                </div>
-                <div class="pulse-card">
-                    <div class="pulse-number">{len(critical_items)}</div>
-                    <div class="pulse-label">Critical Alerts</div>
-                </div>
-                <div class="pulse-card">
-                    <div class="pulse-number">{self.calculate_market_temp(sorted_items)}°</div>
-                    <div class="pulse-label">Market Temp</div>
-                </div>
-            </div>
-        </div>
+Items to analyze:
 """
-
-        # Add big story if exists
-        if big_story:
-            html_content += f"""
-        <div class="big-story">
-            <h2>🎯 The Big Story</h2>
-            {big_story}
-        </div>
-"""
-
-        # Add critical items
-        if critical_items:
-            html_content += f"""
-        <div class="section">
-            <div class="section-header">🚨 Critical: Act Today</div>
-"""
-            for item in critical_items[:5]:
-                html_content += self.generate_news_item_html(item, 'critical')
-            html_content += "</div>"
-
-        # Add important items
-        if important_items:
-            html_content += f"""
-        <div class="section">
-            <div class="section-header">👀 Important: On Your Radar</div>
-"""
-            for item in important_items[:7]:
-                html_content += self.generate_news_item_html(item, 'important')
-            html_content += "</div>"
-
-        # Add quick scan items
-        if monitor_items:
-            html_content += f"""
-        <div class="section">
-            <div class="section-header">⚡ Quick Scan</div>
-            <div style="font-size: 14px; color: #6c757d; margin-bottom: 15px;">
-                Lower priority but worth a glance:
-            </div>
-"""
-            for item in monitor_items[:5]:
-                html_content += self.generate_news_item_html(item, 'monitor')
-            html_content += "</div>"
-
-        # Add bottom line
-        action_recommendation = self.generate_ai_action_recommendation(critical_items, market_summary)
         
-        html_content += f"""
-        <div class="bottom-line">
-            <h3>📈 Your Move</h3>
-            <div class="action-items">
-                {action_recommendation}
-            </div>
-        </div>
+        for idx, item in enumerate(items, 1):
+            desc = item.description[:200] if item.description else ""
+            prompt += f"\nItem {idx}:\nTitle: {item.title}\nDescription: {desc}\nSource: {item.source_name}\n"
         
-        <div class="footer">
-            <strong>That's your intelligence edge for today.</strong><br><br>
-            Remember: Information is power, but action is profit.<br><br>
-            <em>P.S. - This email was crafted by AI that read {len(sorted_items)} articles in 0.3 seconds.<br>
-            What took you 2 minutes to read would've taken 2 hours to research.</em><br><br>
-            Built with 🤖 by <a href="https://www.linkedin.com/in/mattwhiteoak">Matt Whiteoak</a>
-        </div>
-    </div>
-</body>
-</html>"""
-
-        return html_content
-
-    def generate_news_item_html(self, item: Tuple, priority: str) -> str:
-        """Generate HTML for a single news item"""
-        title, link, description, score, ai_summary, source = item[:6]
+        return prompt
+    
+    def _parse_analysis_response(self, response: str, items: List[FeedItem]) -> List[FeedItem]:
+        """Parse structured AI response with error handling"""
+        analyzed_items = []
         
-        # Clean AI summary
-        if ai_summary and len(ai_summary) > 10:
-            insight = ai_summary
+        for j, item in enumerate(items):
+            try:
+                item_pattern = f"Item {j+1}:"
+                next_pattern = f"Item {j+2}:"
+                
+                if next_pattern in response:
+                    item_section = response.split(item_pattern)[1].split(next_pattern)[0]
+                else:
+                    item_section = response.split(item_pattern)[1]
+                
+                # Extract components with defaults
+                score_match = re.search(r'Score:\s*(\d+)', item_section)
+                item.interest_score = int(score_match.group(1)) if score_match else 5
+                
+                impact_match = re.search(r'Impact:\s*(.+?)(?:Trend:|Category:|$)', item_section, re.DOTALL)
+                item.ai_summary = impact_match.group(1).strip() if impact_match else "Property market impact under analysis"
+                
+                trend_match = re.search(r'Trend:\s*(Bullish|Bearish|Neutral)', item_section)
+                item.sentiment = trend_match.group(1) if trend_match else "Neutral"
+                
+                category_match = re.search(r'Category:\s*(Critical|Important|Monitor|Low)', item_section)
+                item.category = category_match.group(1) if category_match else self._score_to_category(item.interest_score)
+                
+            except Exception as e:
+                logger.warning(f"Failed to parse item {j+1}: {e}")
+                item.interest_score = 5
+                item.ai_summary = "Analysis pending"
+                item.sentiment = "Neutral"
+                item.category = "Monitor"
+            
+            analyzed_items.append(item)
+        
+        return analyzed_items
+    
+    def _score_to_category(self, score: int) -> str:
+        """Convert score to category"""
+        if score >= 8:
+            return "Critical"
+        elif score >= 6:
+            return "Important"
+        elif score >= 4:
+            return "Monitor"
         else:
-            insight = self.generate_quick_insight(title, description)
+            return "Low"
+    
+    def _calculate_basic_score(self, item: FeedItem) -> int:
+        """Calculate basic score without AI"""
+        score = 5
+        keywords = {
+            'critical': ['acquisition', 'merger', 'bankruptcy', 'default', 'crash'],
+            'important': ['reit', 'property', 'real estate', 'office', 'retail', 'industrial'],
+            'relevant': ['interest rate', 'fed', 'inflation', 'economy', 'market']
+        }
         
-        score_class = 'score-' + priority
+        text = (item.title + " " + item.description).lower()
         
-        html = f"""
-        <div class="news-item {priority}">
-            <div class="news-title">
-                {title}
-                <span class="score-badge {score_class}">Score: {score}/10</span>
-            </div>
-            <div class="news-insight">
-                {insight}
-            </div>
-            <div class="news-meta">
-                <span class="source">📰 {source}</span>
-                <a href="{link}" class="read-more">Read Full Story →</a>
-            </div>
-        </div>
-"""
-        return html
+        for word in keywords['critical']:
+            if word in text:
+                score = min(10, score + 3)
+        
+        for word in keywords['important']:
+            if word in text:
+                score = min(9, score + 2)
+        
+        for word in keywords['relevant']:
+            if word in text:
+                score = min(8, score + 1)
+        
+        return score
 
-    def process_daily_intelligence(self):
-        """Main processing for daily 6am email"""
-        logging.info("=" * 60)
-        logging.info("🌅 Starting Daily Intelligence Processing (6am Edition)")
-        
-        # Get last 24 hours of content
-        processor = IncrementalProcessor(self)
-        cutoff_time = processor.get_incremental_cutoff_time()
-        
-        # Fetch all items from last 24 hours
-        all_items = self.fetch_feeds_parallel_recent(cutoff_time)
-        
-        if not all_items:
-            logging.warning("No items found in last 24 hours")
-            return
-        
-        logging.info(f"Found {len(all_items)} items from last 24 hours")
-        
-        # Filter for new items only
-        new_items = []
-        for item in all_items:
-            if not self.item_exists(item.link):
-                new_items.append(item)
-        
-        logging.info(f"New items to process: {len(new_items)}")
-        
-        if new_items:
-            # AI analysis
-            analyzed_items = self.ai_score_and_analyze_batch(new_items)
-            
-            # Save to database
-            for item in analyzed_items:
-                self.save_item(item)
-            
-            logging.info(f"Saved {len(analyzed_items)} items to database")
-        
-        # Get all items from last 24 hours for email
-        self.send_daily_intelligence_email()
-        
-        # Update last run time
-        processor.update_last_run_time('feed_processing', len(new_items))
-        
-        logging.info("✅ Daily intelligence processing complete!")
-        logging.info("=" * 60)
 
-    def send_daily_intelligence_email(self):
-        """Send the daily 6am intelligence email"""
-        # Get last 24 hours of items
-        cutoff_time = datetime.now() - timedelta(hours=24)
+class RSSAnalyzer:
+    """Main analyzer class with improved architecture"""
+    
+    def __init__(self):
+        # Load and validate configuration
+        self.config = self._load_config()
         
-        cursor = self.conn.execute('''
-            SELECT title, link, description, interest_score, ai_summary, source_name, 
-                   processed_at, category, sentiment
-            FROM items 
-            WHERE processed_at >= ?
-            ORDER BY interest_score DESC, processed_at DESC
-        ''', (cutoff_time,))
+        # Initialize components
+        self.db = DatabaseManager()
+        self.ai = AIAnalyzer(self.config['openai_api_key'])
+        self.rss_feeds = RSS_FEEDS
         
-        items = cursor.fetchall()
+        # Performance tracking
+        self.stats = defaultdict(int)
         
-        if not items:
-            logging.warning("No items for daily email")
-            return
+        logger.info(f"RSS Analyzer initialized with {len(self.rss_feeds)} feeds")
+    
+    def _load_config(self) -> Dict[str, str]:
+        """Load and validate configuration"""
+        config = {
+            'openai_api_key': os.getenv('OPENAI_API_KEY'),
+            'gmail_user': os.getenv('GMAIL_USER'),
+            'gmail_password': os.getenv('GMAIL_APP_PASSWORD'),
+            'recipient_email': os.getenv('RECIPIENT_EMAIL'),
+        }
         
-        logging.info(f"Generating email for {len(items)} items")
+        # Validate required variables
+        missing = [k for k, v in config.items() if not v]
+        if missing:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
         
-        # Generate dynamic content
-        html_content = self.generate_dynamic_email_content(items)
+        return config
+    
+    def fetch_feeds_parallel(self, cutoff_time: datetime, max_workers: int = 10) -> List[FeedItem]:
+        """Improved parallel feed fetching with timeout handling"""
+        all_items = []
+        errors = []
         
-        if not html_content:
-            logging.error("Failed to generate email content")
-            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_feed = {
+                executor.submit(self._fetch_single_feed, feed_config, cutoff_time): feed_config 
+                for feed_config in self.rss_feeds
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_feed, timeout=30):
+                feed_config = future_to_feed[future]
+                try:
+                    items = future.result(timeout=10)
+                    all_items.extend(items)
+                    self.stats['feeds_success'] += 1
+                except Exception as e:
+                    logger.error(f"Failed to fetch {feed_config['name']}: {e}")
+                    errors.append((feed_config['name'], str(e)))
+                    self.stats['feeds_failed'] += 1
         
-        # Send email
+        # Log errors to database
+        if errors:
+            with self.db.get_connection() as conn:
+                for feed_name, error_msg in errors:
+                    conn.execute(
+                        "INSERT INTO error_log (error_type, error_message, feed_url) VALUES (?, ?, ?)",
+                        ('feed_fetch', error_msg, feed_name)
+                    )
+                conn.commit()
+        
+        logger.info(f"Fetched {len(all_items)} items from {self.stats['feeds_success']} feeds")
+        return all_items
+    
+    def _fetch_single_feed(self, feed_config: Dict, cutoff_time: datetime) -> List[FeedItem]:
+        """Fetch single feed with improved error handling"""
+        feed_url = feed_config['url']
+        feed_name = feed_config['name']
+        items = []
+        
         try:
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = getattr(self, 'email_subject', f"🏢 Property Intelligence - {datetime.now().strftime('%B %d')}")
-            msg['From'] = self.config['gmail_user']
-            msg['To'] = self.config['recipient_email']
+            # Parse feed with timeout
+            feed = feedparser.parse(feed_url, timeout=15)
             
-            # Plain text fallback
-            text_part = MIMEText("Please view this email in HTML format for the best experience.", 'plain')
-            html_part = MIMEText(html_content, 'html')
+            if feed.bozo:
+                logger.warning(f"Feed parse warning for {feed_name}: {feed.bozo_exception}")
             
-            msg.attach(text_part)
-            msg.attach(html_part)
+            for entry in feed.entries[:50]:  # Limit entries per feed
+                try:
+                    # Skip if missing required fields
+                    if not hasattr(entry, 'title') or not hasattr(entry, 'link'):
+                        continue
+                    
+                    # Parse published date
+                    published = self._parse_date(entry)
+                    
+                    # Skip old items
+                    if published < cutoff_time:
+                        continue
+                    
+                    # Extract description
+                    description = self._extract_description(entry)
+                    
+                    item = FeedItem(
+                        title=entry.title[:500],  # Limit title length
+                        link=entry.link,
+                        description=description,
+                        published=published,
+                        source_feed=feed_url,
+                        source_name=feed_name
+                    )
+                    
+                    items.append(item)
+                    
+                except Exception as e:
+                    logger.debug(f"Error processing entry from {feed_name}: {e}")
+                    continue
             
-            with smtplib.SMTP('smtp.gmail.com', 587) as server:
-                server.starttls()
-                server.login(self.config['gmail_user'], self.config['gmail_password'])
-                server.send_message(msg)
-            
-            logging.info("✅ Daily intelligence email sent successfully!")
-            
-            # Mark items as sent
-            self.conn.execute('''
-                UPDATE items SET email_sent = TRUE 
-                WHERE processed_at >= ?
-            ''', (cutoff_time,))
-            self.conn.commit()
+            logger.info(f"✓ {feed_name}: {len(items)} recent items")
             
         except Exception as e:
-            logging.error(f"Failed to send email: {e}")
-
+            logger.error(f"Error fetching {feed_name}: {e}")
+            raise
+        
+        return items
+    
+    def _parse_date(self, entry) -> datetime:
+        """Parse date from feed entry with fallbacks"""
+        # Try multiple date fields
+        date_fields = ['published_parsed', 'updated_parsed', 'created_parsed']
+        
+        for field in date_fields:
+            if hasattr(entry, field) and getattr(entry, field):
+                try:
+                    return datetime(*getattr(entry, field)[:6])
+                except:
+                    continue
+        
+        # Fallback to current time
+        return datetime.now()
+    
+    def _extract_description(self, entry) -> str:
+        """Extract and clean description from entry"""
+        description = ""
+        
+        # Try multiple description fields
+        for field in ['description', 'summary', 'content']:
+            if hasattr(entry, field):
+                content = getattr(entry, field)
+                if isinstance(content, list) and content:
+                    description = content[0].get('value', '')
+                elif isinstance(content, str):
+                    description = content
+                
+                if description:
+                    break
+        
+        # Clean HTML and limit length
+        description = re.sub('<[^<]+?>', '', description)
+        description = re.sub(r'\s+', ' ', description).strip()
+        
+        return description[:1000]
+    
+    def process_daily_intelligence(self):
+        """Enhanced daily processing with better error handling"""
+        start_time = time.time()
+        logger.info("=" * 60)
+        logger.info("🌅 Starting Daily Intelligence Processing")
+        
+        try:
+            # Get cutoff time (last 24 hours)
+            cutoff_time = datetime.now() - timedelta(hours=24)
+            
+            # Fetch feeds in parallel
+            all_items = self.fetch_feeds_parallel(cutoff_time)
+            
+            if not all_items:
+                logger.warning("No items found in last 24 hours")
+                return
+            
+            # Filter new items
+            new_items = []
+            with self.db.get_connection() as conn:
+                for item in all_items:
+                    cursor = conn.execute('SELECT 1 FROM items WHERE link = ?', (item.link,))
+                    if not cursor.fetchone():
+                        new_items.append(item)
+            
+            logger.info(f"Processing {len(new_items)} new items out of {len(all_items)} total")
+            
+            if new_items:
+                # AI analysis in batches
+                analyzed_items = self.ai.batch_analyze_items(new_items)
+                
+                # Save to database
+                self._save_items(analyzed_items)
+                
+                logger.info(f"Saved {len(analyzed_items)} items to database")
+            
+            # Send email
+            self.send_daily_intelligence_email()
+            
+            # Record processing run
+            duration = time.time() - start_time
+            with self.db.get_connection() as conn:
+                conn.execute('''
+                    INSERT INTO processing_runs 
+                    (run_type, last_run_time, items_processed, items_new, errors, duration_seconds)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', ('daily_processing', datetime.now(), len(all_items), len(new_items), 
+                      self.stats['feeds_failed'], duration))
+                conn.commit()
+            
+            logger.info(f"✅ Daily processing complete in {duration:.2f} seconds")
+            
+        except Exception as e:
+            logger.error(f"Daily processing failed: {e}", exc_info=True)
+            raise
+        
+        finally:
+            logger.info("=" * 60)
+    
+    def _save_items(self, items: List[FeedItem]):
+        """Save items to database with batch insert"""
+        with self.db.get_connection() as conn:
+            for item in items:
+                try:
+                    # Generate content hash for deduplication
+                    content_hash = hashlib.md5(
+                        f"{item.title}{item.description}".encode()
+                    ).hexdigest()
+                    
+                    conn.execute('''
+                        INSERT OR IGNORE INTO items (
+                            title, link, description, published, source_feed, source_name,
+                            interest_score, ai_summary, category, sentiment, key_metrics,
+                            geographic_tags, sector_tags, content_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        item.title, item.link, item.description, item.published,
+                        item.source_feed, item.source_name, item.interest_score,
+                        item.ai_summary, item.category, item.sentiment,
+                        json.dumps(item.key_metrics) if item.key_metrics else None,
+                        json.dumps(item.geographic_tags) if item.geographic_tags else None,
+                        json.dumps(item.sector_tags) if item.sector_tags else None,
+                        content_hash
+                    ))
+                except sqlite3.IntegrityError:
+                    logger.debug(f"Duplicate item skipped: {item.title[:50]}")
+                except Exception as e:
+                    logger.error(f"Error saving item: {e}")
+            
+            conn.commit()
+    
     def cleanup_old_items(self, days: int = 7):
-        """Remove items older than specified days"""
+        """Enhanced cleanup with statistics"""
         try:
             cutoff_date = datetime.now() - timedelta(days=days)
             
-            # Count items to be deleted
-            cursor = self.conn.execute(
-                'SELECT COUNT(*) FROM items WHERE processed_at < ?', 
-                (cutoff_date,)
-            )
-            count = cursor.fetchone()[0]
-            
-            if count > 0:
-                # Delete old items
-                self.conn.execute(
-                    'DELETE FROM items WHERE processed_at < ?', 
+            with self.db.get_connection() as conn:
+                # Get statistics before deletion
+                cursor = conn.execute(
+                    'SELECT COUNT(*) as count, MIN(published) as oldest FROM items WHERE processed_at < ?',
                     (cutoff_date,)
                 )
-                self.conn.commit()
-                logging.info(f"Cleaned up {count} items older than {days} days")
-            else:
-                logging.info(f"No items older than {days} days found")
+                result = cursor.fetchone()
+                count = result['count']
+                oldest = result['oldest']
+                
+                if count > 0:
+                    # Delete old items
+                    conn.execute('DELETE FROM items WHERE processed_at < ?', (cutoff_date,))
+                    
+                    # Clean up old error logs
+                    conn.execute(
+                        'DELETE FROM error_log WHERE created_at < ?',
+                        (cutoff_date,)
+                    )
+                    
+                    conn.commit()
+                    logger.info(f"Cleaned up {count} items older than {days} days (oldest: {oldest})")
+                else:
+                    logger.info(f"No items older than {days} days found")
                 
         except Exception as e:
-            logging.error(f"Cleanup error: {e}")
+            logger.error(f"Cleanup error: {e}")
             raise
 
 
 def main():
-    """Main function"""
+    """Enhanced main function with better argument handling"""
     try:
         analyzer = RSSAnalyzer()
         
@@ -1138,40 +686,62 @@ def main():
             command = sys.argv[1].lower()
             
             if command in ['process', 'run', 'test']:
-                logging.info("Running daily intelligence processing...")
+                logger.info("Running daily intelligence processing...")
                 analyzer.process_daily_intelligence()
                 
             elif command == 'email':
-                logging.info("Sending daily email only...")
+                logger.info("Sending daily email only...")
                 analyzer.send_daily_intelligence_email()
             
             elif command == 'cleanup':
                 days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
-                logging.info(f"Cleaning up items older than {days} days...")
+                logger.info(f"Cleaning up items older than {days} days...")
                 analyzer.cleanup_old_items(days)
-                logging.info("Cleanup completed!")
                 
+            elif command == 'stats':
+                # Show statistics
+                with analyzer.db.get_connection() as conn:
+                    cursor = conn.execute('''
+                        SELECT 
+                            COUNT(*) as total_items,
+                            COUNT(DISTINCT source_name) as sources,
+                            AVG(interest_score) as avg_score,
+                            MAX(published) as latest_item
+                        FROM items
+                    ''')
+                    stats = cursor.fetchone()
+                    print(f"\nDatabase Statistics:")
+                    print(f"  Total items: {stats['total_items']}")
+                    print(f"  Sources: {stats['sources']}")
+                    print(f"  Average score: {stats['avg_score']:.2f}")
+                    print(f"  Latest item: {stats['latest_item']}")
+                    
             else:
-                print("Usage: python rss_analyzer.py [process|email|cleanup] [days]")
+                print("Usage: python rss_analyzer.py [process|email|cleanup|stats] [options]")
                 sys.exit(1)
+                
         else:
             # Schedule for 6am daily
-            logging.info("Starting scheduled mode - will run at 6:00 AM daily")
+            logger.info("Starting scheduled mode - will run at 6:00 AM daily")
             
+            # Run once on startup
+            analyzer.process_daily_intelligence()
+            
+            # Schedule daily run
             schedule.every().day.at("06:00").do(analyzer.process_daily_intelligence)
             
-            # Run once on startup for testing
-            analyzer.process_daily_intelligence()
+            # Weekly cleanup
+            schedule.every().sunday.at("03:00").do(analyzer.cleanup_old_items, 30)
             
             while True:
                 schedule.run_pending()
                 time.sleep(60)
             
     except KeyboardInterrupt:
-        logging.info("Stopped by user")
+        logger.info("Stopped by user")
     except Exception as e:
-        logging.error(f"Fatal error: {e}")
-        raise
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
