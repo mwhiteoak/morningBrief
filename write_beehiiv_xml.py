@@ -1,128 +1,94 @@
+#!/usr/bin/env python3
+import os, sqlite3, logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import sqlite3, os, html, json, sys
+from xml.sax.saxutils import escape
 
-DB_PATH    = os.getenv("RSS_DB_PATH", "rss_items.db")
-OUT_PATH   = os.getenv("OUT_PATH", "beehiiv.xml")  # default to repo root
-SITE_TITLE = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
-SITE_LINK  = os.getenv("BASE_URL", "https://yourname.github.io/yourrepo")
-FEED_DESC  = "Daily AU commercial property briefing — asset, fund, and acquisitions focused."
-TZ_REGION  = os.getenv("TZ_REGION", "Australia/Brisbane")
-REQUIRE_AI = os.getenv("REQUIRE_AI", "1") == "1"  # exclude items without AI package
+DB_PATH   = os.getenv("RSS_DB_PATH", "rss_items.db")
+OUT_PATH  = os.getenv("OUT_PATH", "beehiiv.xml")
+SITE_LINK = os.getenv("BASE_URL", "https://example.github.io/repo")
+TITLE     = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
+LANG      = "en-au"
+WINDOW_HR = int(os.getenv("SCAN_WINDOW_HRS", "36"))
 
-def ensure_schema(conn: sqlite3.Connection):
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            link TEXT NOT NULL,
-            link_canonical TEXT,
-            fp TEXT UNIQUE,
-            description TEXT,
-            published DATETIME,
-            source_feed TEXT,
-            source_name TEXT,
-            interest_score INTEGER,
-            ai_summary TEXT,
-            category TEXT,
-            processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            ai_package TEXT,
-            exported_to_rss INTEGER DEFAULT 0,
-            export_batch TEXT
-        )
-    ''')
-    try: conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_fp ON items(fp)")
-    except sqlite3.OperationalError: pass
-    conn.commit()
+# Sort categories in a CRE-friendly order
+CAT_ORDER = [
+    "deals_capital","development_planning","reits","leasing",
+    "industrial","office","retail","residential","proptech_finance","macro"
+]
+CAT_INDEX = {c:i for i,c in enumerate(CAT_ORDER)}
 
-def rfc822(dt_local: datetime) -> str:
-    return dt_local.strftime("%a, %d %b %Y %H:%M:%S %z")
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-def today_bounds_utc():
-    tz = ZoneInfo(TZ_REGION)
-    now_local = datetime.now(tz)
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=1)
-    start_utc = start_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
-    end_utc   = end_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
-    return start_local, start_utc, end_utc
+def fetch_items(conn):
+    since = (datetime.utcnow() + timedelta(hours=10)) - timedelta(hours=WINDOW_HR)
+    cur = conn.execute("""
+        SELECT url, source, title, published_at, ai_title, ai_desc_html, category_main, ai_tags
+        FROM items
+        WHERE ai_title IS NOT NULL
+          AND ai_desc_html IS NOT NULL
+          AND LENGTH(TRIM(ai_desc_html)) > 60
+          AND datetime(published_at) >= datetime(?)
+    """, (since.isoformat(),))
+    rows = [dict(r) for r in cur.fetchall()]
+    # Fallback category
+    for r in rows:
+        r["category_main"] = r.get("category_main") or "macro"
+    # Sort: category bucket, then newest first
+    rows.sort(key=lambda r: (CAT_INDEX.get(r["category_main"], 999), r["published_at"]), reverse=True)
+    return rows
 
-def item_block_from_pkg(pkg: dict, link: str) -> str:
-    block = pkg.get("newsletter_block_html") or f'<p><a href="{html.escape(link)}">Read more</a></p>'
-    return block.replace("<script", "&lt;script")
+def iso_to_rfc2822(iso_s: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_s)
+    except Exception:
+        dt = datetime.utcnow()
+    # naive AU time already baked into stored iso; render as +1000
+    return dt.strftime("%a, %d %b %Y %H:%M:%S +1000")
 
-# --- main ---
-conn = sqlite3.connect(DB_PATH)
-ensure_schema(conn)
+def build_xml(items):
+    now = datetime.utcnow() + timedelta(hours=10)
+    head = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">',
+        "<channel>",
+        f"<title>{escape(TITLE)}</title>",
+        f"<link>{escape(SITE_LINK)}</link>",
+        "<description>Daily AU commercial property briefing — asset, fund, and acquisitions focused.</description>",
+        f"<language>{LANG}</language>",
+        f"<lastBuildDate>{iso_to_rfc2822(now.isoformat())}</lastBuildDate>",
+        "<ttl>60</ttl>",
+    ]
+    body = []
+    for it in items:
+        ai_title = it["ai_title"].strip()
+        ai_desc  = it["ai_desc_html"].strip()
+        if not ai_title or not ai_desc:  # double-guard
+            continue
+        body.extend([
+            "<item>",
+            f"<title>{escape(ai_title)}</title>",
+            f"<link>{escape(it['url'])}</link>",
+            f"<guid isPermaLink=\"false\">{escape(it['url'])}</guid>",
+            f"<pubDate>{iso_to_rfc2822(it['published_at'])}</pubDate>",
+            "<description><![CDATA[ " + ai_desc + " ]]></description>",
+            "<content:encoded><![CDATA[ " + ai_desc + " ]]></content:encoded>",
+            f"<category>{escape(it['source'])}</category>",
+            f"<category>{escape(it['category_main'])}</category>",
+            "</item>"
+        ])
+    tail = ["</channel>", "</rss>"]
+    return "\n".join(head + body + tail)
 
-start_local, start_utc, end_utc = today_bounds_utc()
-batch_id = start_local.strftime("%Y%m%d")
+def main():
+    if not os.path.exists(DB_PATH):
+        logging.info("No DB found, writing empty shell RSS.")
+        open(OUT_PATH, "w").write(build_xml([]))
+        return
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+    items = fetch_items(conn)
+    xml = build_xml(items)
+    open(OUT_PATH, "w", encoding="utf-8").write(xml)
+    logging.info("Wrote RSS to %s (items=%d)", OUT_PATH, len(items))
 
-cur = conn.execute("""
-    SELECT id, title, link, description, interest_score, ai_summary, source_name, processed_at, ai_package, exported_to_rss
-    FROM items
-    WHERE processed_at >= ? AND processed_at < ? AND exported_to_rss = 0
-    ORDER BY interest_score DESC, processed_at DESC
-""", (start_utc, end_utc))
-rows = cur.fetchall()
-
-items_xml = []
-selected_ids = []
-
-for row in rows:
-    _id, title, link, desc, score, summary, source, processed_at, ai_pkg, exported = row
-    pkg = None
-    if ai_pkg:
-        try: pkg = json.loads(ai_pkg)
-        except Exception: pkg = None
-    if REQUIRE_AI and not (pkg and isinstance(pkg, dict) and pkg.get("hed")):
-        continue
-
-    hed = (pkg.get("hed") if pkg else title) or "Untitled"
-    block = item_block_from_pkg(pkg, link) if pkg else f"<p>{html.escape((summary or desc or '')[:400])}…</p><p><a href=\"{html.escape(link)}\">Read more</a></p>"
-    cats = ""
-    if pkg:
-        cats += "".join(f"<category>{html.escape(c)}</category>" for c in (pkg.get("sector_tags") or []))
-        cats += "".join(f"<category>{html.escape(c)}</category>" for c in (pkg.get("geo_tags") or []))
-
-    pub_local = start_local
-    items_xml.append(f"""
-<item>
-  <title>{html.escape(hed)}</title>
-  <link>{html.escape(link)}</link>
-  <guid isPermaLink="false">{html.escape(link)}</guid>
-  <pubDate>{rfc822(pub_local)}</pubDate>
-  <description><![CDATA[{block}]]></description>
-  <content:encoded><![CDATA[{block}]]></content:encoded>
-  <category>{html.escape(source)}</category>
-  {cats}
-</item>""")
-    selected_ids.append(str(_id))
-
-xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"
-     xmlns:content="http://purl.org/rss/1.0/modules/content/">
-  <channel>
-    <title>{html.escape(SITE_TITLE)}</title>
-    <link>{html.escape(SITE_LINK)}</link>
-    <description>{html.escape(FEED_DESC)}</description>
-    <language>en-au</language>
-    <lastBuildDate>{rfc822(datetime.now(ZoneInfo(TZ_REGION)))}</lastBuildDate>
-    <ttl>60</ttl>
-    {''.join(items_xml)}
-  </channel>
-</rss>"""
-
-os.makedirs(os.path.dirname(OUT_PATH) or ".", exist_ok=True)
-with open(OUT_PATH, "w", encoding="utf-8") as f:
-    f.write(xml)
-
-if selected_ids:
-    q = f"UPDATE items SET exported_to_rss = 1, export_batch = ? WHERE id IN ({','.join(['?']*len(selected_ids))})"
-    conn.execute(q, (batch_id, *selected_ids))
-    conn.commit()
-
-conn.close()
-print(f"Wrote RSS to {OUT_PATH} (items={len(items_xml)}), batch={batch_id}")
-if not selected_ids:
-    print("NOTE: No eligible items today (DB present but none matched window/AI gating).")
+if __name__ == "__main__":
+    main()
