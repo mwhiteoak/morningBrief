@@ -894,8 +894,6 @@ Consider portfolio implications, risk management, and opportunities."""
         market_summary = self._generate_ai_market_summary(items)
         greeting = self._generate_ai_greeting(critical_items, market_summary)
         big_story = self._generate_ai_big_story(critical_items) if critical_items else None
-        action_items = self._generate_ai_action_items(items)
-        market_metrics = self._calculate_market_temperature(items)
         
         current_date = datetime.now().strftime('%B %d, %Y')
         current_time = datetime.now().strftime('%I:%M %p')
@@ -940,33 +938,25 @@ Consider portfolio implications, risk management, and opportunities."""
             opacity: 0.95;
         }}
         
-        /* Market Metrics Bar */
-        .metrics-bar {{
+        /* Articles Count Bar */
+        .count-bar {{
             background: white;
-            padding: 20px;
-            display: flex;
-            justify-content: space-around;
+            padding: 25px;
+            text-align: center;
             border-bottom: 1px solid #e9ecef;
         }}
-        .metric {{
-            text-align: center;
-            flex: 1;
-        }}
-        .metric-value {{
-            font-size: 28px;
+        .count-value {{
+            font-size: 36px;
             font-weight: 700;
             color: #667eea;
             line-height: 1;
         }}
-        .metric-label {{
-            font-size: 11px;
+        .count-label {{
+            font-size: 12px;
             color: #6c757d;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-top: 5px;
-        }}
-        .metric + .metric {{
-            border-left: 1px solid #e9ecef;
+            letter-spacing: 1px;
+            margin-top: 8px;
         }}
         
         /* Greeting Section */
@@ -1023,27 +1013,6 @@ Consider portfolio implications, risk management, and opportunities."""
             font-size: 14px;
             line-height: 1.6;
             margin: 0;
-        }}
-        
-        /* Action Items */
-        .action-items {{
-            background: #f0f4ff;
-            padding: 20px 30px;
-            border-left: 4px solid #667eea;
-            margin: 0 25px 25px 25px;
-            border-radius: 8px;
-        }}
-        .action-items h3 {{
-            margin: 0 0 12px 0;
-            color: #667eea;
-            font-size: 15px;
-            font-weight: 600;
-        }}
-        .action-items p {{
-            margin: 0;
-            color: #495057;
-            font-size: 14px;
-            line-height: 1.8;
         }}
         
         /* Section Headers */
@@ -1159,9 +1128,7 @@ Consider portfolio implications, risk management, and opportunities."""
         @media (max-width: 600px) {{
             .container {{ border-radius: 0; }}
             .header h1 {{ font-size: 24px; }}
-            .metric-value {{ font-size: 24px; }}
-            .metrics-bar {{ flex-direction: column; gap: 15px; }}
-            .metric + .metric {{ border-left: none; border-top: 1px solid #e9ecef; padding-top: 15px; }}
+            .count-value {{ font-size: 32px; }}
         }}
     </style>
 </head>
@@ -1173,24 +1140,10 @@ Consider portfolio implications, risk management, and opportunities."""
             <div class="date">{current_date} • {current_time}</div>
         </div>
         
-        <!-- Market Metrics -->
-        <div class="metrics-bar">
-            <div class="metric">
-                <div class="metric-value">{len(items)}</div>
-                <div class="metric-label">Analyzed</div>
-            </div>
-            <div class="metric">
-                <div class="metric-value">{market_metrics['temperature']}°</div>
-                <div class="metric-label">Market Temp</div>
-            </div>
-            <div class="metric">
-                <div class="metric-value">{market_metrics['high_impact_count']}</div>
-                <div class="metric-label">High Impact</div>
-            </div>
-            <div class="metric">
-                <div class="metric-value">{market_metrics['trend']}</div>
-                <div class="metric-label">Trend</div>
-            </div>
+        <!-- Articles Count -->
+        <div class="count-bar">
+            <div class="count-value">{len(items)}</div>
+            <div class="count-label">Articles Analyzed</div>
         </div>
         
         <!-- Personalized Greeting -->
@@ -1212,15 +1165,6 @@ Consider portfolio implications, risk management, and opportunities."""
         <div class="big-story">
             <h3>🎯 The Big Story</h3>
             <p>{big_story}</p>
-        </div>
-"""
-        
-        # Add Action Items
-        html += f"""
-        <!-- Action Items -->
-        <div class="action-items">
-            <h3>⚡ Today's Action Items</h3>
-            <p>{action_items}</p>
         </div>
 """
         
@@ -1287,7 +1231,7 @@ Consider portfolio implications, risk management, and opportunities."""
                 What took you 2 minutes would've taken 2 hours manually.
             </p>
             <p style="margin-top: 15px;">
-                Built with 🤖 for strategic property intelligence
+                Built with 🤖 by <a href="https://www.linkedin.com/in/mattwhiteoak">Matt Whiteoak</a>
             </p>
         </div>
     </div>
@@ -1313,7 +1257,7 @@ Consider portfolio implications, risk management, and opportunities."""
                 💡 {summary}
             </div>
             <div class="item-meta">
-                <span>📰 {item['source_name']} • {item['sentiment'] if item['sentiment'] else 'Neutral'}</span>
+                <span>📰 {item['source_name']}</span>
                 <a href="{item['link']}" class="read-more">Read Full Article →</a>
             </div>
         </div>
