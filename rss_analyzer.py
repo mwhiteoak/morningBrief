@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced RSS Analyzer with 100x More Engaging Content
-- Aggressive feed fetching with better duplicate handling
-- Engaging AI prompts for high-net-worth audience
-- Content scoring and prioritization
-- Enhanced headline/subhead generation
+Enhanced RSS Analyzer with 100x More Engaging Content - FIXED VERSION
 """
 
 import os, re, json, time, hashlib, sqlite3, logging, feedparser
@@ -29,7 +25,7 @@ SCAN_WINDOW_HRS = int(os.getenv("SCAN_WINDOW_HRS", "24"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 FEED_TIMEOUT = int(os.getenv("FEED_TIMEOUT", "15"))
 ALWAYS_AI = os.getenv("ALWAYS_AI", "1") == "1"
-MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "3"))  # Lower threshold for more content
+MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "3"))
 MIN_ITEMS_PER_CATEGORY = int(os.getenv("MIN_ITEMS_PER_CATEGORY", "2"))
 TZ = timezone(timedelta(hours=10))
 
@@ -55,7 +51,6 @@ PROPERTY_WEIGHTED_SOURCES = {
     "The Australian - Business": 2,
 }
 
-# Enhanced keywords for better scoring
 KEYWORDS = [
     # High-value CRE
     "industrial","warehouse","logistics","distribution centre","office","retail","shopping centre",
@@ -285,7 +280,7 @@ def ai_classify_and_rewrite_engaging(title: str, summary: str, source: str) -> O
                 return {"relevant": False}
             
             desc = (data.get("desc") or "").strip()
-            if not desc or len(desc) < 60:  # Require substantial content
+            if not desc or len(desc) < 60:
                 return {"relevant": False}
                 
             new_title = (data.get("title") or "").strip()
@@ -406,7 +401,7 @@ def generate_engaging_headlines(conn: sqlite3.Connection) -> Tuple[str, str]:
         throttle_sleep([0.0])
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.8,  # Higher creativity for headlines
+            temperature=0.8,
             messages=[
                 {"role": "system", "content": ENGAGING_HEADLINE_SYSTEM},
                 {"role": "user", "content": f"Create an IRRESISTIBLE headline based on this intelligence:\n\n{rich_context}"}
@@ -662,7 +657,7 @@ def fetch_incremental_enhanced(conn: sqlite3.Connection) -> List[Dict[str, Any]]
             feed_items = 0
             consecutive_duplicates = 0
             
-            for i, e in enumerate(fp.entries[:150]):  # Increased limit
+            for i, e in enumerate(fp.entries[:150]):
                 link = getattr(e, "link", "") or ""
                 if not link:
                     continue
@@ -692,6 +687,70 @@ def fetch_incremental_enhanced(conn: sqlite3.Connection) -> List[Dict[str, Any]]
                         summary = ""
                 
                 pub_iso = parse_dt(e)
+                
+                items.append({
+                    "source_name": name,
+                    "source_feed": url,
+                    "link": link,
+                    "link_canonical": canonical_link,
+                    "title": title,
+                    "summary": summary.strip(),
+                    "published_at": pub_iso,
+                    "fetched_at": datetime.now(tz=TZ).isoformat(),
+                })
+                
+                feed_items += 1
+                
+            logging.info(f"Collected {feed_items} new items from {name}")
+                
+        except Exception as ex:
+            logging.error(f"Fetch error {name}: {ex}")
+    
+    logging.info(f"Total items collected: {len(items)}")
+    return items
+
+def fetch_comprehensive_enhanced() -> List[Dict[str, Any]]:
+    """Enhanced comprehensive fetch"""
+    items: List[Dict[str,Any]] = []
+    since = datetime.now(tz=TZ) - timedelta(days=7)
+    
+    for f in RSS_FEEDS:
+        name = f.get("name","Feed")
+        url = f.get("url","")
+        
+        logging.info(f"Comprehensive fetch from: {name}")
+        
+        try:
+            fp = feedparser.parse(url)
+            
+            if not fp.entries:
+                logging.warning(f"No entries found for {name}")
+                continue
+                
+            logging.info(f"Found {len(fp.entries)} entries in {name}")
+            
+            for e in fp.entries[:300]:
+                link = getattr(e, "link", "") or ""
+                if not link:
+                    continue
+                
+                title = (getattr(e, "title", "") or "").strip()
+                summary = (getattr(e, "summary", "") or "")
+                
+                if not summary and getattr(e, "content", None):
+                    try:
+                        summary = e.content[0].value or ""
+                    except Exception:
+                        summary = ""
+                
+                pub_iso = parse_dt(e)
+                try:
+                    pub_dt = datetime.fromisoformat(pub_iso)
+                except Exception:
+                    pub_dt = datetime.now(tz=TZ)
+                
+                if pub_dt < since:
+                    continue
                 
                 items.append({
                     "source_name": name,
@@ -934,67 +993,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                    "link_canonical": canonical_link,
-                    "title": title,
-                    "summary": summary.strip(),
-                    "published_at": pub_iso,
-                    "fetched_at": datetime.now(tz=TZ).isoformat(),
-                })
-                
-                feed_items += 1
-                
-            logging.info(f"Collected {feed_items} new items from {name}")
-                
-        except Exception as ex:
-            logging.error(f"Fetch error {name}: {ex}")
-    
-    logging.info(f"Total items collected: {len(items)}")
-    return items
-
-def fetch_comprehensive_enhanced() -> List[Dict[str, Any]]:
-    """Enhanced comprehensive fetch"""
-    items: List[Dict[str,Any]] = []
-    since = datetime.now(tz=TZ) - timedelta(days=7)  # Look back further
-    
-    for f in RSS_FEEDS:
-        name = f.get("name","Feed")
-        url = f.get("url","")
-        
-        logging.info(f"Comprehensive fetch from: {name}")
-        
-        try:
-            fp = feedparser.parse(url)
-            
-            if not fp.entries:
-                logging.warning(f"No entries found for {name}")
-                continue
-                
-            logging.info(f"Found {len(fp.entries)} entries in {name}")
-            
-            for e in fp.entries[:300]:  # Even more entries for comprehensive
-                link = getattr(e, "link", "") or ""
-                if not link:
-                    continue
-                
-                title = (getattr(e, "title", "") or "").strip()
-                summary = (getattr(e, "summary", "") or "")
-                
-                if not summary and getattr(e, "content", None):
-                    try:
-                        summary = e.content[0].value or ""
-                    except Exception:
-                        summary = ""
-                
-                pub_iso = parse_dt(e)
-                try:
-                    pub_dt = datetime.fromisoformat(pub_iso)
-                except Exception:
-                    pub_dt = datetime.now(tz=TZ)
-                
-                if pub_dt < since:
-                    continue
-                
-                items.append({
-                    "source_name": name,
-                    "source_feed": url,
-                    "link": link,
