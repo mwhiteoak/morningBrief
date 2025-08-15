@@ -653,7 +653,7 @@ class RSSAnalyzer:
             conn.commit()
     
     def send_daily_intelligence_email(self):
-        """Send the daily intelligence email"""
+        """Send the daily intelligence email with executive summary"""
         try:
             # Get last 24 hours of items
             cutoff_time = datetime.now() - timedelta(hours=24)
@@ -675,16 +675,19 @@ class RSSAnalyzer:
             
             logger.info(f"Generating email for {len(items)} items")
             
-            # Generate email content
-            html_content = self._generate_email_html(items)
+            # Generate dynamic email content with AI insights
+            html_content = self._generate_enhanced_email_html(items)
             
             if not html_content:
                 logger.error("Failed to generate email content")
                 return
             
+            # Generate dynamic subject line
+            subject = self._generate_ai_subject_line(items)
+            
             # Create email message
             msg = MIMEMultipart('alternative')
-            msg['Subject'] = self._generate_subject_line(items)
+            msg['Subject'] = subject
             msg['From'] = self.config['gmail_user']
             msg['To'] = self.config['recipient_email']
             
@@ -714,86 +717,578 @@ class RSSAnalyzer:
         except Exception as e:
             logger.error(f"Failed to send email: {e}", exc_info=True)
     
-    def _generate_subject_line(self, items) -> str:
-        """Generate email subject line"""
+    def _generate_ai_subject_line(self, items) -> str:
+        """Generate dynamic AI subject line"""
         critical_count = sum(1 for item in items if item['interest_score'] >= 8)
-        date_str = datetime.now().strftime('%B %d')
         
+        if critical_count > 0 and items:
+            # Try to generate AI subject based on top story
+            try:
+                top_story = items[0]['title']
+                prompt = f"""Write a compelling email subject line based on this top story:
+                {top_story}
+                
+                Make it urgent but not clickbait. Max 60 characters. Include an emoji."""
+                
+                subject = self.ai.analyze_with_retry(prompt, max_tokens=30)
+                if len(subject) > 70:
+                    subject = subject[:67] + "..."
+                return subject
+            except:
+                pass
+        
+        # Fallback subjects
+        date_str = datetime.now().strftime('%B %d')
         if critical_count > 0:
             return f"🔥 {critical_count} Critical Property Alerts - {date_str}"
         else:
             return f"📊 Property Intelligence Daily - {date_str}"
     
-    def _generate_email_html(self, items) -> str:
-        """Generate HTML email content"""
+    def _generate_ai_market_summary(self, items) -> str:
+        """Generate AI market summary from top items"""
+        if not items or len(items) < 3:
+            return "Markets are showing limited activity today."
+        
+        try:
+            # Get top 5 headlines
+            headlines = "\n".join([f"- {item['title']}" for item in items[:5]])
+            
+            prompt = f"""Based on these top property news headlines, write a 2-3 sentence market summary:
+
+{headlines}
+
+Focus on the overall market direction and key themes. Be specific but concise. 
+Write for a REIT CEO who needs to understand market dynamics quickly."""
+
+            summary = self.ai.analyze_with_retry(prompt, max_tokens=150)
+            return summary
+        except Exception as e:
+            logger.warning(f"Failed to generate market summary: {e}")
+            return "Property markets are showing mixed signals with several key developments requiring attention."
+    
+    def _generate_ai_greeting(self, critical_items, market_summary) -> str:
+        """Generate personalized AI greeting"""
+        try:
+            context = f"{len(critical_items)} critical alerts" if critical_items else "steady market conditions"
+            
+            prompt = f"""Write a 2-3 sentence engaging opening for a property market briefing email.
+
+Context: {context}
+Market summary: {market_summary}
+
+Make it conversational, slightly witty, and action-oriented. Like you're talking to a smart friend who runs a REIT.
+Start with something like "Morning champion" or "Good morning" - keep it fresh and engaging."""
+
+            greeting = self.ai.analyze_with_retry(prompt, max_tokens=100)
+            return greeting
+        except:
+            if critical_items:
+                return "Good morning! We've got some critical developments that need your attention today. Let's dive into what's moving the market."
+            else:
+                return "Morning champion! Markets are steady but there are opportunities hiding in today's news. Here's what you need to know."
+    
+    def _generate_ai_big_story(self, critical_items) -> Optional[str]:
+        """Generate the big story narrative for critical news"""
+        if not critical_items or len(critical_items) == 0:
+            return None
+        
+        try:
+            top_story = critical_items[0]
+            
+            prompt = f"""Write a 3-4 sentence executive briefing about why this is THE story to watch today:
+
+Title: {top_story['title']}
+Summary: {top_story['ai_summary'] if top_story['ai_summary'] else top_story['description'][:200]}
+Score: {top_story['interest_score']}/10
+
+Make it compelling and specific about the commercial property impact. 
+Use active voice and strong verbs. 
+Explain what actions a REIT CEO should consider."""
+
+            story = self.ai.analyze_with_retry(prompt, max_tokens=200)
+            return story
+        except Exception as e:
+            logger.warning(f"Failed to generate big story: {e}")
+            return None
+    
+    def _generate_ai_action_items(self, items) -> str:
+        """Generate specific action recommendations"""
+        try:
+            critical_context = []
+            if items:
+                for item in items[:5]:
+                    if item['interest_score'] >= 7:
+                        critical_context.append(f"{item['title'][:80]} (Score: {item['interest_score']})")
+            
+            context = "\n".join(critical_context) if critical_context else "No critical items today"
+            
+            prompt = f"""Based on today's property market developments, write 3 specific action items for a REIT CEO.
+
+Top stories:
+{context}
+
+Be specific and actionable. Format as bullet points. 
+Focus on what they should DO today or this week.
+Consider portfolio implications, risk management, and opportunities."""
+
+            actions = self.ai.analyze_with_retry(prompt, max_tokens=200)
+            # Clean up formatting
+            actions = actions.replace('•', '→').replace('- ', '→ ')
+            return actions
+        except:
+            return """→ Review portfolio exposure to interest rate changes
+→ Schedule team discussion on market positioning  
+→ Monitor tenant stability in key properties"""
+    
+    def _calculate_market_temperature(self, items) -> Dict[str, Any]:
+        """Calculate market metrics"""
+        if not items:
+            return {'temperature': 50, 'trend': 'Neutral', 'volatility': 'Low'}
+        
+        # Calculate temperature based on high-impact news
+        high_scores = len([item for item in items if item['interest_score'] >= 7])
+        total = min(len(items), 20)  # Look at top 20 items
+        
+        temp = 50 + (high_scores / max(total, 1)) * 50
+        
+        # Analyze sentiment
+        sentiments = [item['sentiment'] for item in items[:10] if item['sentiment']]
+        bullish = sentiments.count('Bullish')
+        bearish = sentiments.count('Bearish')
+        
+        # Adjust temperature based on sentiment
+        temp += (bullish - bearish) * 5
+        temp = min(100, max(0, int(temp)))
+        
+        # Determine trend
+        if bullish > bearish + 2:
+            trend = 'Bullish'
+        elif bearish > bullish + 2:
+            trend = 'Bearish'
+        else:
+            trend = 'Neutral'
+        
+        # Determine volatility
+        if high_scores >= 5:
+            volatility = 'High'
+        elif high_scores >= 2:
+            volatility = 'Medium'
+        else:
+            volatility = 'Low'
+        
+        return {
+            'temperature': temp,
+            'trend': trend,
+            'volatility': volatility,
+            'high_impact_count': high_scores
+        }
+    
+    def _generate_enhanced_email_html(self, items) -> str:
+        """Generate enhanced HTML email with AI insights and big story"""
         # Sort and categorize items
         critical_items = [item for item in items if item['interest_score'] >= 8]
         important_items = [item for item in items if 6 <= item['interest_score'] < 8]
         monitor_items = [item for item in items if 4 <= item['interest_score'] < 6]
         
+        # Generate AI components
+        market_summary = self._generate_ai_market_summary(items)
+        greeting = self._generate_ai_greeting(critical_items, market_summary)
+        big_story = self._generate_ai_big_story(critical_items) if critical_items else None
+        action_items = self._generate_ai_action_items(items)
+        market_metrics = self._calculate_market_temperature(items)
+        
         current_date = datetime.now().strftime('%B %d, %Y')
         current_time = datetime.now().strftime('%I:%M %p')
         
+        # Build enhanced HTML
         html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body {{ font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 600px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }}
-        .header h1 {{ margin: 0; font-size: 24px; }}
-        .section {{ padding: 20px; }}
-        .section-title {{ font-size: 18px; font-weight: bold; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #667eea; }}
-        .item {{ margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px; }}
-        .item.critical {{ border-left: 4px solid #ff4444; }}
-        .item.important {{ border-left: 4px solid #ffaa00; }}
-        .item-title {{ font-weight: bold; color: #333; margin-bottom: 8px; }}
-        .item-summary {{ color: #666; font-size: 14px; line-height: 1.5; margin: 10px 0; }}
-        .item-meta {{ font-size: 12px; color: #999; }}
-        .score-badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }}
-        .score-high {{ background: #ff4444; color: white; }}
-        .score-medium {{ background: #ffaa00; color: white; }}
-        .score-low {{ background: #00aa00; color: white; }}
-        .footer {{ padding: 20px; text-align: center; color: #666; font-size: 12px; background: #f9f9f9; }}
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        }}
+        .container {{ 
+            max-width: 650px; 
+            margin: 0 auto; 
+            background: white; 
+            border-radius: 16px; 
+            overflow: hidden;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+        }}
+        
+        /* Header */
+        .header {{ 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            color: white; 
+            padding: 40px 30px;
+            text-align: center;
+        }}
+        .header h1 {{ 
+            margin: 0 0 10px 0; 
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }}
+        .header .date {{ 
+            font-size: 14px; 
+            opacity: 0.95;
+        }}
+        
+        /* Market Metrics Bar */
+        .metrics-bar {{
+            background: white;
+            padding: 20px;
+            display: flex;
+            justify-content: space-around;
+            border-bottom: 1px solid #e9ecef;
+        }}
+        .metric {{
+            text-align: center;
+            flex: 1;
+        }}
+        .metric-value {{
+            font-size: 28px;
+            font-weight: 700;
+            color: #667eea;
+            line-height: 1;
+        }}
+        .metric-label {{
+            font-size: 11px;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 5px;
+        }}
+        .metric + .metric {{
+            border-left: 1px solid #e9ecef;
+        }}
+        
+        /* Greeting Section */
+        .greeting {{
+            padding: 25px 30px;
+            background: #f8f9fa;
+            font-size: 15px;
+            line-height: 1.7;
+            color: #495057;
+            border-bottom: 2px solid #e9ecef;
+        }}
+        
+        /* Executive Summary */
+        .executive-summary {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px 30px;
+            margin: 0;
+        }}
+        .executive-summary h2 {{
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .executive-summary p {{
+            margin: 0 0 10px 0;
+            line-height: 1.6;
+            font-size: 14px;
+            opacity: 0.95;
+        }}
+        
+        /* Big Story */
+        .big-story {{
+            margin: 25px;
+            padding: 20px;
+            background: linear-gradient(135deg, #fff6e6 0%, #ffe4cc 100%);
+            border-radius: 12px;
+            border-left: 4px solid #ff9800;
+        }}
+        .big-story h3 {{
+            color: #e65100;
+            font-size: 16px;
+            font-weight: 700;
+            margin: 0 0 12px 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .big-story p {{
+            color: #5d4037;
+            font-size: 14px;
+            line-height: 1.6;
+            margin: 0;
+        }}
+        
+        /* Action Items */
+        .action-items {{
+            background: #f0f4ff;
+            padding: 20px 30px;
+            border-left: 4px solid #667eea;
+            margin: 0 25px 25px 25px;
+            border-radius: 8px;
+        }}
+        .action-items h3 {{
+            margin: 0 0 12px 0;
+            color: #667eea;
+            font-size: 15px;
+            font-weight: 600;
+        }}
+        .action-items p {{
+            margin: 0;
+            color: #495057;
+            font-size: 14px;
+            line-height: 1.8;
+        }}
+        
+        /* Section Headers */
+        .section {{
+            padding: 0;
+        }}
+        .section-header {{
+            padding: 20px 30px 15px;
+            font-size: 17px;
+            font-weight: 700;
+            color: #2c3e50;
+            border-bottom: 2px solid #667eea;
+            background: #fafbfc;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .section-content {{
+            padding: 20px;
+        }}
+        
+        /* News Items */
+        .item {{
+            background: white;
+            padding: 18px;
+            margin-bottom: 15px;
+            border: 1px solid #e9ecef;
+            border-radius: 10px;
+            transition: all 0.2s;
+        }}
+        .item.critical {{
+            border-left: 4px solid #dc3545;
+            background: #fff5f5;
+        }}
+        .item.important {{
+            border-left: 4px solid #ffc107;
+            background: #fffdf5;
+        }}
+        .item.monitor {{
+            border-left: 4px solid #28a745;
+        }}
+        .item-title {{
+            font-weight: 600;
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 15px;
+            line-height: 1.4;
+        }}
+        .item-summary {{
+            background: #f8f9fa;
+            padding: 12px;
+            border-radius: 6px;
+            margin: 10px 0;
+            font-size: 13px;
+            color: #495057;
+            line-height: 1.5;
+            border-left: 3px solid #667eea;
+        }}
+        .item-meta {{
+            font-size: 12px;
+            color: #6c757d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 12px;
+        }}
+        .score-badge {{
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 700;
+            margin-left: 10px;
+        }}
+        .score-high {{ background: #dc3545; color: white; }}
+        .score-medium {{ background: #ffc107; color: #000; }}
+        .score-low {{ background: #28a745; color: white; }}
+        
+        /* Read More Link */
+        .read-more {{
+            display: inline-block;
+            padding: 6px 14px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 16px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        .read-more:hover {{
+            background: #5a67d8;
+        }}
+        
+        /* Footer */
+        .footer {{
+            padding: 30px;
+            background: #f8f9fa;
+            text-align: center;
+            color: #6c757d;
+            font-size: 13px;
+            line-height: 1.6;
+            border-top: 2px solid #e9ecef;
+        }}
+        .footer-tagline {{
+            font-weight: 600;
+            color: #495057;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }}
         a {{ color: #667eea; text-decoration: none; }}
         a:hover {{ text-decoration: underline; }}
+        
+        @media (max-width: 600px) {{
+            .container {{ border-radius: 0; }}
+            .header h1 {{ font-size: 24px; }}
+            .metric-value {{ font-size: 24px; }}
+            .metrics-bar {{ flex-direction: column; gap: 15px; }}
+            .metric + .metric {{ border-left: none; border-top: 1px solid #e9ecef; padding-top: 15px; }}
+        }}
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- Header -->
         <div class="header">
             <h1>🏢 Property Intelligence Daily</h1>
-            <p>{current_date} • {current_time}</p>
+            <div class="date">{current_date} • {current_time}</div>
+        </div>
+        
+        <!-- Market Metrics -->
+        <div class="metrics-bar">
+            <div class="metric">
+                <div class="metric-value">{len(items)}</div>
+                <div class="metric-label">Analyzed</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value">{market_metrics['temperature']}°</div>
+                <div class="metric-label">Market Temp</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value">{market_metrics['high_impact_count']}</div>
+                <div class="metric-label">High Impact</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value">{market_metrics['trend']}</div>
+                <div class="metric-label">Trend</div>
+            </div>
+        </div>
+        
+        <!-- Personalized Greeting -->
+        <div class="greeting">
+            {greeting}
+        </div>
+        
+        <!-- Executive Summary -->
+        <div class="executive-summary">
+            <h2>📈 Market Overview</h2>
+            <p>{market_summary}</p>
         </div>
 """
         
-        # Add critical items section
-        if critical_items:
-            html += '<div class="section"><div class="section-title">🚨 Critical Alerts</div>'
-            for item in critical_items[:5]:
-                html += self._format_item_html(item, 'critical')
-            html += '</div>'
+        # Add Big Story if there are critical items
+        if big_story and critical_items:
+            html += f"""
+        <!-- The Big Story -->
+        <div class="big-story">
+            <h3>🎯 The Big Story</h3>
+            <p>{big_story}</p>
+        </div>
+"""
         
-        # Add important items section
-        if important_items:
-            html += '<div class="section"><div class="section-title">👀 Important Updates</div>'
-            for item in important_items[:7]:
-                html += self._format_item_html(item, 'important')
-            html += '</div>'
-        
-        # Add monitoring items section
-        if monitor_items:
-            html += '<div class="section"><div class="section-title">📊 Market Monitor</div>'
-            for item in monitor_items[:5]:
-                html += self._format_item_html(item, 'monitor')
-            html += '</div>'
-        
-        # Add footer
+        # Add Action Items
         html += f"""
+        <!-- Action Items -->
+        <div class="action-items">
+            <h3>⚡ Today's Action Items</h3>
+            <p>{action_items}</p>
+        </div>
+"""
+        
+        # Add critical items
+        if critical_items:
+            html += """
+        <!-- Critical Alerts -->
+        <div class="section">
+            <div class="section-header">
+                🚨 Critical Alerts - Immediate Attention Required
+            </div>
+            <div class="section-content">
+"""
+            for item in critical_items[:5]:
+                html += self._format_enhanced_item_html(item, 'critical')
+            html += """
+            </div>
+        </div>
+"""
+        
+        # Add important items
+        if important_items:
+            html += """
+        <!-- Important Updates -->
+        <div class="section">
+            <div class="section-header">
+                👀 Important Updates - On Your Radar
+            </div>
+            <div class="section-content">
+"""
+            for item in important_items[:7]:
+                html += self._format_enhanced_item_html(item, 'important')
+            html += """
+            </div>
+        </div>
+"""
+        
+        # Add monitoring items (compressed)
+        if monitor_items:
+            html += """
+        <!-- Market Monitor -->
+        <div class="section">
+            <div class="section-header">
+                📊 Market Monitor - Tracking
+            </div>
+            <div class="section-content">
+"""
+            for item in monitor_items[:5]:
+                html += self._format_enhanced_item_html(item, 'monitor')
+            html += """
+            </div>
+        </div>
+"""
+        
+        # Footer
+        html += f"""
+        <!-- Footer -->
         <div class="footer">
-            <p><strong>Analyzed {len(items)} articles in seconds</strong></p>
-            <p>Powered by AI Intelligence Platform</p>
+            <div class="footer-tagline">
+                Information is power. Action is profit.
+            </div>
+            <p>
+                This AI analyzed {len(items)} articles in seconds.<br>
+                What took you 2 minutes would've taken 2 hours manually.
+            </p>
+            <p style="margin-top: 15px;">
+                Built with 🤖 for strategic property intelligence
+            </p>
         </div>
     </div>
 </body>
@@ -801,20 +1296,25 @@ class RSSAnalyzer:
         
         return html
     
-    def _format_item_html(self, item, priority: str) -> str:
-        """Format individual item for email"""
+    def _format_enhanced_item_html(self, item, priority: str) -> str:
+        """Format individual item with enhanced styling"""
         score_class = 'score-high' if priority == 'critical' else 'score-medium' if priority == 'important' else 'score-low'
+        
+        # Use AI summary if available, otherwise show description snippet
+        summary = item['ai_summary'] if item['ai_summary'] else (item['description'][:150] + '...' if item['description'] else 'Analysis pending')
         
         return f"""
         <div class="item {priority}">
             <div class="item-title">
-                {item['title']} 
+                {item['title']}
                 <span class="score-badge {score_class}">Score: {item['interest_score']}/10</span>
             </div>
-            <div class="item-summary">{item['ai_summary'] or 'Analysis pending'}</div>
+            <div class="item-summary">
+                💡 {summary}
+            </div>
             <div class="item-meta">
-                📰 {item['source_name']} • 
-                <a href="{item['link']}">Read Full Article →</a>
+                <span>📰 {item['source_name']} • {item['sentiment'] if item['sentiment'] else 'Neutral'}</span>
+                <a href="{item['link']}" class="read-more">Read Full Article →</a>
             </div>
         </div>
         """
