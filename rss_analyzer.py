@@ -122,7 +122,78 @@ def heuristic_score(source: str, title: str, summary: str) -> int:
     return score
 
 # ---------- DB ----------
-def create_base_schema(conn: sqlite3.Connection):
+def check_database_compatibility(conn: sqlite3.Connection) -> bool:
+    """Check if the existing database is compatible enough to migrate"""
+    try:
+        # Check if items table exists
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='items'")
+        if not cur.fetchone():
+            return True  # No table, we can create fresh
+        
+        # Check if basic required columns exist
+        cur = conn.execute("PRAGMA table_info(items)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        
+        # Must have at least link column to be worth migrating
+        essential_cols = {'link'}
+        if not essential_cols.issubset(existing_cols):
+            logging.warning(f"Database missing essential columns: {essential_cols - existing_cols}")
+            return False
+            
+        return True
+    except sqlite3.OperationalError as e:
+        logging.error(f"Database compatibility check failed: {e}")
+        return False
+
+def create_fresh_database(conn: sqlite3.Connection):
+    """Create a completely fresh database schema"""
+    logging.info("Creating fresh database schema")
+    
+    # Drop existing tables if they exist
+    conn.execute("DROP TABLE IF EXISTS items")
+    conn.execute("DROP TABLE IF EXISTS newsletter_metadata")
+    
+    # Create fresh schema
+    conn.execute("""
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT,
+            source_feed TEXT,
+            link TEXT,
+            link_canonical TEXT UNIQUE,
+            title TEXT,
+            summary TEXT,
+            published_at TEXT,
+            fetched_at TEXT,
+            interest_score INTEGER DEFAULT 0,
+            relevant INTEGER DEFAULT 0,
+            ai_json TEXT,
+            ai_title TEXT,
+            ai_desc TEXT,
+            ai_tags TEXT,
+            processed_at TEXT
+        )
+    """)
+    
+    conn.execute("""
+        CREATE TABLE newsletter_metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT,
+            headline TEXT,
+            subhead TEXT,
+            created_at TEXT,
+            item_count INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Create indexes
+    conn.execute("CREATE INDEX idx_items_pub ON items(published_at)")
+    conn.execute("CREATE INDEX idx_items_rel ON items(relevant)")
+    conn.execute("CREATE INDEX idx_items_canonical ON items(link_canonical)")
+    conn.execute("CREATE INDEX idx_newsletter_date ON newsletter_metadata(run_date)")
+    
+    conn.commit()
+    logging.info("Fresh database schema created successfully")
     """Create base tables if they don't exist"""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS items (
@@ -161,8 +232,48 @@ NEEDED_COLS = set([
     "fetched_at","interest_score","relevant","ai_json","ai_title","ai_desc","ai_tags","processed_at"
 ])
 
+def create_base_schema(conn: sqlite3.Connection):
+    """Create base tables if they don't exist"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT,
+            source_feed TEXT,
+            link TEXT,
+            link_canonical TEXT UNIQUE,
+            title TEXT,
+            summary TEXT,
+            published_at TEXT,
+            fetched_at TEXT
+        )
+    """)
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS newsletter_metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT,
+            headline TEXT,
+            subhead TEXT,
+            created_at TEXT,
+            item_count INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Create indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_canonical ON items(link_canonical)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_newsletter_date ON newsletter_metadata(run_date)")
+    
+    conn.commit()
+
 def ensure_schema(conn: sqlite3.Connection):
     """Safely migrate database schema"""
+    # Check if database is compatible enough to migrate
+    if not check_database_compatibility(conn):
+        logging.info("Database incompatible - creating fresh schema")
+        create_fresh_database(conn)
+        return
+    
     # First create base tables
     create_base_schema(conn)
     
@@ -170,8 +281,16 @@ def ensure_schema(conn: sqlite3.Connection):
     cur = conn.execute("PRAGMA table_info(items)")
     existing_cols = {row[1]: row[2] for row in cur.fetchall()}
     
-    # Add missing columns one by one (safe for existing DBs)
-    columns_to_add = {
+    # Define ALL columns we need (including basic ones that might be missing)
+    all_columns_needed = {
+        'source_name': 'TEXT',
+        'source_feed': 'TEXT', 
+        'link': 'TEXT',
+        'link_canonical': 'TEXT',
+        'title': 'TEXT',
+        'summary': 'TEXT',  # This might be missing!
+        'published_at': 'TEXT',
+        'fetched_at': 'TEXT',
         'interest_score': 'INTEGER DEFAULT 0',
         'relevant': 'INTEGER DEFAULT 0', 
         'ai_json': 'TEXT',
@@ -181,7 +300,8 @@ def ensure_schema(conn: sqlite3.Connection):
         'processed_at': 'TEXT'
     }
     
-    for col_name, col_def in columns_to_add.items():
+    # Add missing columns one by one (safe for existing DBs)
+    for col_name, col_def in all_columns_needed.items():
         if col_name not in existing_cols:
             try:
                 conn.execute(f"ALTER TABLE items ADD COLUMN {col_name} {col_def}")
@@ -560,55 +680,100 @@ def fetch_until_duplicates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 # ---------- Main pipeline ----------
 def upsert(conn: sqlite3.Connection, row: Dict[str, Any]):
     """Insert item, handling potential missing columns gracefully"""
-    try:
-        conn.execute("""
-            INSERT OR IGNORE INTO items
-              (source_name,source_feed,link,link_canonical,title,summary,published_at,fetched_at,interest_score,relevant)
-            VALUES (?,?,?,?,?,?,?,?,?,0)
-        """, (row["source_name"], row["source_feed"], row["link"], row["link_canonical"],
-              row["title"], row["summary"], row["published_at"], row["fetched_at"], 0))
-    except sqlite3.OperationalError:
-        # Fallback for older schema - insert without new columns
-        conn.execute("""
-            INSERT OR IGNORE INTO items
-              (source_name,source_feed,link,link_canonical,title,summary,published_at,fetched_at)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (row["source_name"], row["source_feed"], row["link"], row["link_canonical"],
-              row["title"], row["summary"], row["published_at"], row["fetched_at"]))
-    conn.commit()
+    # Get current table schema
+    cur = conn.execute("PRAGMA table_info(items)")
+    existing_cols = {r[1] for r in cur.fetchall()}
+    
+    # Build dynamic insert based on available columns
+    available_fields = []
+    values = []
+    
+    field_mapping = {
+        'source_name': row.get("source_name"),
+        'source_feed': row.get("source_feed"), 
+        'link': row.get("link"),
+        'link_canonical': row.get("link_canonical"),
+        'title': row.get("title"),
+        'summary': row.get("summary"),
+        'published_at': row.get("published_at"),
+        'fetched_at': row.get("fetched_at"),
+        'interest_score': 0,
+        'relevant': 0
+    }
+    
+    for field, value in field_mapping.items():
+        if field in existing_cols:
+            available_fields.append(field)
+            values.append(value)
+    
+    if available_fields:
+        placeholders = ','.join(['?'] * len(available_fields))
+        fields_str = ','.join(available_fields)
+        
+        try:
+            conn.execute(f"""
+                INSERT OR IGNORE INTO items ({fields_str})
+                VALUES ({placeholders})
+            """, values)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            logging.error(f"Failed to insert item: {e}")
+            logging.error(f"Available fields: {available_fields}")
+            logging.error(f"Values: {values}")
+    else:
+        logging.error("No valid columns available for insert")
 
 def update_ai(conn: sqlite3.Connection, link_canonical: str, interest_score: int,
               relevant: int, ai_pkg: Optional[Dict[str,Any]]):
     """Update AI results, handling potential missing columns gracefully"""
-    try:
-        if ai_pkg and ai_pkg.get("relevant"):
-            conn.execute("""
-              UPDATE items SET
-                interest_score=?, relevant=1, ai_json=?, ai_title=?, ai_desc=?, ai_tags=?, processed_at=?
-              WHERE link_canonical=?
-            """, (interest_score, json.dumps(ai_pkg, ensure_ascii=False),
-                  ai_pkg.get("title"), ai_pkg.get("desc"),
-                  ",".join(ai_pkg.get("tags") or []),
-                  datetime.now(tz=TZ).isoformat(),
-                  link_canonical))
-        else:
-            conn.execute("""
-              UPDATE items SET
-                interest_score=?, relevant=0, processed_at=?
-              WHERE link_canonical=?
-            """, (interest_score, datetime.now(tz=TZ).isoformat(), link_canonical))
-    except sqlite3.OperationalError as e:
-        # Fallback for older schema - just log that we can't update AI fields yet
-        logging.warning(f"Could not update AI fields (schema migration needed): {e}")
-        # At minimum, we can still track that we processed this item
+    # Get current table schema
+    cur = conn.execute("PRAGMA table_info(items)")
+    existing_cols = {r[1] for r in cur.fetchall()}
+    
+    # Build dynamic update based on available columns
+    update_fields = []
+    values = []
+    
+    # Always try to update interest_score if available
+    if 'interest_score' in existing_cols:
+        update_fields.append('interest_score=?')
+        values.append(interest_score)
+    
+    if ai_pkg and ai_pkg.get("relevant"):
+        # Try to update AI fields if they exist
+        field_mapping = {
+            'relevant': 1,
+            'ai_json': json.dumps(ai_pkg, ensure_ascii=False),
+            'ai_title': ai_pkg.get("title"),
+            'ai_desc': ai_pkg.get("desc"), 
+            'ai_tags': ",".join(ai_pkg.get("tags") or []),
+            'processed_at': datetime.now(tz=TZ).isoformat()
+        }
+        
+        for field, value in field_mapping.items():
+            if field in existing_cols:
+                update_fields.append(f'{field}=?')
+                values.append(value)
+    else:
+        # Mark as not relevant
+        if 'relevant' in existing_cols:
+            update_fields.append('relevant=?')
+            values.append(0)
+        if 'processed_at' in existing_cols:
+            update_fields.append('processed_at=?')
+            values.append(datetime.now(tz=TZ).isoformat())
+    
+    if update_fields:
+        values.append(link_canonical)  # for WHERE clause
+        update_sql = f"UPDATE items SET {','.join(update_fields)} WHERE link_canonical=?"
+        
         try:
-            conn.execute("UPDATE items SET title=?, summary=? WHERE link_canonical=?", 
-                        (ai_pkg.get("title") if ai_pkg else None, 
-                         ai_pkg.get("desc") if ai_pkg else None,
-                         link_canonical))
-        except sqlite3.OperationalError:
-            pass  # Give up gracefully
-    conn.commit()
+            conn.execute(update_sql, values)
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            logging.warning(f"Could not update AI fields: {e}")
+    else:
+        logging.warning("No valid columns available for AI update")
 
 def save_newsletter_metadata(conn: sqlite3.Connection, headline: str, subhead: str, item_count: int):
     """Save the generated headline and subhead for this run"""
