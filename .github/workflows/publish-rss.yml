@@ -1,46 +1,49 @@
-name: Publish RSS (05:58 AEST)
+name: publish-rss
+
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '58 19 * * *'   # 05:58 AEST daily
-  workflow_dispatch: {}
-concurrency:
-  group: publish-rss
-  cancel-in-progress: true
+    - cron: "55 20 * * *"  # ~06:55 AEST? (GitHub UTC → adjust as you prefer)
+    # If you absolutely need 06:00 AEST sharp, bump this earlier and/or shorten windows.
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate today’s beehiiv.xml (AI-only, no repeats)
+      - name: Generate Beehiiv feeds (multi + macro)
         env:
           RSS_DB_PATH: rss_items.db
-          OUT_PATH: beehiiv.xml
           NEWSLETTER_NAME: "Morning Briefing"
           BASE_URL: "https://mwhiteoak.github.io/morningBrief"
           TZ_REGION: "Australia/Brisbane"
-          REQUIRE_AI: "1"
+          FEED_WINDOW_HOURS: 36
+          TOP_WORD_BUDGET: 1100
+          MIN_DESC_CHARS: 60
+          # Optional: set these to avoid em dashes
+          # RBA_CASH_RATE: "4.10%"
+          # RBA_NEXT_MOVE_PROB: "Cut 55%"
         run: |
-          python write_beehiiv_xml.py
+          python write_beehiiv_feeds.py
 
-      - name: Commit & push feed
+      - name: Commit feeds
         run: |
+          set -e
           git config user.name "rss-bot"
-          git config user.email "rss-bot@example.com"
-          git add beehiiv.xml
-          git commit -m "Update daily beehiiv.xml" || echo "Nothing to commit"
+          git config user.email "rss-bot@users.noreply.github.com"
+          git pull --rebase origin main || true
+          git add beehiiv_*.xml
+          git commit -m "Update daily Beehiiv feeds"
           git push
+
