@@ -28,7 +28,6 @@ from dotenv import load_dotenv
 import random
 import hashlib
 from functools import lru_cache
-import backoff
 from contextlib import contextmanager
 
 # Import RSS feeds from separate file
@@ -195,34 +194,37 @@ class AIAnalyzer:
         self.cache = {}
         self.cache_ttl = 3600  # 1 hour
         
-    @lru_cache(maxsize=128)
     def _get_cache_key(self, text: str) -> str:
         """Generate cache key for text"""
         return hashlib.md5(text.encode()).hexdigest()
     
-    @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=3,
-        max_time=30
-    )
-    def analyze_with_retry(self, prompt: str, model: str = "gpt-4o", max_tokens: int = 500) -> str:
-        """Make API call with exponential backoff retry"""
-        try:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a commercial property analyst. Be accurate, specific, and never make up facts."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=max_tokens,
-                temperature=0.3,
-                timeout=30
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"AI API error: {e}")
-            raise
+    def analyze_with_retry(self, prompt: str, model: str = "gpt-4o", max_tokens: int = 500, max_retries: int = 3) -> str:
+        """Make API call with retry logic"""
+        last_error = None
+        wait_time = 1
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a commercial property analyst. Be accurate, specific, and never make up facts."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                    timeout=30
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                last_error = e
+                logger.warning(f"AI API attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
+                    wait_time *= 2  # Exponential backoff
+        
+        logger.error(f"AI API failed after {max_retries} attempts: {last_error}")
+        raise last_error
     
     def batch_analyze_items(self, items: List[FeedItem], batch_size: int = 5) -> List[FeedItem]:
         """Improved batch analysis with better error handling"""
@@ -641,6 +643,173 @@ class RSSAnalyzer:
                     logger.error(f"Error saving item: {e}")
             
             conn.commit()
+    
+    def send_daily_intelligence_email(self):
+        """Send the daily intelligence email"""
+        try:
+            # Get last 24 hours of items
+            cutoff_time = datetime.now() - timedelta(hours=24)
+            
+            with self.db.get_connection() as conn:
+                cursor = conn.execute('''
+                    SELECT title, link, description, interest_score, ai_summary, source_name, 
+                           processed_at, category, sentiment
+                    FROM items 
+                    WHERE processed_at >= ?
+                    ORDER BY interest_score DESC, processed_at DESC
+                ''', (cutoff_time,))
+                
+                items = cursor.fetchall()
+            
+            if not items:
+                logger.warning("No items for daily email")
+                return
+            
+            logger.info(f"Generating email for {len(items)} items")
+            
+            # Generate email content
+            html_content = self._generate_email_html(items)
+            
+            if not html_content:
+                logger.error("Failed to generate email content")
+                return
+            
+            # Create email message
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = self._generate_subject_line(items)
+            msg['From'] = self.config['gmail_user']
+            msg['To'] = self.config['recipient_email']
+            
+            # Add plain text and HTML parts
+            text_part = MIMEText("Please view this email in HTML format for the best experience.", 'plain')
+            html_part = MIMEText(html_content, 'html')
+            
+            msg.attach(text_part)
+            msg.attach(html_part)
+            
+            # Send email
+            with smtplib.SMTP('smtp.gmail.com', 587) as server:
+                server.starttls()
+                server.login(self.config['gmail_user'], self.config['gmail_password'])
+                server.send_message(msg)
+            
+            logger.info("✅ Daily intelligence email sent successfully!")
+            
+            # Mark items as sent
+            with self.db.get_connection() as conn:
+                conn.execute('''
+                    UPDATE items SET email_sent = TRUE 
+                    WHERE processed_at >= ?
+                ''', (cutoff_time,))
+                conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}", exc_info=True)
+    
+    def _generate_subject_line(self, items) -> str:
+        """Generate email subject line"""
+        critical_count = sum(1 for item in items if item['interest_score'] >= 8)
+        date_str = datetime.now().strftime('%B %d')
+        
+        if critical_count > 0:
+            return f"🔥 {critical_count} Critical Property Alerts - {date_str}"
+        else:
+            return f"📊 Property Intelligence Daily - {date_str}"
+    
+    def _generate_email_html(self, items) -> str:
+        """Generate HTML email content"""
+        # Sort and categorize items
+        critical_items = [item for item in items if item['interest_score'] >= 8]
+        important_items = [item for item in items if 6 <= item['interest_score'] < 8]
+        monitor_items = [item for item in items if 4 <= item['interest_score'] < 6]
+        
+        current_date = datetime.now().strftime('%B %d, %Y')
+        current_time = datetime.now().strftime('%I:%M %p')
+        
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 600px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; }}
+        .header h1 {{ margin: 0; font-size: 24px; }}
+        .section {{ padding: 20px; }}
+        .section-title {{ font-size: 18px; font-weight: bold; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #667eea; }}
+        .item {{ margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 8px; }}
+        .item.critical {{ border-left: 4px solid #ff4444; }}
+        .item.important {{ border-left: 4px solid #ffaa00; }}
+        .item-title {{ font-weight: bold; color: #333; margin-bottom: 8px; }}
+        .item-summary {{ color: #666; font-size: 14px; line-height: 1.5; margin: 10px 0; }}
+        .item-meta {{ font-size: 12px; color: #999; }}
+        .score-badge {{ display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; }}
+        .score-high {{ background: #ff4444; color: white; }}
+        .score-medium {{ background: #ffaa00; color: white; }}
+        .score-low {{ background: #00aa00; color: white; }}
+        .footer {{ padding: 20px; text-align: center; color: #666; font-size: 12px; background: #f9f9f9; }}
+        a {{ color: #667eea; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏢 Property Intelligence Daily</h1>
+            <p>{current_date} • {current_time}</p>
+        </div>
+"""
+        
+        # Add critical items section
+        if critical_items:
+            html += '<div class="section"><div class="section-title">🚨 Critical Alerts</div>'
+            for item in critical_items[:5]:
+                html += self._format_item_html(item, 'critical')
+            html += '</div>'
+        
+        # Add important items section
+        if important_items:
+            html += '<div class="section"><div class="section-title">👀 Important Updates</div>'
+            for item in important_items[:7]:
+                html += self._format_item_html(item, 'important')
+            html += '</div>'
+        
+        # Add monitoring items section
+        if monitor_items:
+            html += '<div class="section"><div class="section-title">📊 Market Monitor</div>'
+            for item in monitor_items[:5]:
+                html += self._format_item_html(item, 'monitor')
+            html += '</div>'
+        
+        # Add footer
+        html += f"""
+        <div class="footer">
+            <p><strong>Analyzed {len(items)} articles in seconds</strong></p>
+            <p>Powered by AI Intelligence Platform</p>
+        </div>
+    </div>
+</body>
+</html>"""
+        
+        return html
+    
+    def _format_item_html(self, item, priority: str) -> str:
+        """Format individual item for email"""
+        score_class = 'score-high' if priority == 'critical' else 'score-medium' if priority == 'important' else 'score-low'
+        
+        return f"""
+        <div class="item {priority}">
+            <div class="item-title">
+                {item['title']} 
+                <span class="score-badge {score_class}">Score: {item['interest_score']}/10</span>
+            </div>
+            <div class="item-summary">{item['ai_summary'] or 'Analysis pending'}</div>
+            <div class="item-meta">
+                📰 {item['source_name']} • 
+                <a href="{item['link']}">Read Full Article →</a>
+            </div>
+        </div>
+        """
     
     def cleanup_old_items(self, days: int = 7):
         """Enhanced cleanup with statistics"""
