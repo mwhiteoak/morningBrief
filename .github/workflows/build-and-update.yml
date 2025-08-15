@@ -37,7 +37,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RSS_DB_PATH: rss_items.db
-          ALWAYS_AI: "1"              # <— ensure we try AI for everything
+          ALWAYS_AI: "1"              
           MIN_SCORE_FOR_AI: "0"
           TZ_REGION: "Australia/Brisbane"
           LOG_LEVEL: "INFO"
@@ -59,7 +59,7 @@ jobs:
           BASE_URL: "https://mwhiteoak.github.io/morningBrief"
           SCAN_WINDOW_HRS: "36"
           MAX_ITEMS_PER_FEED: "80"
-          REQUIRE_AI: "1"            # <— only include AI-rewritten items
+          REQUIRE_AI: "1"           
         run: |
           set -euxo pipefail
           python write_beehiiv_feeds.py
