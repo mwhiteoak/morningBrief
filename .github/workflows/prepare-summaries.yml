@@ -1,10 +1,13 @@
-name: prepare-summaries
+name: Prepare Summaries (DB)
 
 on:
-  workflow_dispatch:
   schedule:
-    # Run daily earlier so publish has fresh DB
-    - cron: "25 20 * * *"  # 05:25 AEST / 06:25 AEDT approximate (GitHub UTC)
+    # 05:20 AEST (UTC+10) -> 19:20 UTC previous day
+    - cron: "20 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to push DB/logs
 
 jobs:
   build:
@@ -12,54 +15,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show head
-        run: |
-          echo "HEAD of rss_analyzer.py (first 35 lines):"
-          head -n 35 rss_analyzer.py || true
-          echo
-          sha256sum rss_analyzer.py || true
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Prepare DB (CRE-first AI rewrites + classify)
+      - name: Run analyser (populate DB)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NEWSLETTER_NAME: "Morning Briefing"
-          LOG_LEVEL: INFO
-          OAI_RPM: 25
-          OAI_MAX_RETRIES: 4
-          MAX_WORKERS: 8
-          FEED_TIMEOUT: 15
-          MIN_SCORE_FOR_AI: 5
-          RSS_DB_PATH: rss_items.db
-          TZ_REGION: "Australia/Brisbane"
-          SCAN_WINDOW_HRS: 36
+          LOG_LEVEL: "INFO"
+          MAX_WORKERS: "8"
+          FEED_TIMEOUT: "15"
+          OAI_RPM: "25"
+          OAI_MAX_RETRIES: "4"
+          MIN_SCORE_FOR_AI: "5"
+          SCAN_WINDOW_HRS: "36"
+          MAX_PER_FEED: "20"
         run: |
           set -euxo pipefail
           python rss_analyzer.py
+          tail -n 200 rss_analyzer.log || true
 
-      - name: Commit DB + logs (skip CI)
+      - name: Commit DB + logs (force add, autostash rebase)
         run: |
-          set -e
+          set -euxo pipefail
           git config user.name "rss-bot"
           git config user.email "rss-bot@users.noreply.github.com"
-          git pull --rebase origin main || true
-          git add -f rss_items.db rss_analyzer.log || true
-          git commit -m "Prepare: update DB/logs [skip ci]" || echo "Nothing to commit"
-          git push || echo "Nothing to push"
 
-      - name: Upload db/logs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: db-and-logs.zip
-          path: |
-            rss_items.db
-            rss_analyzer.log
+          # force-add even if ignored
+          git add -f rss_items.db || true
+          git add -f rss_analyzer.log || true
+
+          # commit only if there are staged changes
+          if ! git diff --cached --quiet; then
+            git commit -m "Prepare: update DB/logs [skip ci]"
+            git pull --rebase --autostash || true
+            git push
+          else
+            echo "Nothing to commit"
+          fi
