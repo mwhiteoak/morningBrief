@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Morning Briefing — AU CRE Intelligence (Beehiiv-ready, multi-feed)
-- Fetches feeds (incremental, parallel)
-- Filters & scores for AU property pros (CRE-first)
-- Rewrites in a Shaan Puri-ish voice *without* inventing facts (Aussie English)
-- Classifies into sections for multi-RSS output
-- Stores everything in sqlite: rss_items.db (auto-migrates schema)
+Morning Briefing — AU CRE Intelligence (Beehiiv-ready, multi-feed capable)
+- Fetch feeds (parallel)
+- Score for AU CRE relevance
+- Summarise in a punchy Shaan-Puri-ish voice (Aussie English), NO new facts
+- Store into sqlite (auto-migrates | self-heals)
 """
 
 import os, re, json, time, sqlite3, logging, socket, concurrent.futures
@@ -25,13 +24,13 @@ load_dotenv()
 LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")
 NEWSLETTER_NAME  = os.getenv("NEWSLETTER_NAME", "Morning Briefing")
-OAI_RPM          = int(os.getenv("OAI_RPM", "25"))               # requests/min cap
+OAI_RPM          = int(os.getenv("OAI_RPM", "25"))               # requests/min cap (sequential here)
 OAI_MAX_RETRIES  = int(os.getenv("OAI_MAX_RETRIES", "4"))
 MAX_WORKERS      = int(os.getenv("MAX_WORKERS", "8"))            # feed fetch concurrency
 FEED_TIMEOUT     = int(os.getenv("FEED_TIMEOUT", "15"))          # per-feed seconds
 MIN_SCORE_FOR_AI = int(os.getenv("MIN_SCORE_FOR_AI", "5"))       # below this: skip AI
-TZ_REGION        = os.getenv("TZ_REGION", "Australia/Brisbane")
-SCAN_WINDOW_HRS  = int(os.getenv("SCAN_WINDOW_HRS", "36"))       # look-back
+SCAN_WINDOW_HRS  = int(os.getenv("SCAN_WINDOW_HRS", "36"))       # look-back horizon
+MAX_PER_FEED     = int(os.getenv("MAX_PER_FEED", "20"))          # safety cap per feed
 DB_PATH          = os.getenv("RSS_DB_PATH", "rss_items.db")
 # --------------------------------------
 
@@ -83,7 +82,6 @@ def _create_fresh(conn):
     conn.commit()
 
 def ensure_schema() -> sqlite3.Connection:
-    # If DB file missing → create
     fresh = not os.path.exists(DB_PATH)
     conn = _connect()
     if fresh:
@@ -91,12 +89,10 @@ def ensure_schema() -> sqlite3.Connection:
         _create_fresh(conn)
         return conn
 
-    # Ensure table exists
     conn.execute("CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT)")
     conn.commit()
 
     cols = _cols(conn)
-    # Severe mismatch → nuke & pave (old schema without url/title/published_at)
     severe = any(req in ("url","title","published_at") and req not in cols for req in ["url","title","published_at"])
     if severe:
         logging.warning("DB schema mismatch (missing critical cols in 'items': %s). Recreating DB.", ", ".join(sorted(cols)))
@@ -109,19 +105,16 @@ def ensure_schema() -> sqlite3.Connection:
         _create_fresh(conn)
         return conn
 
-    # Soft-migrate: add any missing optional columns
     for col in REQUIRED_COLS:
         if col not in cols:
             try:
                 if col == "created_at":
                     conn.execute("ALTER TABLE items ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP")
-                elif col in ("category_main","ai_title","ai_desc_html","ai_tags","url_canonical","raw_summary","source","score"):
+                elif col in ("category_main","ai_title","ai_desc_html","ai_tags","url_canonical","raw_summary","source"):
                     conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
-                    if col == "score":
-                        # score should be integer — keep as text-compatible in SQLite, values cast when read
-                        pass
+                elif col == "score":
+                    conn.execute("ALTER TABLE items ADD COLUMN score INTEGER")
                 else:
-                    # If a truly required base column is missing but not severe (edge), fall back to recreate
                     logging.warning("Missing base column '%s'; recreating DB.", col)
                     conn.close()
                     try: os.remove(DB_PATH)
@@ -130,7 +123,6 @@ def ensure_schema() -> sqlite3.Connection:
                     _create_fresh(conn)
                     return conn
             except sqlite3.OperationalError:
-                # If ALTER failed (older SQLite oddities), recreate
                 logging.warning("ALTER TABLE failed for '%s'; recreating DB.", col)
                 conn.close()
                 try: os.remove(DB_PATH)
@@ -138,14 +130,13 @@ def ensure_schema() -> sqlite3.Connection:
                 conn = _connect()
                 _create_fresh(conn)
                 return conn
-    # Ensure index
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_pub ON items(published_at)")
     conn.commit()
     return conn
 
 # ---- Utilities ---------------------------------------------------------------
 def now_au() -> datetime:
-    # naive for Actions; adjust TZ if needed
+    # Naive AU time offset (+10) to keep it simple inside Actions runners
     return datetime.utcnow() + timedelta(hours=10)
 
 def canonicalise_url(u: str) -> str:
@@ -205,28 +196,43 @@ def classify_guess(title: str, summary: str) -> str:
             hit, best = sc, cat
     return best
 
-# ---- OpenAI summariser (no new facts; Aussie EN) -----------------------------
+# ---- AI: force JSON + robust fallback ---------------------------------------
 SYS_PROMPT = """You are a sharp finance-desk editor for an AUSTRALIAN commercial real estate (CRE) briefing.
 
 GOALS:
 - Rewrite ONLY what’s in the provided source text (title + snippet). Do NOT add new facts, numbers or claims.
 - Keep Aussie English spellings.
-- Voice: energetic, Shaan Puri-ish (punchy, a zinger or two), but strictly faithful to source.
+- Voice: energetic, Shaan Puri-ish (punchy, a zinger), but strictly faithful to source.
 - Audience: property professionals (lenders, fund managers, asset managers, developers).
-- If the source is too thin to be useful for CRE readers, mark "exclude": true.
+- If the source is too thin to be useful for CRE readers, set "exclude": true.
 
-OUTPUT JSON with fields:
+Return a SINGLE JSON OBJECT ONLY (no code fences), shape:
 {
  "ai_title": "spicy but faithful headline (<= 12 words)",
  "ai_desc_html": "<p>2–4 tight sentences. No invented facts. One fun line OK.</p>",
  "category_main": "one of [deals_capital, development_planning, leasing, macro, reits, retail, industrial, office, residential, proptech_finance]",
- "tags": ["a few", "lower_snake_case"],
+ "tags": ["a_few", "lower_snake_case"],
  "exclude": false
 }
-Rules:
-- No swearing or crude language.
-- If the original text has no CRE relevance or is too vague, set exclude = true and ai_desc_html = "Insufficient data..."
 """
+
+def _extract_json_block(s: str) -> Optional[str]:
+    if not s: return None
+    # Fast path: already looks like a JSON object
+    s = s.strip()
+    if s.startswith("{") and s.endswith("}"):
+        return s
+    # Otherwise, scan for first balanced {...}
+    start = s.find("{")
+    if start == -1: return None
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == "{": depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i+1]
+    return None
 
 def ai_rewrite(title: str, summary: str, source: str, url: str) -> Optional[Dict]:
     user = f"""SOURCE:
@@ -240,24 +246,39 @@ url: {url}
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 temperature=0.4,
+                response_format={"type": "json_object"},
                 messages=[
                     {"role":"system","content":SYS_PROMPT},
                     {"role":"user","content":user}
                 ]
             )
-            txt = resp.choices[0].message.content.strip()
-            data = json.loads(txt)
-            return data
+            txt = (resp.choices[0].message.content or "").strip()
+            try:
+                return json.loads(txt)
+            except Exception:
+                blk = _extract_json_block(txt)
+                if blk:
+                    return json.loads(blk)
+                raise
         except Exception as e:
             logging.warning("AI error (%s/%s): %s", i+1, OAI_MAX_RETRIES, e)
-            time.sleep(1.5*(i+1))
+            time.sleep(1.2*(i+1))
     return None
 
 # ---- Fetch & process ---------------------------------------------------------
+def _parse_pub(e) -> Optional[datetime]:
+    for k in ("published_parsed","updated_parsed"):
+        if e.get(k):
+            try:
+                return datetime(*e.get(k)[:6])
+            except Exception:
+                pass
+    return None
+
 def fetch_feed(feed: Dict) -> List[Dict]:
     url = feed["url"]
     name = feed["name"]
-    out = []
+    bag = []
     try:
         socket.setdefaulttimeout(FEED_TIMEOUT)
         fp = feedparser.parse(url)
@@ -267,36 +288,41 @@ def fetch_feed(feed: Dict) -> List[Dict]:
             title = (e.get("title") or "").strip()
             if not title: continue
             summary = (e.get("summary") or e.get("description") or "").strip()
-            pub = None
-            for k in ("published_parsed","updated_parsed"):
-                if e.get(k):
-                    pub = datetime(*e.get(k)[:6])
-                    break
-            if not pub:
-                pub = now_au()
-            out.append({
+            pub = _parse_pub(e) or None
+            # Keep all for now; sort & trim after
+            bag.append({
                 "source": name,
                 "url": link,
                 "title": title,
                 "summary": summary,
-                "published_at": pub.isoformat()
+                "published_at": (pub or datetime(1970,1,1)).isoformat()
             })
     except Exception as ex:
         logging.error("Fetch error %s: %s", name, ex)
-    return out
 
-def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,int]:
-    new, saved, kept = 0, 0, 0
+    # Sort newest first (unknown dates go last) and cap per-feed
+    bag.sort(key=lambda x: x["published_at"], reverse=True)
+    return bag[:MAX_PER_FEED]
+
+def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,int,int,int]:
+    since = now_au() - timedelta(hours=SCAN_WINDOW_HRS)
+    def _within_window(iso: str) -> bool:
+        try:
+            return datetime.fromisoformat(iso) >= since
+        except Exception:
+            return False
+
+    scanned = len(items)
+    new, saved, kept, low, excluded = 0,0,0,0,0
     with conn:
         for it in items:
-            url = it["url"]
-            title = it["title"]
-            summary = it["summary"]
-            source = it["source"]
-            pub = it["published_at"]
+            if not _within_window(it["published_at"]):
+                continue
+            url = it["url"]; title = it["title"]; summary = it["summary"]; source = it["source"]; pub = it["published_at"]
             score = score_item(title, summary, source)
 
             if score < MIN_SCORE_FOR_AI:
+                low += 1
                 conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score)
                                 VALUES(?,?,?,?,?,?,?)""",
                              (url, canonicalise_url(url), source, title, pub, summary, score))
@@ -304,19 +330,24 @@ def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,
 
             data = ai_rewrite(title, summary, source, url)
             if not data:
-                logging.info("AI skip (no response): %s", title[:120])
+                excluded += 1
                 conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score)
                                 VALUES(?,?,?,?,?,?,?)""",
                              (url, canonicalise_url(url), source, title, pub, summary, score))
                 continue
 
-            exclude = bool(data.get("exclude"))
-            cat = data.get("category_main") or classify_guess(title, summary)
-            ai_title = data.get("ai_title") or title
-            ai_desc_html = data.get("ai_desc_html") or ""
+            # Normalise / guardrails
+            cat = (data.get("category_main") or classify_guess(title, summary)).strip()
+            ai_title = (data.get("ai_title") or title).strip()
+            ai_desc_html = (data.get("ai_desc_html") or "").strip()
             tags = json.dumps(data.get("tags") or [])
+            exclude = bool(data.get("exclude"))
 
-            if exclude:
+            # Auto-exclude thin or placeholder content
+            thin = (len(re.sub(r"<[^>]+>", "", ai_desc_html).strip()) < 60) or ("insufficient data" in ai_desc_html.lower())
+
+            if exclude or thin:
+                excluded += 1
                 conn.execute("""INSERT OR IGNORE INTO items(url,url_canonical,source,title,published_at,raw_summary,score,category_main)
                                 VALUES(?,?,?,?,?,?,?,?)""",
                              (url, canonicalise_url(url), source, title, pub, summary, score, cat))
@@ -327,38 +358,27 @@ def process_items(conn: sqlite3.Connection, items: List[Dict]) -> Tuple[int,int,
                     (url,url_canonical,source,title,published_at,raw_summary,score,category_main,ai_title,ai_desc_html,ai_tags)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """, (url, canonicalise_url(url), source, title, pub, summary, score, cat, ai_title, ai_desc_html, tags))
-            new += 1
-            saved += 1
-    return new, saved, kept
+            new += 1; saved += 1
+
+    return scanned, new, saved, kept, low+excluded
 
 def main():
     conn = ensure_schema()
     start = time.time()
 
-    since = now_au() - timedelta(hours=SCAN_WINDOW_HRS)
-
     logging.info("Loaded %d feeds | MAX_WORKERS=%s FEED_TIMEOUT=%ss OAI_RPM=%s MIN_SCORE_FOR_AI=%s",
                  len(RSS_FEEDS), MAX_WORKERS, FEED_TIMEOUT, OAI_RPM, MIN_SCORE_FOR_AI)
 
-    items = []
+    items: List[Dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [ex.submit(fetch_feed, f) for f in RSS_FEEDS]
         for fut in concurrent.futures.as_completed(futures):
             items.extend(fut.result())
 
-    # restrict by time window
-    cut = []
-    for it in items:
-        try:
-            if datetime.fromisoformat(it["published_at"]) >= since:
-                cut.append(it)
-        except Exception:
-            cut.append(it)
-
-    logging.info("Fetched recent items from %d feeds (items=%d)", len(RSS_FEEDS), len(cut))
-    new, saved, kept = process_items(conn, cut)
-    logging.info("Process: {'scanned': %d, 'new': %d, 'saved': %d, 'kept_for_ai': %d}", len(cut), new, saved, kept)
-    logging.info("Done in %.1fs", time.time() - start)
+    logging.info("Fetched recent items from %d feeds (items=%d)", len(RSS_FEEDS), len(items))
+    scanned, new, saved, kept, dropped = process_items(conn, items)
+    logging.info("SUMMARY: scanned=%d new=%d saved=%d kept_for_ai=%d dropped=%d | duration=%.1fs",
+                 scanned, new, saved, kept, dropped, time.time()-start)
 
 if __name__ == "__main__":
     main()
