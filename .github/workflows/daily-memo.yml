@@ -1,5 +1,4 @@
-name: Matt's Memo - Daily Intelligence Brief
-
+name: Matt's Memo - Daily Intelligence Brief with XML Feed
 on:
   schedule:
     # Run at 6:00 AM AEST (8:00 PM UTC previous day)
@@ -7,6 +6,11 @@ on:
   
   # Allow manual triggering for testing
   workflow_dispatch:
+
+permissions:
+  contents: write  # Needed to commit XML feeds back to repo
+  pages: write     # If you want to deploy to GitHub Pages
+  id-token: write  # For GitHub Pages deployment
 
 jobs:
   send-daily-memo:
@@ -16,6 +20,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
     
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -39,6 +45,44 @@ jobs:
         python rss_analyzer.py process
         echo "✅ Daily memo processing completed!"
     
+    - name: Generate XML Feed
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
+      run: |
+        echo "📡 Generating XML RSS feed..."
+        python rss_analyzer.py feed
+        echo "✅ XML feed generation completed!"
+    
+    - name: List generated files
+      run: |
+        echo "📁 Generated files:"
+        ls -la feeds_output/ || echo "No feeds_output directory found"
+        find . -name "*.xml" -type f -exec ls -la {} \;
+    
+    - name: Setup Git
+      run: |
+        git config --global user.name 'RSS Analyzer Bot'
+        git config --global user.email 'action@github.com'
+    
+    - name: Commit and push XML feeds
+      run: |
+        # Add any new or modified XML files
+        git add feeds_output/*.xml || true
+        git add *.xml || true
+        
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "🤖 Auto-update: Daily RSS feed $(date '+%Y-%m-%d %H:%M:%S')"
+          git push origin main || git push origin master
+          echo "✅ XML feeds committed and pushed!"
+        fi
+    
     - name: Upload logs as artifact
       if: always()
       uses: actions/upload-artifact@v4
@@ -46,6 +90,16 @@ jobs:
         name: rss-analyzer-logs-${{ github.run_number }}
         path: rss_analyzer.log
         retention-days: 7
+    
+    - name: Upload XML feeds as artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: xml-feeds-${{ github.run_number }}
+        path: |
+          feeds_output/*.xml
+          *.xml
+        retention-days: 30
     
     - name: Cleanup old database entries
       env:
@@ -57,3 +111,77 @@ jobs:
       run: |
         python rss_analyzer.py cleanup 7
         echo "🧹 Cleaned up database entries older than 7 days"
+    
+    - name: Display feed statistics
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        LINKEDIN_PROFILE_URL: ${{ secrets.LINKEDIN_PROFILE_URL }}
+      run: |
+        echo "📊 Feed Statistics:"
+        python rss_analyzer.py stats
+
+  # Optional: Deploy to GitHub Pages for public RSS feed access
+  deploy-feeds:
+    needs: send-daily-memo
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.ref }}
+    
+    - name: Setup Pages
+      uses: actions/configure-pages@v3
+      
+    - name: Create index.html for feeds
+      run: |
+        mkdir -p public
+        cp -r feeds_output/* public/ 2>/dev/null || true
+        
+        # Create a simple index page
+        cat > public/index.html << 'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Property Intelligence RSS Feeds</title>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 40px; }
+                .container { max-width: 800px; margin: 0 auto; }
+                h1 { color: #333; }
+                .feed-link { display: block; padding: 15px; margin: 10px 0; background: #f5f5f5; border-radius: 8px; text-decoration: none; color: #333; }
+                .feed-link:hover { background: #e5e5e5; }
+                .updated { color: #666; font-size: 14px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🏢 Property Intelligence RSS Feeds</h1>
+                <p>AI-curated commercial property news and market intelligence</p>
+                
+                <a href="property-intelligence-daily.xml" class="feed-link">
+                    <strong>📡 Property Intelligence Daily Feed</strong><br>
+                    <span class="updated">Updated daily with AI-analyzed property market news</span>
+                </a>
+                
+                <p style="margin-top: 30px; color: #666; font-size: 14px;">
+                    Generated automatically by AI • Last updated: $(date)
+                </p>
+            </div>
+        </body>
+        </html>
+        EOF
+    
+    - name: Upload artifact for Pages
+      uses: actions/upload-pages-artifact@v2
+      with:
+        path: ./public
+    
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v2
